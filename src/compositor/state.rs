@@ -252,15 +252,21 @@ impl WaylandWebStreamState {
             }
         }
         
-        // If no windows, show test pattern
+        // If no windows, show the classic Xorg "root weave" stipple: a 4x4
+        // basket-weave bitmap (X11's default root window pattern before any
+        // window manager or client connects), rendered in black and white.
         if window_count == 0 {
+            const ROOT_WEAVE_BITS: [u8; 4] = [0b0110, 0b1001, 0b1001, 0b0110];
             for y in 0..self.height {
+                let row = ROOT_WEAVE_BITS[(y % 4) as usize];
                 for x in 0..self.width {
+                    let bit = (row >> (x % 4)) & 1;
+                    let color = if bit == 1 { 255 } else { 0 };
                     let idx = ((y * self.width + x) * 4) as usize;
-                    render_buffer[idx] = (x % 256) as u8;     // B
-                    render_buffer[idx + 1] = (y % 256) as u8; // G
-                    render_buffer[idx + 2] = 128;              // R
-                    render_buffer[idx + 3] = 255;              // A
+                    render_buffer[idx] = color;     // B
+                    render_buffer[idx + 1] = color; // G
+                    render_buffer[idx + 2] = color; // R
+                    render_buffer[idx + 3] = 255;    // A
                 }
             }
         }
