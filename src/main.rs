@@ -215,7 +215,7 @@ async fn main() -> Result<()> {
         
         // Process touch events (non-blocking, drain all available)
         while let Ok(touch_event) = touch_rx.try_recv() {
-            touch_handler.handle_event(touch_event);
+            touch_handler.handle_event(touch_event, &mut state);
         }
         
         // Dispatch Wayland events (non-blocking with 16ms timeout)

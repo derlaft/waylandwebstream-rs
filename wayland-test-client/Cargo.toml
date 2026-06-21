@@ -7,6 +7,10 @@ edition = "2021"
 name = "wayland-test-client"
 path = "src/main.rs"
 
+[[bin]]
+name = "wayland-touch-client"
+path = "src/touch_client.rs"
+
 [dependencies]
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }

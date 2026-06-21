@@ -13,7 +13,7 @@ fn test_compositor_pipeline() {
     // Build the compositor first
     println!("Building compositor...");
     let build_status = Command::new("cargo")
-        .args(&["build", "--release"])
+        .args(&["build", "--release", "--workspace"])
         .status()
         .expect("Failed to build compositor");
     

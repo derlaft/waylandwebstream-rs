@@ -1,14 +1,21 @@
 // Complete compositor state implementation with full Wayland protocol support
 
 use smithay::{
-    backend::renderer::{
-        pixman::PixmanRenderer,
-        utils::with_renderer_surface_state,
+    backend::{
+        input::TouchSlot,
+        renderer::{
+            pixman::PixmanRenderer,
+            utils::with_renderer_surface_state,
+        },
     },
     delegate_compositor, delegate_output, delegate_seat, delegate_shm,
     delegate_xdg_shell,
     desktop::{Space, Window},
-    input::{Seat, SeatState, pointer::CursorImageStatus},
+    input::{
+        Seat, SeatState,
+        pointer::CursorImageStatus,
+        touch::{DownEvent, MotionEvent, UpEvent},
+    },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::EventLoop,
@@ -19,7 +26,7 @@ use smithay::{
             Display,
         },
     },
-    utils::{Clock, Monotonic},
+    utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -101,6 +108,7 @@ impl WaylandWebStreamState {
         let mut seat = seat_state.new_wl_seat(&dh, "seat-0");
         seat.add_keyboard(Default::default(), 200, 25).unwrap();
         seat.add_pointer();
+        seat.add_touch();
 
         // Create space for window management
         let mut space = Space::default();
@@ -284,7 +292,129 @@ impl WaylandWebStreamState {
             window.wl_surface().map(|surface| (surface.into_owned(), (pos.x as f64, pos.y as f64)))
         })
     }
-    
+
+    /// Resolves a touch point given in output-pixel coordinates to the
+    /// topmost window plus that point translated into the window's own
+    /// buffer-pixel space.
+    ///
+    /// Every window is configured to occupy the entire output (see
+    /// `configure_toplevel_fullscreen`), and `render()` scales whatever
+    /// buffer a client has actually attached to fill the output regardless
+    /// of the buffer's real pixel size -- a client can lag a viewport
+    /// resize by a frame or more, or simply never resize at all (see the
+    /// `wayland-touch-client` test client). `Space::element_under` hit-tests
+    /// against the literal, possibly-stale buffer bbox, which would make
+    /// most of a touch test client's window untouchable. So for touch
+    /// targeting, any point within the output belongs to the topmost
+    /// window, scaled into its buffer space the same way `render()` scales
+    /// the other direction.
+    fn touch_target_at(&self, location: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+        if location.x < 0.0
+            || location.y < 0.0
+            || location.x >= self.width as f64
+            || location.y >= self.height as f64
+        {
+            return None;
+        }
+
+        let window = self.space.elements().last()?;
+        let surface = window.wl_surface()?.into_owned();
+        let render_location = self.space.element_location(window).unwrap_or((0, 0).into());
+
+        let origin_x = render_location.x.max(0) as f64;
+        let origin_y = render_location.y.max(0) as f64;
+        let target_w = (self.width as f64 - origin_x).max(1.0);
+        let target_h = (self.height as f64 - origin_y).max(1.0);
+        let rel_x = (location.x - origin_x).clamp(0.0, target_w);
+        let rel_y = (location.y - origin_y).clamp(0.0, target_h);
+
+        let bbox = window.bbox();
+        let buffer_w = (bbox.size.w.max(1)) as f64;
+        let buffer_h = (bbox.size.h.max(1)) as f64;
+
+        let surface_local = Point::<f64, Logical>::from((rel_x * buffer_w / target_w, rel_y * buffer_h / target_h));
+        Some((surface, surface_local))
+    }
+
+    /// Inject a new touch point at the given output-pixel coordinates.
+    pub fn touch_down(&mut self, slot: i32, x: f64, y: f64) {
+        let Some(touch) = self.seat.get_touch() else { return };
+        let location = Point::<f64, Logical>::from((x, y));
+        let target = self.touch_target_at(location);
+        let time = self.clock.now().as_millis();
+        // The location handed to `TouchHandle::down` is delivered to the
+        // client as-is, minus the focus origin we pass alongside it. We've
+        // already done that translation ourselves in `touch_target_at`, so
+        // pass a zero origin and let `event.location` be the final,
+        // already-surface-local coordinate.
+        let (focus, event_location) = match target {
+            Some((surface, surface_local)) => (Some((surface, Point::from((0.0, 0.0)))), surface_local),
+            None => (None, location),
+        };
+        touch.down(
+            self,
+            focus,
+            &DownEvent {
+                slot: TouchSlot::from(Some(slot as u32)),
+                location: event_location,
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+    }
+
+    /// Update the position of an in-progress touch point.
+    pub fn touch_motion(&mut self, slot: i32, x: f64, y: f64) {
+        let Some(touch) = self.seat.get_touch() else { return };
+        let location = Point::<f64, Logical>::from((x, y));
+        let target = self.touch_target_at(location);
+        let time = self.clock.now().as_millis();
+        let (focus, event_location) = match target {
+            Some((surface, surface_local)) => (Some((surface, Point::from((0.0, 0.0)))), surface_local),
+            None => (None, location),
+        };
+        touch.motion(
+            self,
+            focus,
+            &MotionEvent {
+                slot: TouchSlot::from(Some(slot as u32)),
+                location: event_location,
+                time,
+            },
+        );
+    }
+
+    /// End a touch point (finger lifted).
+    pub fn touch_up(&mut self, slot: i32) {
+        let Some(touch) = self.seat.get_touch() else { return };
+        let time = self.clock.now().as_millis();
+        touch.up(
+            self,
+            &UpEvent {
+                slot: TouchSlot::from(Some(slot as u32)),
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+    }
+
+    /// Marks the end of a batch of touch down/motion/up calls that logically
+    /// belong together (e.g. all the touches in one browser `touchmove`
+    /// event).
+    pub fn touch_frame(&mut self) {
+        if let Some(touch) = self.seat.get_touch() {
+            touch.frame(self);
+        }
+    }
+
+    /// Cancels the entire touch sequence. `wl_touch.cancel` has no per-slot
+    /// variant -- it always ends every active touch point at once.
+    pub fn touch_cancel(&mut self) {
+        if let Some(touch) = self.seat.get_touch() {
+            touch.cancel(self);
+        }
+    }
+
     pub fn send_frames(&mut self) {
         // Send frame callbacks to all surfaces so they know when to render.
         //
