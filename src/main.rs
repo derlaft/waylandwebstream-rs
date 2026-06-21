@@ -221,18 +221,21 @@ async fn main() -> Result<()> {
         // Dispatch Wayland events (non-blocking with 16ms timeout)
         event_loop.dispatch(std::time::Duration::from_millis(16), &mut state)
             .context("Event loop dispatch failed")?;
-            
+
         display.dispatch_clients(&mut state)
             .context("Failed to dispatch Wayland clients")?;
-        
-        // Send frame callbacks to surfaces so they know when to render
-        state.send_frames();
-        
+
         display.flush_clients()
             .context("Failed to flush Wayland clients")?;
-        
-        // Render and send frame at target framerate
+
+        // Render and send frame at target framerate. Frame callbacks are sent
+        // from here too, at the same cadence, rather than every loop tick:
+        // clients that redraw on every `frame.done` (e.g. cage) would otherwise
+        // repaint as fast as the event loop spins instead of at the rate we
+        // actually capture and encode, burning CPU for frames nobody captures.
         if loop_start.duration_since(last_frame) >= frame_interval {
+            state.send_frames();
+
             if let Some(framebuffer) = state.render() {
                 let raw_frame = encoder::RawFrame {
                     data: framebuffer,
@@ -240,13 +243,16 @@ async fn main() -> Result<()> {
                     height: state.height,
                     timestamp: (frame_count * 3000) as i64, // 90kHz clock, 30fps
                 };
-                
+
                 // Send frame to encoder (non-blocking)
                 if frame_sender.try_send(raw_frame).is_ok() {
                     frame_count += 1;
                 }
             }
             last_frame = loop_start;
+
+            display.flush_clients()
+                .context("Failed to flush Wayland clients")?;
         }
     }
 }

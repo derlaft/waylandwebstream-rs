@@ -286,11 +286,23 @@ impl WaylandWebStreamState {
     }
     
     pub fn send_frames(&mut self) {
-        // Send frame callbacks to all surfaces so they know when to render
+        // Send frame callbacks to all surfaces so they know when to render.
+        //
+        // `render()` copies surface buffers directly rather than going through
+        // Smithay's renderer-based damage tracking, so no surface ever gets a
+        // primary scan-out output recorded. With throttle = None, Smithay's
+        // frame-callback helper treats every surface as never-overdue and
+        // never sends a callback at all (see `SurfaceFrameThrottlingState::update`),
+        // so clients that wait for `frame.done` before repainting (e.g. cage)
+        // stall forever on their first, often-blank, buffer. Duration::ZERO
+        // makes every surface "overdue" so a callback fires every time this is
+        // called. Callers must therefore call this at the rate they actually
+        // want clients to redraw at (e.g. once per render(), not once per
+        // event-loop tick) or clients will repaint far faster than necessary.
         let time = self.clock.now();
-        
+
         for window in self.space.elements() {
-            window.send_frame(&self.output, time, None, |_, _| None);
+            window.send_frame(&self.output, time, Some(std::time::Duration::ZERO), |_, _| None);
         }
     }
 }
