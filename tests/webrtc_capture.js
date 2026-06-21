@@ -11,11 +11,18 @@ const SCREENSHOT_PATH = process.argv[2] || '/tmp/compositor_test_screenshot.png'
 
 async function captureFrame() {
     console.log('Launching browser...');
+    
+    // Use system chromium
+    const executablePath = '/usr/bin/chromium';
+    console.log(`Using Chromium at: ${executablePath}`);
+    
     const browser = await puppeteer.launch({
-        headless: true,
+        headless: 'new',
+        executablePath: executablePath,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
             '--use-fake-ui-for-media-stream',
             '--use-fake-device-for-media-stream',
         ]

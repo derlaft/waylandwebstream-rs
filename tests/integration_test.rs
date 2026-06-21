@@ -23,37 +23,48 @@ fn test_compositor_pipeline() {
     println!("Starting compositor...");
     let mut compositor = start_compositor();
     
-    // Give it time to initialize
-    thread::sleep(Duration::from_secs(3));
+    // Use a closure to ensure cleanup happens even on panic
+    let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Give it time to initialize
+        thread::sleep(Duration::from_secs(3));
+        
+        // Check if compositor is still running
+        match compositor.try_wait() {
+            Ok(Some(status)) => panic!("Compositor exited early with status: {}", status),
+            Ok(None) => println!("Compositor is running"),
+            Err(e) => panic!("Error checking compositor status: {}", e),
+        }
+        
+        // Launch a simple Wayland client
+        println!("Launching test Wayland client...");
+        let mut client = start_test_client();
+        
+        // Give the client time to connect and render
+        thread::sleep(Duration::from_secs(2));
+        
+        // Connect WebRTC client and capture a frame
+        println!("Connecting WebRTC client...");
+        let screenshot_path = capture_webrtc_frame();
+        
+        // Validate the screenshot
+        println!("Validating screenshot...");
+        validate_screenshot(&screenshot_path);
+        
+        // Cleanup client
+        let _ = client.kill();
+        
+        println!("Test passed!");
+    }));
     
-    // Check if compositor is still running
-    match compositor.try_wait() {
-        Ok(Some(status)) => panic!("Compositor exited early with status: {}", status),
-        Ok(None) => println!("Compositor is running"),
-        Err(e) => panic!("Error checking compositor status: {}", e),
-    }
-    
-    // Launch a simple Wayland client
-    println!("Launching test Wayland client...");
-    let mut client = start_test_client();
-    
-    // Give the client time to connect and render
-    thread::sleep(Duration::from_secs(2));
-    
-    // Connect WebRTC client and capture a frame
-    println!("Connecting WebRTC client...");
-    let screenshot_path = capture_webrtc_frame();
-    
-    // Validate the screenshot
-    println!("Validating screenshot...");
-    validate_screenshot(&screenshot_path);
-    
-    // Cleanup
-    println!("Cleaning up...");
-    let _ = client.kill();
+    // Always cleanup compositor
+    println!("Cleaning up compositor...");
     let _ = compositor.kill();
+    let _ = compositor.wait();
     
-    println!("Test passed!");
+    // Re-panic if the test failed
+    if let Err(e) = test_result {
+        std::panic::resume_unwind(e);
+    }
 }
 
 fn start_compositor() -> Child {
@@ -99,6 +110,8 @@ fn capture_webrtc_frame() -> PathBuf {
     let status = Command::new("node")
         .arg("tests/webrtc_capture.js")
         .arg(&screenshot_path)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .status()
         .expect("Failed to run WebRTC capture script - ensure Node.js and dependencies are installed");
     
@@ -113,6 +126,8 @@ fn validate_screenshot(screenshot_path: &PathBuf) {
     let status = Command::new("node")
         .arg("tests/validate_screenshot.js")
         .arg(screenshot_path)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .status()
         .expect("Failed to run screenshot validation");
     
@@ -124,21 +139,31 @@ fn test_compositor_startup() {
     println!("Testing compositor can start and bind socket...");
     
     let mut compositor = start_compositor();
-    thread::sleep(Duration::from_secs(2));
     
-    // Check if compositor is running
-    match compositor.try_wait() {
-        Ok(Some(status)) => panic!("Compositor exited with status: {}", status),
-        Ok(None) => println!("Compositor started successfully"),
-        Err(e) => panic!("Error checking compositor: {}", e),
-    }
+    let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        thread::sleep(Duration::from_secs(2));
+        
+        // Check if compositor is running
+        match compositor.try_wait() {
+            Ok(Some(status)) => panic!("Compositor exited with status: {}", status),
+            Ok(None) => println!("Compositor started successfully"),
+            Err(e) => panic!("Error checking compositor: {}", e),
+        }
+        
+        // Check if the Wayland socket was created
+        let socket_path = format!("/run/user/{}/wayland-test-0", users::get_current_uid());
+        let socket_exists = std::path::Path::new(&socket_path).exists();
+        
+        assert!(socket_exists, "Wayland socket was not created at {}", socket_path);
+        println!("Test passed!");
+    }));
     
-    // Check if the Wayland socket was created
-    let socket_path = format!("/run/user/{}/wayland-test-0", users::get_current_uid());
-    let socket_exists = std::path::Path::new(&socket_path).exists();
-    
+    // Always cleanup
     let _ = compositor.kill();
+    let _ = compositor.wait();
     
-    assert!(socket_exists, "Wayland socket was not created at {}", socket_path);
-    println!("Test passed!");
+    // Re-panic if the test failed
+    if let Err(e) = test_result {
+        std::panic::resume_unwind(e);
+    }
 }

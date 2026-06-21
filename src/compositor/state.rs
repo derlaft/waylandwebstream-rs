@@ -1,7 +1,10 @@
 // Complete compositor state implementation with full Wayland protocol support
 
 use smithay::{
-    backend::renderer::pixman::PixmanRenderer,
+    backend::renderer::{
+        pixman::PixmanRenderer,
+        utils::with_renderer_surface_state,
+    },
     delegate_compositor, delegate_output, delegate_seat, delegate_shm,
     delegate_xdg_shell,
     desktop::{Space, Window},
@@ -20,7 +23,6 @@ use smithay::{
         buffer::BufferHandler,
         compositor::{
             CompositorClientState, CompositorState as SmithayCompositorState,
-            with_states, SurfaceAttributes,
         },
         output::{OutputManagerState, OutputHandler},
         shell::xdg::{
@@ -167,21 +169,14 @@ impl WaylandWebStreamState {
             
             // Get the window's surface
             if let Some(surface) = window.wl_surface() {
-                // Access the surface buffer directly using with_states
-                let buffer_opt = with_states(&surface, |states| {
-                    states.data_map.get::<std::cell::RefCell<SurfaceAttributes>>().and_then(|attrs_ref| {
-                        let attrs = attrs_ref.borrow();
-                        match &attrs.buffer {
-                            Some(smithay::wayland::compositor::BufferAssignment::NewBuffer(buf)) => Some(buf.clone()),
-                            _ => None
-                        }
-                    })
-                });
-                
-                if let Some(buffer) = buffer_opt {
-                    // Access SHM buffer contents
-                    let _result = smithay::wayland::shm::with_buffer_contents(
-                        &buffer,
+                // Access the surface buffer using renderer surface state
+                // on_commit_buffer_handler stores buffers in RendererSurfaceState, not SurfaceAttributes
+                with_renderer_surface_state(&surface, |state| {
+                    if let Some(buffer) = state.buffer() {
+                        // Buffer derefs to WlBuffer, so we can use it directly with with_buffer_contents
+                        // Access SHM buffer contents
+                        let _result = smithay::wayland::shm::with_buffer_contents(
+                            &*buffer,
                         |ptr, len, buffer_data| {
                             let buffer_width = buffer_data.width as u32;
                             let buffer_height = buffer_data.height as u32;
@@ -222,7 +217,8 @@ impl WaylandWebStreamState {
                             }
                         }
                     );
-                }
+                    }
+                });
             }
         }
         
