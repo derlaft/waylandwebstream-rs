@@ -325,6 +325,18 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
     fn new_popup(&mut self, _surface: smithay::wayland::shell::xdg::PopupSurface, _positioner: smithay::wayland::shell::xdg::PositionerState) {
         info!("New popup surface created");
     }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        let window = self.space.elements()
+            .find(|w| w.toplevel() == Some(&surface))
+            .cloned();
+
+        if let Some(window) = window {
+            self.space.unmap_elem(&window);
+        }
+
+        info!("Window unmapped from space. Total windows: {}", self.space.elements().count());
+    }
     
     fn grab(&mut self, _surface: smithay::wayland::shell::xdg::PopupSurface, _seat: wl_seat::WlSeat, _serial: smithay::utils::Serial) {
         // Handle popup grabs
