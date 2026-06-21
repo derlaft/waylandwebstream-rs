@@ -51,11 +51,18 @@ impl Default for EncoderConfig {
     }
 }
 
+/// Control messages for the encoder
+#[derive(Clone, Debug)]
+pub enum EncoderControl {
+    ForceKeyframe,
+}
+
 /// Handle for controlling the encoder thread
 pub struct EncoderHandle {
     frame_tx: mpsc::Sender<RawFrame>,
     packet_rx: mpsc::Receiver<EncodedPacket>,
     resize_tx: watch::Sender<Option<ResolutionChange>>,
+    control_tx: mpsc::Sender<EncoderControl>,
 }
 
 impl EncoderHandle {
@@ -85,6 +92,24 @@ impl EncoderHandle {
             .send(Some(ResolutionChange { width, height }))
             .context("Failed to send resize request")
     }
+
+    /// Get a cloneable frame sender for use in other threads
+    pub fn get_frame_sender(&self) -> mpsc::Sender<RawFrame> {
+        self.frame_tx.clone()
+    }
+
+    /// Request a keyframe to be generated
+    pub async fn request_keyframe(&self) -> Result<()> {
+        self.control_tx
+            .send(EncoderControl::ForceKeyframe)
+            .await
+            .context("Failed to send keyframe request")
+    }
+
+    /// Get a cloneable control sender
+    pub fn get_control_sender(&self) -> mpsc::Sender<EncoderControl> {
+        self.control_tx.clone()
+    }
 }
 
 /// Spawn the encoder thread
@@ -95,10 +120,11 @@ pub fn spawn_encoder(config: EncoderConfig) -> Result<EncoderHandle> {
     let (frame_tx, frame_rx) = mpsc::channel::<RawFrame>(4); // Bounded channel with small buffer
     let (packet_tx, packet_rx) = mpsc::channel::<EncodedPacket>(16);
     let (resize_tx, resize_rx) = watch::channel::<Option<ResolutionChange>>(None);
+    let (control_tx, control_rx) = mpsc::channel::<EncoderControl>(8);
 
     // Spawn encoder thread
     std::thread::spawn(move || {
-        if let Err(e) = encoder_thread(config, frame_rx, packet_tx, resize_rx) {
+        if let Err(e) = encoder_thread(config, frame_rx, packet_tx, resize_rx, control_rx) {
             error!("Encoder thread failed: {}", e);
         }
     });
@@ -107,6 +133,7 @@ pub fn spawn_encoder(config: EncoderConfig) -> Result<EncoderHandle> {
         frame_tx,
         packet_rx,
         resize_tx,
+        control_tx,
     })
 }
 
@@ -116,6 +143,7 @@ fn encoder_thread(
     mut frame_rx: mpsc::Receiver<RawFrame>,
     packet_tx: mpsc::Sender<EncodedPacket>,
     mut resize_rx: watch::Receiver<Option<ResolutionChange>>,
+    mut control_rx: mpsc::Receiver<EncoderControl>,
 ) -> Result<()> {
     info!("Encoder thread started with config: {:?}", config);
 
@@ -123,8 +151,19 @@ fn encoder_thread(
     let mut encoder = create_encoder(&config)?;
     let mut scaler = create_scaler(&config)?;
     let mut frame_count = 0i64;
+    let mut force_keyframe = false;
 
     loop {
+        // Check for control messages (non-blocking)
+        while let Ok(control) = control_rx.try_recv() {
+            match control {
+                EncoderControl::ForceKeyframe => {
+                    info!("Keyframe requested");
+                    force_keyframe = true;
+                }
+            }
+        }
+
         // Check for resize events
         if resize_rx.has_changed().unwrap_or(false) {
             let resize = resize_rx.borrow_and_update().clone();
@@ -159,6 +198,13 @@ fn encoder_thread(
                 break;
             }
         };
+
+        // Force keyframe if requested by resetting frame count
+        if force_keyframe {
+            info!("Forcing keyframe");
+            frame_count = 0;
+            force_keyframe = false;
+        }
 
         // Encode the frame
         match encode_frame(&mut encoder, &mut scaler, &raw_frame, frame_count) {
@@ -206,6 +252,8 @@ fn create_encoder(config: &EncoderConfig) -> Result<ffmpeg::encoder::Video> {
     opts.set("g", &config.keyframe_interval.to_string()); // GOP size
     opts.set("keyint_min", &config.keyframe_interval.to_string());
     opts.set("sc_threshold", "0"); // Disable scene change detection
+    opts.set("repeat_headers", "1"); // Include SPS/PPS with every keyframe
+    opts.set("annex_b", "1"); // Use Annex B format (required for RTP)
 
     let encoder = encoder.open_with(opts)?;
     

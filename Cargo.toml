@@ -15,6 +15,7 @@ ffmpeg-next = "8.1"
 
 # WebRTC
 webrtc = "0.12"
+interceptor = "0.13"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -39,3 +40,5 @@ serde_json = "1"
 bytes = "1"
 anyhow = "1"
 thiserror = "1.0"
+futures-util = "0.3"
+local-ip-address = "0.6"

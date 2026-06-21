@@ -1,12 +1,5 @@
 // RTP packetization for H.264
-// TODO: Implement RTP packetization
-
-pub struct RtpPacketizer {
-    // TODO: Add RTP packetizer fields
-}
-
-impl RtpPacketizer {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
+//
+// Note: The webrtc-rs crate's TrackLocalStaticRTP handles RTP packetization
+// automatically, including fragmentation of H.264 NAL units according to RFC 6184.
+// This module can be extended in the future if we need custom RTP handling.
