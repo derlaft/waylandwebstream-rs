@@ -2,7 +2,7 @@
 
 use smithay::{
     backend::{
-        input::TouchSlot,
+        input::{Axis, AxisSource, ButtonState, TouchSlot},
         renderer::{
             pixman::PixmanRenderer,
             utils::with_renderer_surface_state,
@@ -13,7 +13,7 @@ use smithay::{
     desktop::{Space, Window},
     input::{
         Seat, SeatState,
-        pointer::CursorImageStatus,
+        pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent as PointerMotionEvent},
         touch::{DownEvent, MotionEvent, UpEvent},
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
@@ -287,15 +287,9 @@ impl WaylandWebStreamState {
         vec![0u8; buffer_size]
     }
     
-    pub fn surface_under_pointer(&self, position: (f64, f64)) -> Option<(WlSurface, (f64, f64))> {
-        self.space.element_under(position).and_then(|(window, pos)| {
-            window.wl_surface().map(|surface| (surface.into_owned(), (pos.x as f64, pos.y as f64)))
-        })
-    }
-
-    /// Resolves a touch point given in output-pixel coordinates to the
-    /// topmost window plus that point translated into the window's own
-    /// buffer-pixel space.
+    /// Resolves a point given in output-pixel coordinates to the topmost
+    /// window plus that point translated into the window's own buffer-pixel
+    /// space. Used by both touch and pointer injection.
     ///
     /// Every window is configured to occupy the entire output (see
     /// `configure_toplevel_fullscreen`), and `render()` scales whatever
@@ -304,11 +298,11 @@ impl WaylandWebStreamState {
     /// resize by a frame or more, or simply never resize at all (see the
     /// `wayland-touch-client` test client). `Space::element_under` hit-tests
     /// against the literal, possibly-stale buffer bbox, which would make
-    /// most of a touch test client's window untouchable. So for touch
-    /// targeting, any point within the output belongs to the topmost
-    /// window, scaled into its buffer space the same way `render()` scales
-    /// the other direction.
-    fn touch_target_at(&self, location: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+    /// most of a touch test client's window untouchable. So for hit
+    /// testing, any point within the output belongs to the topmost window,
+    /// scaled into its buffer space the same way `render()` scales the
+    /// other direction.
+    fn surface_at(&self, location: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
         if location.x < 0.0
             || location.y < 0.0
             || location.x >= self.width as f64
@@ -340,11 +334,11 @@ impl WaylandWebStreamState {
     pub fn touch_down(&mut self, slot: i32, x: f64, y: f64) {
         let Some(touch) = self.seat.get_touch() else { return };
         let location = Point::<f64, Logical>::from((x, y));
-        let target = self.touch_target_at(location);
+        let target = self.surface_at(location);
         let time = self.clock.now().as_millis();
         // The location handed to `TouchHandle::down` is delivered to the
         // client as-is, minus the focus origin we pass alongside it. We've
-        // already done that translation ourselves in `touch_target_at`, so
+        // already done that translation ourselves in `surface_at`, so
         // pass a zero origin and let `event.location` be the final,
         // already-surface-local coordinate.
         let (focus, event_location) = match target {
@@ -367,7 +361,7 @@ impl WaylandWebStreamState {
     pub fn touch_motion(&mut self, slot: i32, x: f64, y: f64) {
         let Some(touch) = self.seat.get_touch() else { return };
         let location = Point::<f64, Logical>::from((x, y));
-        let target = self.touch_target_at(location);
+        let target = self.surface_at(location);
         let time = self.clock.now().as_millis();
         let (focus, event_location) = match target {
             Some((surface, surface_local)) => (Some((surface, Point::from((0.0, 0.0)))), surface_local),
@@ -412,6 +406,62 @@ impl WaylandWebStreamState {
     pub fn touch_cancel(&mut self) {
         if let Some(touch) = self.seat.get_touch() {
             touch.cancel(self);
+        }
+    }
+
+    /// Move the pointer to the given output-pixel coordinates.
+    pub fn pointer_motion(&mut self, x: f64, y: f64) {
+        let Some(pointer) = self.seat.get_pointer() else { return };
+        let location = Point::<f64, Logical>::from((x, y));
+        let target = self.surface_at(location);
+        let time = self.clock.now().as_millis();
+        let (focus, event_location) = match target {
+            Some((surface, surface_local)) => (Some((surface, Point::from((0.0, 0.0)))), surface_local),
+            None => (None, location),
+        };
+        pointer.motion(
+            self,
+            focus,
+            &PointerMotionEvent {
+                location: event_location,
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+    }
+
+    /// Press or release a pointer button (Linux button code, e.g. `BTN_LEFT`).
+    pub fn pointer_button(&mut self, button: u32, pressed: bool) {
+        let Some(pointer) = self.seat.get_pointer() else { return };
+        let time = self.clock.now().as_millis();
+        pointer.button(
+            self,
+            &ButtonEvent {
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+                button,
+                state: if pressed { ButtonState::Pressed } else { ButtonState::Released },
+            },
+        );
+    }
+
+    /// Scroll by the given amount (wheel or trackpad delta, in surface-local pixels).
+    pub fn pointer_axis(&mut self, delta_x: f64, delta_y: f64) {
+        let Some(pointer) = self.seat.get_pointer() else { return };
+        let time = self.clock.now().as_millis();
+        let frame = AxisFrame::new(time)
+            .source(AxisSource::Wheel)
+            .value(Axis::Horizontal, delta_x)
+            .value(Axis::Vertical, delta_y);
+        pointer.axis(self, frame);
+    }
+
+    /// Marks the end of a batch of pointer motion/button/axis calls that
+    /// logically belong together (e.g. a motion plus the button event it's
+    /// paired with), mirroring `touch_frame`.
+    pub fn pointer_frame(&mut self) {
+        if let Some(pointer) = self.seat.get_pointer() {
+            pointer.frame(self);
         }
     }
 
@@ -503,15 +553,21 @@ impl smithay::wayland::compositor::CompositorHandler for WaylandWebStreamState {
         // Handle surface commits - apply pending state
         use smithay::backend::renderer::utils::on_commit_buffer_handler;
         on_commit_buffer_handler::<Self>(surface);
-        
-        let is_window_surface = self.space.elements().any(|w| {
-            w.wl_surface().map(|s| &*s == surface).unwrap_or(false)
-        });
-        
-        if is_window_surface {
+
+        // `Window::bbox()` is a cache that only `Window::on_commit()` refreshes;
+        // without this, it stays at its initial (0,0) forever and `surface_at`'s
+        // `.max(1)` fallback collapses every touch/pointer hit-test target to a
+        // 1x1 box, regardless of where the client's buffer actually is.
+        if let Some(window) = self
+            .space
+            .elements()
+            .find(|w| w.wl_surface().map(|s| &*s == surface).unwrap_or(false))
+            .cloned()
+        {
+            window.on_commit();
             info!("Window surface committed");
         }
-        
+
         // Surface state is updated, frame callbacks will be sent in main loop
     }
 }

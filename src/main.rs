@@ -18,6 +18,7 @@ mod webrtc;
 
 use compositor::CompositorState;
 use encoder::{EncoderConfig, spawn_encoder};
+use input::mouse::MouseHandler;
 use input::touch::TouchHandler;
 use webrtc::session::SessionManager;
 use webrtc::signaling::{SignalingServer, SignalingState};
@@ -93,14 +94,16 @@ async fn main() -> Result<()> {
     let (packet_tx, packet_rx) = mpsc::channel(16);
     let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32)>(4);
     let (touch_tx, mut touch_rx) = mpsc::channel(32); // Higher capacity for touch events
+    let (mouse_tx, mut mouse_rx) = mpsc::channel(64); // Higher capacity for pointer moves
 
     // Create signaling state and server
-    let signaling_state = SignalingState::new(offer_tx, resize_tx, touch_tx);
+    let signaling_state = SignalingState::new(offer_tx, resize_tx, touch_tx, mouse_tx);
     let ice_tx = signaling_state.get_ice_sender();
     let signaling_server = SignalingServer::new(signaling_state.clone());
 
-    // Create touch handler
+    // Create touch and pointer handlers
     let mut touch_handler = TouchHandler::new(width, height);
+    let mut mouse_handler = MouseHandler::new(width, height);
 
     info!("\n╔══════════════════════════════════════════════════════════════╗");
     info!("║  Phase 4 Implementation: Basic Touch Input                  ║");
@@ -176,7 +179,7 @@ async fn main() -> Result<()> {
     
     // Main event loop for Wayland compositor (synchronous)
     let mut frame_count = 0u64;
-    let frame_interval = std::time::Duration::from_millis(33); // ~30fps
+    let frame_interval = std::time::Duration::from_millis(17); // ~60fps
     let mut last_frame = std::time::Instant::now();
     
     loop {
@@ -199,8 +202,9 @@ async fn main() -> Result<()> {
             // Resize compositor output
             state.resize_output(new_width, new_height);
             
-            // Update touch handler dimensions
+            // Update touch and pointer handler dimensions
             touch_handler.set_dimensions(new_width, new_height);
+            mouse_handler.set_dimensions(new_width, new_height);
             
             // Resize encoder
             if let Err(e) = encoder_resize.send(Some(encoder::ResolutionChange {
@@ -213,9 +217,12 @@ async fn main() -> Result<()> {
             info!("Resize complete: {}x{}", new_width, new_height);
         }
         
-        // Process touch events (non-blocking, drain all available)
+        // Process touch and pointer events (non-blocking, drain all available)
         while let Ok(touch_event) = touch_rx.try_recv() {
             touch_handler.handle_event(touch_event, &mut state);
+        }
+        while let Ok(mouse_event) = mouse_rx.try_recv() {
+            mouse_handler.handle_event(mouse_event, &mut state);
         }
         
         // Dispatch Wayland events (non-blocking with 16ms timeout)

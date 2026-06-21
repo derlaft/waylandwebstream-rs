@@ -19,6 +19,7 @@
         #video {
             display: block;
             object-fit: none;
+            touch-action: none;
         }
         #status {
             position: fixed;
@@ -135,16 +136,34 @@
             }
         }
 
+        // ICE gathering (and thus pc.onicecandidate) can start producing
+        // candidates before the WebSocket finishes its handshake, since it's
+        // only opened after the SDP offer/answer round trip completes.
+        // Queue anything sent before `ws.onopen` instead of throwing.
+        let wsQueue = [];
+        function wsSend(message) {
+            const json = JSON.stringify(message);
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(json);
+            } else {
+                wsQueue.push(json);
+            }
+        }
+
         function connectWebSocket() {
             const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
-            
+
             console.log('Connecting to WebSocket:', wsUrl);
             ws = new WebSocket(wsUrl);
 
             ws.onopen = () => {
                 console.log('WebSocket connected');
                 ws.send(JSON.stringify({ type: 'ready' }));
+                for (const json of wsQueue) {
+                    ws.send(json);
+                }
+                wsQueue = [];
             };
 
             ws.onmessage = async (event) => {
@@ -171,17 +190,19 @@
                 console.log('WebSocket closed');
             };
 
-            // Send ICE candidates to server
+            // Send ICE candidates to server. Gathering can produce candidates
+            // before this WebSocket finishes connecting, so route through the
+            // queueing `wsSend` rather than calling `ws.send` directly.
             pc.onicecandidate = (event) => {
                 if (event.candidate) {
-                    ws.send(JSON.stringify({
+                    wsSend({
                         type: 'ice',
                         candidate: {
                             candidate: event.candidate.candidate,
                             sdpMLineIndex: event.candidate.sdpMLineIndex,
                             sdpMid: event.candidate.sdpMid
                         }
-                    }));
+                    });
                 }
             };
         }
@@ -286,6 +307,69 @@
         video.addEventListener('touchcancel', (e) => {
             e.preventDefault();
             sendTouchEvent('touchcancel', e.changedTouches);
+        }, { passive: false });
+
+        // Mouse/pen input handling via Pointer Events. Touch contacts arrive
+        // as PointerEvents too (pointerType "touch"), but those are already
+        // handled above via the dedicated touch listeners, so they're
+        // ignored here to avoid injecting the same physical contact twice.
+        function normalizedPointer(e, videoRect) {
+            const x = (e.clientX - videoRect.left) / videoRect.width;
+            const y = (e.clientY - videoRect.top) / videoRect.height;
+            return {
+                x: Math.min(Math.max(x, 0), 1),
+                y: Math.min(Math.max(y, 0), 1),
+                button: e.button,
+                pointerType: e.pointerType,
+                pressure: e.pressure,
+            };
+        }
+
+        function sendPointerEvent(eventType, pointer) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            ws.send(JSON.stringify({ type: 'pointer', eventType, pointer }));
+        }
+
+        video.addEventListener('pointerdown', (e) => {
+            if (e.pointerType === 'touch') return;
+            e.preventDefault();
+            video.setPointerCapture(e.pointerId);
+            sendPointerEvent('pointerdown', normalizedPointer(e, video.getBoundingClientRect()));
+        });
+
+        video.addEventListener('pointermove', (e) => {
+            if (e.pointerType === 'touch') return;
+            sendPointerEvent('pointermove', normalizedPointer(e, video.getBoundingClientRect()));
+        });
+
+        video.addEventListener('pointerup', (e) => {
+            if (e.pointerType === 'touch') return;
+            video.releasePointerCapture(e.pointerId);
+            sendPointerEvent('pointerup', normalizedPointer(e, video.getBoundingClientRect()));
+        });
+
+        video.addEventListener('pointercancel', (e) => {
+            if (e.pointerType === 'touch') return;
+            sendPointerEvent('pointercancel', normalizedPointer(e, video.getBoundingClientRect()));
+        });
+
+        // Disable the native context menu so right-click reaches the remote app
+        video.addEventListener('contextmenu', (e) => e.preventDefault());
+
+        video.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            const videoRect = video.getBoundingClientRect();
+            const x = Math.min(Math.max((e.clientX - videoRect.left) / videoRect.width, 0), 1);
+            const y = Math.min(Math.max((e.clientY - videoRect.top) / videoRect.height, 0), 1);
+            ws.send(JSON.stringify({
+                type: 'pointer',
+                eventType: 'wheel',
+                x: x,
+                y: y,
+                deltaX: e.deltaX,
+                deltaY: e.deltaY,
+            }));
         }, { passive: false });
 
         // Start the connection

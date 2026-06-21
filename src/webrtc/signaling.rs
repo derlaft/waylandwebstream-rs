@@ -16,6 +16,7 @@ use tokio::sync::{broadcast, mpsc};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
+use crate::input::mouse::MouseEvent;
 use crate::input::touch::TouchEvent;
 use crate::web::client_html::CLIENT_HTML;
 
@@ -60,6 +61,11 @@ pub enum SignalingMessage {
         #[serde(flatten)]
         event: TouchEvent,
     },
+    #[serde(rename = "pointer")]
+    Pointer {
+        #[serde(flatten)]
+        event: MouseEvent,
+    },
 }
 
 /// Shared state for the signaling server
@@ -73,6 +79,8 @@ pub struct SignalingState {
     resize_tx: mpsc::Sender<(u32, u32)>,
     /// Channel to send touch events from clients
     touch_tx: mpsc::Sender<TouchEvent>,
+    /// Channel to send pointer (mouse/pen) events from clients
+    mouse_tx: mpsc::Sender<MouseEvent>,
 }
 
 impl SignalingState {
@@ -80,9 +88,10 @@ impl SignalingState {
         offer_tx: mpsc::Sender<(SdpOffer, tokio::sync::oneshot::Sender<SdpAnswer>)>,
         resize_tx: mpsc::Sender<(u32, u32)>,
         touch_tx: mpsc::Sender<TouchEvent>,
+        mouse_tx: mpsc::Sender<MouseEvent>,
     ) -> Self {
         let (ice_tx, _) = broadcast::channel(16);
-        Self { ice_tx, offer_tx, resize_tx, touch_tx }
+        Self { ice_tx, offer_tx, resize_tx, touch_tx, mouse_tx }
     }
 
     pub fn get_ice_receiver(&self) -> broadcast::Receiver<IceCandidate> {
@@ -233,6 +242,12 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                         // Touch events can be frequent, so only log at debug level
                         if let Err(e) = state.touch_tx.send(event).await {
                             warn!("Failed to send touch event: {}", e);
+                        }
+                    }
+                    SignalingMessage::Pointer { event } => {
+                        // Pointer events can be frequent, so only log at debug level
+                        if let Err(e) = state.mouse_tx.send(event).await {
+                            warn!("Failed to send pointer event: {}", e);
                         }
                     }
                 }
