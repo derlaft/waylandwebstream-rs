@@ -18,7 +18,10 @@ use smithay::{
     utils::{Clock, Monotonic},
     wayland::{
         buffer::BufferHandler,
-        compositor::{CompositorClientState, CompositorState as SmithayCompositorState},
+        compositor::{
+            CompositorClientState, CompositorState as SmithayCompositorState,
+            with_states, SurfaceAttributes,
+        },
         output::{OutputManagerState, OutputHandler},
         shell::xdg::{
             XdgShellState, ToplevelSurface,
@@ -134,37 +137,97 @@ impl WaylandWebStreamState {
     }
 
     pub fn render(&mut self) -> Option<Vec<u8>> {
-        // For now, just render a background that indicates compositor is working
-        // We'll show different color if we have windows mapped
         let buffer_size = (self.width * self.height * 4) as usize;
         let mut render_buffer = vec![0u8; buffer_size];
         
+        // Clear to black background
+        for pixel in render_buffer.chunks_exact_mut(4) {
+            pixel[0] = 0;   // B
+            pixel[1] = 0;   // G
+            pixel[2] = 0;   // R
+            pixel[3] = 255; // A
+        }
+        
         let window_count = self.space.elements().count();
-        let has_windows = window_count > 0;
         
         // Log every 30 frames (once per second at 30fps)
         static mut FRAME_COUNTER: u32 = 0;
         unsafe {
             FRAME_COUNTER += 1;
             if FRAME_COUNTER % 30 == 0 {
-                info!("Render called: {} windows in space", window_count);
+                info!("Rendering {} windows", window_count);
             }
         }
         
-        // If we have windows, render a different background to show they're recognized
-        if has_windows {
-            // Green/teal background when windows are present - very visible!
-            for y in 0..self.height {
-                for x in 0..self.width {
-                    let idx = ((y * self.width + x) * 4) as usize;
-                    render_buffer[idx] = 100;     // B
-                    render_buffer[idx + 1] = 200; // G (bright green)
-                    render_buffer[idx + 2] = 100; // R
-                    render_buffer[idx + 3] = 255; // A
+        // Render each window
+        for window in self.space.elements() {
+            let location = self.space.element_location(window).unwrap_or((0, 0).into());
+            let window_pos_x = location.x.max(0) as u32;
+            let window_pos_y = location.y.max(0) as u32;
+            
+            // Get the window's surface
+            if let Some(surface) = window.wl_surface() {
+                // Access the surface buffer directly using with_states
+                let buffer_opt = with_states(&surface, |states| {
+                    states.data_map.get::<std::cell::RefCell<SurfaceAttributes>>().and_then(|attrs_ref| {
+                        let attrs = attrs_ref.borrow();
+                        match &attrs.buffer {
+                            Some(smithay::wayland::compositor::BufferAssignment::NewBuffer(buf)) => Some(buf.clone()),
+                            _ => None
+                        }
+                    })
+                });
+                
+                if let Some(buffer) = buffer_opt {
+                    // Access SHM buffer contents
+                    let _result = smithay::wayland::shm::with_buffer_contents(
+                        &buffer,
+                        |ptr, len, buffer_data| {
+                            let buffer_width = buffer_data.width as u32;
+                            let buffer_height = buffer_data.height as u32;
+                            let buffer_stride = buffer_data.stride as u32;
+                            let buffer_offset = buffer_data.offset as isize;
+                            
+                            unsafe {
+                                if FRAME_COUNTER % 120 == 0 {
+                                    info!("Rendering buffer: {}x{}", buffer_width, buffer_height);
+                                }
+                            }
+                            
+                            // Access pixel data safely
+                            let expected_len = (buffer_stride * buffer_height) as usize;
+                            if buffer_offset as usize + expected_len <= len {
+                                let pixel_data = unsafe {
+                                    std::slice::from_raw_parts(ptr.offset(buffer_offset), expected_len)
+                                };
+                                
+                                // Copy pixels from client buffer to output framebuffer
+                                for y in 0..buffer_height.min(self.height - window_pos_y) {
+                                    for x in 0..buffer_width.min(self.width - window_pos_x) {
+                                        let dest_y = window_pos_y + y;
+                                        let dest_x = window_pos_x + x;
+                                        
+                                        let src_idx = (y * buffer_stride + x * 4) as usize;
+                                        let dest_idx = ((dest_y * self.width + dest_x) * 4) as usize;
+                                        
+                                        if src_idx + 3 < pixel_data.len() && dest_idx + 3 < render_buffer.len() {
+                                            // Copy ARGB8888/XRGB8888 pixel
+                                            render_buffer[dest_idx] = pixel_data[src_idx];
+                                            render_buffer[dest_idx + 1] = pixel_data[src_idx + 1];
+                                            render_buffer[dest_idx + 2] = pixel_data[src_idx + 2];
+                                            render_buffer[dest_idx + 3] = pixel_data[src_idx + 3];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    );
                 }
             }
-        } else {
-            // Test pattern when no windows (original behavior)
+        }
+        
+        // If no windows, show test pattern
+        if window_count == 0 {
             for y in 0..self.height {
                 for x in 0..self.width {
                     let idx = ((y * self.width + x) * 4) as usize;
