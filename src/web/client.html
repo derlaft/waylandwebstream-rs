@@ -13,12 +13,12 @@
             justify-content: center;
             align-items: center;
             height: 100vh;
+            width: 100vw;
             font-family: sans-serif;
         }
         #video {
-            max-width: 100%;
-            max-height: 100vh;
             display: block;
+            object-fit: none;
         }
         #status {
             position: fixed;
@@ -200,6 +200,34 @@
                 document.body.appendChild(playButton);
             });
         };
+
+        // Handle window resize
+        let resizeTimeout;
+        function sendResizeRequest() {
+            // Round to dimensions divisible by 16 for optimal H.264 encoding
+            const width = Math.floor(window.innerWidth / 16) * 16;
+            const height = Math.floor(window.innerHeight / 16) * 16;
+            
+            console.log('Requesting resolution:', width, 'x', height);
+            
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'resize',
+                    width: width,
+                    height: height
+                }));
+            }
+        }
+
+        window.addEventListener('resize', () => {
+            clearTimeout(resizeTimeout);
+            resizeTimeout = setTimeout(sendResizeRequest, 300);
+        });
+
+        // Send initial resize request after connection
+        window.addEventListener('load', () => {
+            setTimeout(sendResizeRequest, 1000);
+        });
 
         // Start the connection
         start();

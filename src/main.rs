@@ -90,9 +90,10 @@ async fn main() -> Result<()> {
     // Create channels for WebRTC
     let (offer_tx, offer_rx) = mpsc::channel(4);
     let (packet_tx, packet_rx) = mpsc::channel(16);
+    let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32)>(4);
 
     // Create signaling state and server
-    let signaling_state = SignalingState::new(offer_tx);
+    let signaling_state = SignalingState::new(offer_tx, resize_tx);
     let ice_tx = signaling_state.get_ice_sender();
     let signaling_server = SignalingServer::new(signaling_state.clone());
 
@@ -130,9 +131,10 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Get frame sender and encoder control sender before moving encoder
+    // Get frame sender, encoder control sender, and resize sender before moving encoder
     let frame_sender = encoder.get_frame_sender();
     let encoder_control = encoder.get_control_sender();
+    let encoder_resize = encoder.get_resize_sender();
 
     // Spawn the session manager with ICE sender and encoder control
     let session_manager = SessionManager::new(offer_rx, packet_rx, ice_tx, encoder_control);
@@ -167,6 +169,34 @@ async fn main() -> Result<()> {
     
     loop {
         let loop_start = std::time::Instant::now();
+        
+        // Check for resize requests (non-blocking)
+        if let Ok((req_width, req_height)) = resize_rx.try_recv() {
+            // Ensure dimensions are divisible by 16 for optimal H.264 encoding
+            let new_width = (req_width / 16) * 16;
+            let new_height = (req_height / 16) * 16;
+            
+            // Validate minimum dimensions (minimum 16x16 after rounding)
+            if new_width < 16 || new_height < 16 {
+                warn!("Ignoring resize request with dimensions too small: {}x{}", req_width, req_height);
+                continue;
+            }
+            
+            info!("Processing resize request: {}x{}", new_width, new_height);
+            
+            // Resize compositor output
+            state.resize_output(new_width, new_height);
+            
+            // Resize encoder
+            if let Err(e) = encoder_resize.send(Some(encoder::ResolutionChange {
+                width: new_width,
+                height: new_height,
+            })) {
+                warn!("Failed to send resize to encoder: {}", e);
+            }
+            
+            info!("Resize complete: {}x{}", new_width, new_height);
+        }
         
         // Dispatch Wayland events (non-blocking with 16ms timeout)
         event_loop.dispatch(std::time::Duration::from_millis(16), &mut state)

@@ -110,6 +110,11 @@ impl EncoderHandle {
     pub fn get_control_sender(&self) -> mpsc::Sender<EncoderControl> {
         self.control_tx.clone()
     }
+
+    /// Get a cloneable resize sender
+    pub fn get_resize_sender(&self) -> watch::Sender<Option<ResolutionChange>> {
+        self.resize_tx.clone()
+    }
 }
 
 /// Spawn the encoder thread

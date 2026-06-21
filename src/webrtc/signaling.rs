@@ -52,6 +52,8 @@ pub enum SignalingMessage {
     Ice { candidate: IceCandidate },
     #[serde(rename = "ready")]
     Ready,
+    #[serde(rename = "resize")]
+    Resize { width: u32, height: u32 },
 }
 
 /// Shared state for the signaling server
@@ -61,14 +63,17 @@ pub struct SignalingState {
     ice_tx: broadcast::Sender<IceCandidate>,
     /// Channel to send offers from clients to the WebRTC session manager
     offer_tx: mpsc::Sender<(SdpOffer, tokio::sync::oneshot::Sender<SdpAnswer>)>,
+    /// Channel to send resize requests from clients
+    resize_tx: mpsc::Sender<(u32, u32)>,
 }
 
 impl SignalingState {
     pub fn new(
         offer_tx: mpsc::Sender<(SdpOffer, tokio::sync::oneshot::Sender<SdpAnswer>)>,
+        resize_tx: mpsc::Sender<(u32, u32)>,
     ) -> Self {
         let (ice_tx, _) = broadcast::channel(16);
-        Self { ice_tx, offer_tx }
+        Self { ice_tx, offer_tx, resize_tx }
     }
 
     pub fn get_ice_receiver(&self) -> broadcast::Receiver<IceCandidate> {
@@ -210,6 +215,10 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                     }
                     SignalingMessage::Ready => {
                         info!("Client is ready");
+                    }
+                    SignalingMessage::Resize { width, height } => {
+                        info!("Received resize request from client: {}x{}", width, height);
+                        let _ = state.resize_tx.send((width, height)).await;
                     }
                 }
             }
