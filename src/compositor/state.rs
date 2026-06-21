@@ -12,6 +12,7 @@ use smithay::{
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::EventLoop,
+        wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::{wl_seat, wl_surface::WlSurface},
@@ -136,6 +137,28 @@ impl WaylandWebStreamState {
         self.output.set_preferred(mode);
         self.width = width;
         self.height = height;
+
+        // Tell every mapped client window about the new viewport size so it
+        // redraws to fill the screen instead of staying at its old size.
+        let toplevels: Vec<ToplevelSurface> = self
+            .space
+            .elements()
+            .filter_map(|window| window.toplevel().cloned())
+            .collect();
+        for toplevel in toplevels {
+            self.configure_toplevel_fullscreen(&toplevel);
+            toplevel.send_configure();
+        }
+    }
+
+    /// Configures a toplevel's pending state to occupy the entire output,
+    /// borderless. Used both for newly created windows and on viewport resize.
+    fn configure_toplevel_fullscreen(&self, surface: &ToplevelSurface) {
+        surface.with_pending_state(|state| {
+            state.size = Some((self.width as i32, self.height as i32).into());
+            state.states.set(xdg_toplevel::State::Maximized);
+            state.states.set(xdg_toplevel::State::Activated);
+        });
     }
 
     pub fn render(&mut self) -> Option<Vec<u8>> {
@@ -196,21 +219,28 @@ impl WaylandWebStreamState {
                                     std::slice::from_raw_parts(ptr.offset(buffer_offset), expected_len)
                                 };
                                 
-                                // Copy pixels from client buffer to output framebuffer
-                                for y in 0..buffer_height.min(self.height - window_pos_y) {
-                                    for x in 0..buffer_width.min(self.width - window_pos_x) {
-                                        let dest_y = window_pos_y + y;
-                                        let dest_x = window_pos_x + x;
-                                        
-                                        let src_idx = (y * buffer_stride + x * 4) as usize;
-                                        let dest_idx = ((dest_y * self.width + dest_x) * 4) as usize;
-                                        
-                                        if src_idx + 3 < pixel_data.len() && dest_idx + 3 < render_buffer.len() {
-                                            // Copy ARGB8888/XRGB8888 pixel
-                                            render_buffer[dest_idx] = pixel_data[src_idx];
-                                            render_buffer[dest_idx + 1] = pixel_data[src_idx + 1];
-                                            render_buffer[dest_idx + 2] = pixel_data[src_idx + 2];
-                                            render_buffer[dest_idx + 3] = pixel_data[src_idx + 3];
+                                // Scale the client buffer to fill the space available to it
+                                // on the output. Windows are configured to match the output
+                                // size, but we scale rather than copy 1:1 so the picture still
+                                // fills the screen for a frame or two while a client catches up
+                                // to a viewport resize (or doesn't honor it exactly).
+                                let target_width = self.width.saturating_sub(window_pos_x);
+                                let target_height = self.height.saturating_sub(window_pos_y);
+
+                                if buffer_width > 0 && buffer_height > 0 && target_width > 0 && target_height > 0 {
+                                    for dest_y in 0..target_height {
+                                        let src_y = (dest_y as u64 * buffer_height as u64 / target_height as u64) as u32;
+                                        for dest_x in 0..target_width {
+                                            let src_x = (dest_x as u64 * buffer_width as u64 / target_width as u64) as u32;
+
+                                            let src_idx = (src_y * buffer_stride + src_x * 4) as usize;
+                                            let dest_idx = (((window_pos_y + dest_y) * self.width + (window_pos_x + dest_x)) * 4) as usize;
+
+                                            if src_idx + 3 < pixel_data.len() && dest_idx + 3 < render_buffer.len() {
+                                                // Copy ARGB8888/XRGB8888 pixel
+                                                render_buffer[dest_idx..dest_idx + 4]
+                                                    .copy_from_slice(&pixel_data[src_idx..src_idx + 4]);
+                                            }
                                         }
                                     }
                                 }
@@ -274,11 +304,9 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
     
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         info!("New toplevel surface created");
-        
-        // Send initial configure to the client
-        surface.with_pending_state(|state| {
-            state.size = Some((self.width as i32, self.height as i32).into());
-        });
+
+        // Send initial configure to the client, sized to fill the output
+        self.configure_toplevel_fullscreen(&surface);
         surface.send_configure();
         
         #[allow(deprecated)]
