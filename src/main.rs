@@ -63,8 +63,11 @@ async fn main() -> Result<()> {
         .insert_source(
             socket_source,
             move |client_stream, _, _state| {
-                // Accept new clients with empty client data
-                if let Err(e) = display_handle.insert_client(client_stream, Arc::new(())) {
+                // Accept new clients with proper client state
+                let client_state = compositor::state::ClientState {
+                    compositor_state: smithay::wayland::compositor::CompositorClientState::default(),
+                };
+                if let Err(e) = display_handle.insert_client(client_stream, Arc::new(client_state)) {
                     info!("Failed to insert client: {}", e);
                 } else {
                     info!("New client connected");
@@ -155,45 +158,16 @@ async fn main() -> Result<()> {
     display.dispatch_clients(&mut state)
         .context("Failed to dispatch Wayland clients")?;
     
-    // Spawn a tokio task to generate test frames
-    let frame_width = width;
-    let frame_height = height;
-    tokio::spawn(async move {
-        info!("Test pattern generator started: {}x{} @ 30fps", frame_width, frame_height);
-        let mut frame_count = 0u64;
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(33)); // ~30fps
-        
-        loop {
-            interval.tick().await;
-            
-            // Generate animated gradient test pattern
-            let mut framebuffer = vec![0u8; (frame_width * frame_height * 4) as usize];
-            for y in 0..frame_height {
-                for x in 0..frame_width {
-                    let idx = ((y * frame_width + x) * 4) as usize;
-                    framebuffer[idx] = ((x * 255) / frame_width) as u8;     // Blue
-                    framebuffer[idx + 1] = ((y * 255) / frame_height) as u8; // Green
-                    framebuffer[idx + 2] = (frame_count % 255) as u8; // Red (animated)
-                    framebuffer[idx + 3] = 255; // Alpha
-                }
-            }
-            
-            let raw_frame = encoder::RawFrame {
-                data: framebuffer,
-                width: frame_width,
-                height: frame_height,
-                timestamp: (frame_count * 3000) as i64, // 90kHz clock, 30fps
-            };
-            
-            // Send frame to encoder
-            if frame_sender.try_send(raw_frame).is_ok() {
-                frame_count += 1;
-            }
-        }
-    });
+    info!("Starting compositor render loop");
     
     // Main event loop for Wayland compositor (synchronous)
+    let mut frame_count = 0u64;
+    let frame_interval = std::time::Duration::from_millis(33); // ~30fps
+    let mut last_frame = std::time::Instant::now();
+    
     loop {
+        let loop_start = std::time::Instant::now();
+        
         // Dispatch Wayland events (non-blocking with 16ms timeout)
         event_loop.dispatch(std::time::Duration::from_millis(16), &mut state)
             .context("Event loop dispatch failed")?;
@@ -201,7 +175,28 @@ async fn main() -> Result<()> {
         display.dispatch_clients(&mut state)
             .context("Failed to dispatch Wayland clients")?;
         
+        // Send frame callbacks to surfaces so they know when to render
+        state.send_frames();
+        
         display.flush_clients()
             .context("Failed to flush Wayland clients")?;
+        
+        // Render and send frame at target framerate
+        if loop_start.duration_since(last_frame) >= frame_interval {
+            if let Some(framebuffer) = state.render() {
+                let raw_frame = encoder::RawFrame {
+                    data: framebuffer,
+                    width: state.width,
+                    height: state.height,
+                    timestamp: (frame_count * 3000) as i64, // 90kHz clock, 30fps
+                };
+                
+                // Send frame to encoder (non-blocking)
+                if frame_sender.try_send(raw_frame).is_ok() {
+                    frame_count += 1;
+                }
+            }
+            last_frame = loop_start;
+        }
     }
 }
