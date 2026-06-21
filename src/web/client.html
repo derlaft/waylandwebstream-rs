@@ -229,6 +229,65 @@
             setTimeout(sendResizeRequest, 1000);
         });
 
+        // Touch input handling
+        function normalizeTouches(touchList, videoRect) {
+            const touches = [];
+            for (let i = 0; i < touchList.length; i++) {
+                const touch = touchList[i];
+                // Convert to normalized coordinates (0.0 to 1.0)
+                const x = (touch.clientX - videoRect.left) / videoRect.width;
+                const y = (touch.clientY - videoRect.top) / videoRect.height;
+                
+                // Only include touches within the video bounds
+                if (x >= 0 && x <= 1 && y >= 0 && y <= 1) {
+                    touches.push({
+                        identifier: touch.identifier,
+                        x: x,
+                        y: y,
+                        pressure: touch.force || 0.5 // Use force if available, default to 0.5
+                    });
+                }
+            }
+            return touches;
+        }
+
+        function sendTouchEvent(eventType, touchList) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            
+            const videoRect = video.getBoundingClientRect();
+            const touches = normalizeTouches(touchList, videoRect);
+            
+            if (touches.length > 0) {
+                ws.send(JSON.stringify({
+                    type: 'touch',
+                    eventType: eventType,
+                    touches: touches
+                }));
+            }
+        }
+
+        // Prevent default touch behavior to avoid scrolling/zooming
+        video.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            sendTouchEvent('touchstart', e.touches);
+        }, { passive: false });
+
+        video.addEventListener('touchmove', (e) => {
+            e.preventDefault();
+            sendTouchEvent('touchmove', e.touches);
+        }, { passive: false });
+
+        video.addEventListener('touchend', (e) => {
+            e.preventDefault();
+            // For touchend, we need to send the changed touches (the ones that ended)
+            sendTouchEvent('touchend', e.changedTouches);
+        }, { passive: false });
+
+        video.addEventListener('touchcancel', (e) => {
+            e.preventDefault();
+            sendTouchEvent('touchcancel', e.changedTouches);
+        }, { passive: false });
+
         // Start the connection
         start();
 

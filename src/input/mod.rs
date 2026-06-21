@@ -2,4 +2,5 @@ pub mod touch;
 pub mod keyboard;
 pub mod mouse;
 
-// Browser event deserialization
+// Re-export commonly used types
+pub use touch::{TouchEvent, TouchHandler, TouchPoint};

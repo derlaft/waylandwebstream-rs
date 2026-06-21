@@ -16,6 +16,7 @@ use tokio::sync::{broadcast, mpsc};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
+use crate::input::touch::TouchEvent;
 use crate::web::client_html::CLIENT_HTML;
 
 /// SDP offer from the browser
@@ -54,6 +55,11 @@ pub enum SignalingMessage {
     Ready,
     #[serde(rename = "resize")]
     Resize { width: u32, height: u32 },
+    #[serde(rename = "touch")]
+    Touch {
+        #[serde(flatten)]
+        event: TouchEvent,
+    },
 }
 
 /// Shared state for the signaling server
@@ -65,15 +71,18 @@ pub struct SignalingState {
     offer_tx: mpsc::Sender<(SdpOffer, tokio::sync::oneshot::Sender<SdpAnswer>)>,
     /// Channel to send resize requests from clients
     resize_tx: mpsc::Sender<(u32, u32)>,
+    /// Channel to send touch events from clients
+    touch_tx: mpsc::Sender<TouchEvent>,
 }
 
 impl SignalingState {
     pub fn new(
         offer_tx: mpsc::Sender<(SdpOffer, tokio::sync::oneshot::Sender<SdpAnswer>)>,
         resize_tx: mpsc::Sender<(u32, u32)>,
+        touch_tx: mpsc::Sender<TouchEvent>,
     ) -> Self {
         let (ice_tx, _) = broadcast::channel(16);
-        Self { ice_tx, offer_tx, resize_tx }
+        Self { ice_tx, offer_tx, resize_tx, touch_tx }
     }
 
     pub fn get_ice_receiver(&self) -> broadcast::Receiver<IceCandidate> {
@@ -219,6 +228,12 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                     SignalingMessage::Resize { width, height } => {
                         info!("Received resize request from client: {}x{}", width, height);
                         let _ = state.resize_tx.send((width, height)).await;
+                    }
+                    SignalingMessage::Touch { event } => {
+                        // Touch events can be frequent, so only log at debug level
+                        if let Err(e) = state.touch_tx.send(event).await {
+                            warn!("Failed to send touch event: {}", e);
+                        }
                     }
                 }
             }

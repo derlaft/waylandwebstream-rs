@@ -18,6 +18,7 @@ mod webrtc;
 
 use compositor::CompositorState;
 use encoder::{EncoderConfig, spawn_encoder};
+use input::touch::TouchHandler;
 use webrtc::session::SessionManager;
 use webrtc::signaling::{SignalingServer, SignalingState};
 
@@ -91,20 +92,25 @@ async fn main() -> Result<()> {
     let (offer_tx, offer_rx) = mpsc::channel(4);
     let (packet_tx, packet_rx) = mpsc::channel(16);
     let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32)>(4);
+    let (touch_tx, mut touch_rx) = mpsc::channel(32); // Higher capacity for touch events
 
     // Create signaling state and server
-    let signaling_state = SignalingState::new(offer_tx, resize_tx);
+    let signaling_state = SignalingState::new(offer_tx, resize_tx, touch_tx);
     let ice_tx = signaling_state.get_ice_sender();
     let signaling_server = SignalingServer::new(signaling_state.clone());
 
+    // Create touch handler
+    let mut touch_handler = TouchHandler::new(width, height);
+
     info!("\n╔══════════════════════════════════════════════════════════════╗");
-    info!("║  Phase 3 Implementation Complete: WebRTC Streaming          ║");
+    info!("║  Phase 4 Implementation: Basic Touch Input                  ║");
     info!("╠══════════════════════════════════════════════════════════════╣");
     info!("║  ✓ WebRTC peer connection with H.264 support                ║");
     info!("║  ✓ HTTP/WebSocket signaling server                          ║");
     info!("║  ✓ RTP packetization (via webrtc-rs)                        ║");
     info!("║  ✓ Browser client with video playback                       ║");
     info!("║  ✓ ICE/STUN support for NAT traversal                       ║");
+    info!("║  ✓ Touch input handling (multi-touch support)               ║");
     info!("╠══════════════════════════════════════════════════════════════╣");
     info!("║  Server Configuration:                                       ║");
     info!("║  - Resolution: {}x{} @ 30fps                       ║", width, height);
@@ -115,8 +121,14 @@ async fn main() -> Result<()> {
     info!("║  Connect with browser:                                       ║");
     info!("║  http://localhost:{}                                      ║", config.port);
     info!("╠══════════════════════════════════════════════════════════════╣");
-    info!("║  Next Steps (Phase 4):                                      ║");
-    info!("║  - Implement touch input handling                            ║");
+    info!("║  Touch Input Features:                                       ║");
+    info!("║  - Multi-touch support with coordinate mapping               ║");
+    info!("║  - Touch pressure sensitivity                                ║");
+    info!("║  - Automatic coordinate normalization                        ║");
+    info!("║  - Touch event batching and efficient processing             ║");
+    info!("╠══════════════════════════════════════════════════════════════╣");
+    info!("║  Next Steps (Phase 5):                                       ║");
+    info!("║  - Integrate touch with Wayland virtual input device         ║");
     info!("║  - Add keyboard/mouse support                                ║");
     info!("║  - Bidirectional data channel communication                  ║");
     info!("╚══════════════════════════════════════════════════════════════╝\n");
@@ -187,6 +199,9 @@ async fn main() -> Result<()> {
             // Resize compositor output
             state.resize_output(new_width, new_height);
             
+            // Update touch handler dimensions
+            touch_handler.set_dimensions(new_width, new_height);
+            
             // Resize encoder
             if let Err(e) = encoder_resize.send(Some(encoder::ResolutionChange {
                 width: new_width,
@@ -196,6 +211,11 @@ async fn main() -> Result<()> {
             }
             
             info!("Resize complete: {}x{}", new_width, new_height);
+        }
+        
+        // Process touch events (non-blocking, drain all available)
+        while let Ok(touch_event) = touch_rx.try_recv() {
+            touch_handler.handle_event(touch_event);
         }
         
         // Dispatch Wayland events (non-blocking with 16ms timeout)

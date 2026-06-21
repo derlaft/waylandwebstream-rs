@@ -1,12 +1,335 @@
 // Touch event handling and coordinate mapping
-// TODO: Implement touch event parsing
 
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use tracing::{debug, warn};
+
+/// Touch event types from the browser
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "eventType")]
+pub enum TouchEvent {
+    #[serde(rename = "touchstart")]
+    Start { touches: Vec<TouchPoint> },
+    #[serde(rename = "touchmove")]
+    Move { touches: Vec<TouchPoint> },
+    #[serde(rename = "touchend")]
+    End { touches: Vec<TouchPoint> },
+    #[serde(rename = "touchcancel")]
+    Cancel { touches: Vec<TouchPoint> },
+}
+
+/// A single touch point from the browser
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TouchPoint {
+    /// Unique identifier for this touch
+    pub identifier: i32,
+    /// X coordinate relative to the video element (0.0 to 1.0)
+    pub x: f64,
+    /// Y coordinate relative to the video element (0.0 to 1.0)
+    pub y: f64,
+    /// Pressure/force of the touch (0.0 to 1.0)
+    #[serde(default)]
+    pub pressure: f64,
+}
+
+/// Internal state for a tracked touch
+#[derive(Debug, Clone)]
+struct TouchState {
+    /// Browser identifier
+    identifier: i32,
+    /// Current X position in compositor coordinates
+    x: f64,
+    /// Current Y position in compositor coordinates
+    y: f64,
+    /// Touch pressure
+    pressure: f64,
+}
+
+/// Touch handler that manages touch state and coordinate mapping
 pub struct TouchHandler {
-    // TODO: Add touch handling fields
+    /// Current compositor width
+    width: u32,
+    /// Current compositor height
+    height: u32,
+    /// Active touches tracked by browser identifier
+    active_touches: HashMap<i32, TouchState>,
 }
 
 impl TouchHandler {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(width: u32, height: u32) -> Self {
+        debug!("Creating touch handler for {}x{}", width, height);
+        Self {
+            width,
+            height,
+            active_touches: HashMap::new(),
+        }
+    }
+
+    /// Update the compositor dimensions for coordinate mapping
+    pub fn set_dimensions(&mut self, width: u32, height: u32) {
+        debug!("Touch handler: updating dimensions to {}x{}", width, height);
+        self.width = width;
+        self.height = height;
+    }
+
+    /// Convert normalized coordinates (0.0-1.0) to compositor coordinates
+    fn to_compositor_coords(&self, x: f64, y: f64) -> (f64, f64) {
+        let comp_x = x * self.width as f64;
+        let comp_y = y * self.height as f64;
+        (comp_x, comp_y)
+    }
+
+    /// Process a touch event from the browser
+    pub fn handle_event(&mut self, event: TouchEvent) {
+        match event {
+            TouchEvent::Start { touches } => {
+                debug!("Touch start: {} touches", touches.len());
+                for touch in touches {
+                    let (x, y) = self.to_compositor_coords(touch.x, touch.y);
+                    let state = TouchState {
+                        identifier: touch.identifier,
+                        x,
+                        y,
+                        pressure: touch.pressure,
+                    };
+                    self.active_touches.insert(touch.identifier, state.clone());
+                    debug!(
+                        "Touch {} down at ({:.1}, {:.1}) pressure={:.2}",
+                        touch.identifier, x, y, touch.pressure
+                    );
+                    // TODO: Send to Wayland virtual touch device
+                }
+            }
+            TouchEvent::Move { touches } => {
+                debug!("Touch move: {} touches", touches.len());
+                for touch in touches {
+                    let (x, y) = self.to_compositor_coords(touch.x, touch.y);
+                    if let Some(state) = self.active_touches.get_mut(&touch.identifier) {
+                        state.x = x;
+                        state.y = y;
+                        state.pressure = touch.pressure;
+                        debug!(
+                            "Touch {} moved to ({:.1}, {:.1}) pressure={:.2}",
+                            touch.identifier, x, y, touch.pressure
+                        );
+                        // TODO: Send to Wayland virtual touch device
+                    } else {
+                        warn!("Touch move for unknown touch: {}", touch.identifier);
+                    }
+                }
+            }
+            TouchEvent::End { touches } => {
+                debug!("Touch end: {} touches", touches.len());
+                for touch in touches {
+                    if let Some(state) = self.active_touches.remove(&touch.identifier) {
+                        debug!(
+                            "Touch {} up at ({:.1}, {:.1})",
+                            touch.identifier, state.x, state.y
+                        );
+                        // TODO: Send to Wayland virtual touch device
+                    } else {
+                        warn!("Touch end for unknown touch: {}", touch.identifier);
+                    }
+                }
+            }
+            TouchEvent::Cancel { touches } => {
+                debug!("Touch cancel: {} touches", touches.len());
+                for touch in touches {
+                    if let Some(state) = self.active_touches.remove(&touch.identifier) {
+                        debug!(
+                            "Touch {} cancelled at ({:.1}, {:.1})",
+                            touch.identifier, state.x, state.y
+                        );
+                        // TODO: Send to Wayland virtual touch device
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get the number of currently active touches
+    pub fn active_touch_count(&self) -> usize {
+        self.active_touches.len()
+    }
+
+    /// Clear all active touches (e.g., on disconnect)
+    pub fn clear_touches(&mut self) {
+        debug!("Clearing {} active touches", self.active_touches.len());
+        self.active_touches.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_touch_handler_creation() {
+        let handler = TouchHandler::new(1920, 1080);
+        assert_eq!(handler.width, 1920);
+        assert_eq!(handler.height, 1080);
+        assert_eq!(handler.active_touch_count(), 0);
+    }
+
+    #[test]
+    fn test_coordinate_mapping() {
+        let handler = TouchHandler::new(1920, 1080);
+        
+        // Test center of screen
+        let (x, y) = handler.to_compositor_coords(0.5, 0.5);
+        assert_eq!(x, 960.0);
+        assert_eq!(y, 540.0);
+        
+        // Test top-left corner
+        let (x, y) = handler.to_compositor_coords(0.0, 0.0);
+        assert_eq!(x, 0.0);
+        assert_eq!(y, 0.0);
+        
+        // Test bottom-right corner
+        let (x, y) = handler.to_compositor_coords(1.0, 1.0);
+        assert_eq!(x, 1920.0);
+        assert_eq!(y, 1080.0);
+    }
+
+    #[test]
+    fn test_touch_start_and_end() {
+        let mut handler = TouchHandler::new(1920, 1080);
+        
+        // Start a touch
+        let event = TouchEvent::Start {
+            touches: vec![TouchPoint {
+                identifier: 0,
+                x: 0.5,
+                y: 0.5,
+                pressure: 0.8,
+            }],
+        };
+        handler.handle_event(event);
+        assert_eq!(handler.active_touch_count(), 1);
+        
+        // End the touch
+        let event = TouchEvent::End {
+            touches: vec![TouchPoint {
+                identifier: 0,
+                x: 0.5,
+                y: 0.5,
+                pressure: 0.8,
+            }],
+        };
+        handler.handle_event(event);
+        assert_eq!(handler.active_touch_count(), 0);
+    }
+
+    #[test]
+    fn test_multiple_touches() {
+        let mut handler = TouchHandler::new(1920, 1080);
+        
+        // Start two touches
+        let event = TouchEvent::Start {
+            touches: vec![
+                TouchPoint {
+                    identifier: 0,
+                    x: 0.25,
+                    y: 0.25,
+                    pressure: 0.8,
+                },
+                TouchPoint {
+                    identifier: 1,
+                    x: 0.75,
+                    y: 0.75,
+                    pressure: 0.9,
+                },
+            ],
+        };
+        handler.handle_event(event);
+        assert_eq!(handler.active_touch_count(), 2);
+        
+        // Move both touches
+        let event = TouchEvent::Move {
+            touches: vec![
+                TouchPoint {
+                    identifier: 0,
+                    x: 0.3,
+                    y: 0.3,
+                    pressure: 0.8,
+                },
+                TouchPoint {
+                    identifier: 1,
+                    x: 0.7,
+                    y: 0.7,
+                    pressure: 0.9,
+                },
+            ],
+        };
+        handler.handle_event(event);
+        assert_eq!(handler.active_touch_count(), 2);
+        
+        // End one touch
+        let event = TouchEvent::End {
+            touches: vec![TouchPoint {
+                identifier: 0,
+                x: 0.3,
+                y: 0.3,
+                pressure: 0.8,
+            }],
+        };
+        handler.handle_event(event);
+        assert_eq!(handler.active_touch_count(), 1);
+        
+        // End the other touch
+        let event = TouchEvent::End {
+            touches: vec![TouchPoint {
+                identifier: 1,
+                x: 0.7,
+                y: 0.7,
+                pressure: 0.9,
+            }],
+        };
+        handler.handle_event(event);
+        assert_eq!(handler.active_touch_count(), 0);
+    }
+
+    #[test]
+    fn test_dimension_update() {
+        let mut handler = TouchHandler::new(1920, 1080);
+        
+        // Update dimensions
+        handler.set_dimensions(3840, 2160);
+        assert_eq!(handler.width, 3840);
+        assert_eq!(handler.height, 2160);
+        
+        // Test coordinate mapping with new dimensions
+        let (x, y) = handler.to_compositor_coords(0.5, 0.5);
+        assert_eq!(x, 1920.0);
+        assert_eq!(y, 1080.0);
+    }
+
+    #[test]
+    fn test_clear_touches() {
+        let mut handler = TouchHandler::new(1920, 1080);
+        
+        // Start multiple touches
+        let event = TouchEvent::Start {
+            touches: vec![
+                TouchPoint {
+                    identifier: 0,
+                    x: 0.25,
+                    y: 0.25,
+                    pressure: 0.8,
+                },
+                TouchPoint {
+                    identifier: 1,
+                    x: 0.75,
+                    y: 0.75,
+                    pressure: 0.9,
+                },
+            ],
+        };
+        handler.handle_event(event);
+        assert_eq!(handler.active_touch_count(), 2);
+        
+        // Clear all touches
+        handler.clear_touches();
+        assert_eq!(handler.active_touch_count(), 0);
     }
 }
