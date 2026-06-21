@@ -1,0 +1,13 @@
+{
+  "name": "waylandwebstream-tests",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Integration tests for WaylandWebStream compositor",
+  "scripts": {
+    "install-deps": "npm install"
+  },
+  "dependencies": {
+    "puppeteer": "^21.0.0",
+    "pngjs": "^7.0.0"
+  }
+}

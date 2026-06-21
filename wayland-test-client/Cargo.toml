@@ -1,0 +1,14 @@
+[package]
+name = "wayland-test-client"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "wayland-test-client"
+path = "src/main.rs"
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+memmap2 = "0.9"
+tempfile = "3"

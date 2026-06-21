@@ -125,6 +125,29 @@ Then open `http://<server-ip>:8080` in a browser.
 - TURN support is not included initially since the server has a public IP, but
   can be added later for edge cases.
 
+## Testing
+
+To run the integration tests:
+
+```sh
+# Install Node.js test dependencies (puppeteer for WebRTC client testing)
+cd tests && npm install && cd ..
+
+# Run the full integration test suite
+./run_integration_test.sh
+```
+
+The test suite validates the entire pipeline: compositor startup, Wayland client rendering, WebRTC streaming, and screenshot validation.
+
+### Development Guidelines
+
+**Important notes for AI assistants and contributors:**
+
+* **When you need a common system tool, ask the user to install it** (instead of giving up instantly, trying 10 other tools, then giving up and writing a script/tool yourself)
+* **Avoid this situation specifically:** changing tooling from the best option just because something did not work or took too long the first time you tried
+* Be patient with package installations (like puppeteer downloading Chrome) - they may take time but are necessary
+* Use the right tool for the job, even if it requires user intervention to install dependencies
+
 ## License
 
 This project is licensed under the **GNU Affero General Public License v3.0**
