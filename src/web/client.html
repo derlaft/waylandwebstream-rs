@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WaylandWebStream Client</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            font-family: sans-serif;
+        }
+        #video {
+            max-width: 100%;
+            max-height: 100vh;
+            display: block;
+        }
+        #status {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div id="status">Connecting...</div>
+    <video id="video" autoplay playsinline></video>
+
+    <script>
+        // TODO: Implement WebRTC client
+        const status = document.getElementById('status');
+        const video = document.getElementById('video');
+
+        status.textContent = 'WebRTC client not yet implemented';
+
+        // Placeholder for WebRTC implementation
+        console.log('WaylandWebStream client loaded');
+    </script>
+</body>
+</html>
