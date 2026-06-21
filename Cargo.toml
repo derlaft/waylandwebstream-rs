@@ -19,6 +19,9 @@ ffmpeg-next = "8.1"
 # WebRTC
 webrtc = "0.12"
 interceptor = "0.13"
+turn = "0.9"
+webrtc-util = { version = "0.10", default-features = false, features = ["conn", "vnet"] }
+rand = "0.8"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

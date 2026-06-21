@@ -20,6 +20,15 @@ pub struct Config {
     #[arg(long, default_value = "stun:stun.l.google.com:19302")]
     pub stun: String,
 
+    /// UDP port for the embedded TURN relay
+    #[arg(long, default_value = "3478")]
+    pub turn_port: u16,
+
+    /// Public IP address clients should use to reach the embedded TURN relay
+    /// (e.g. your netbird IP). Auto-detected if not set.
+    #[arg(long)]
+    pub turn_public_ip: Option<String>,
+
     /// Target framerate
     #[arg(long, default_value = "30")]
     pub framerate: u32,

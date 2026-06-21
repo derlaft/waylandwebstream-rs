@@ -3040,6 +3040,7 @@ dependencies = [
  "futures-util",
  "interceptor",
  "local-ip-address",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "smithay",
@@ -3050,8 +3051,10 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "turn",
  "users",
  "webrtc",
+ "webrtc-util",
 ]
 
 [[package]]

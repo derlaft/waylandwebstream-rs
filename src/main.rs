@@ -22,6 +22,7 @@ use input::mouse::MouseHandler;
 use input::touch::TouchHandler;
 use webrtc::session::SessionManager;
 use webrtc::signaling::{SignalingServer, SignalingState};
+use webrtc::turn_server::{self, IceServerConfig, TurnCredentials};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -92,12 +93,40 @@ async fn main() -> Result<()> {
     // Create channels for WebRTC
     let (offer_tx, offer_rx) = mpsc::channel(4);
     let (packet_tx, packet_rx) = mpsc::channel(16);
+    let (remote_ice_tx, remote_ice_rx) = mpsc::channel(16);
     let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32)>(4);
     let (touch_tx, mut touch_rx) = mpsc::channel(32); // Higher capacity for touch events
     let (mouse_tx, mut mouse_rx) = mpsc::channel(64); // Higher capacity for pointer moves
 
+    // Start the embedded TURN relay. Browsers' mDNS-obfuscated host
+    // candidates can't be resolved over networks (like netbird's WireGuard
+    // overlay) that don't carry multicast traffic, so a TURN relay is needed
+    // for ICE to have any usable candidate pair.
+    let turn_relay_ip = if let Some(ip_str) = &config.turn_public_ip {
+        ip_str
+            .parse()
+            .context("Invalid --turn-public-ip address")?
+    } else {
+        turn_server::detect_relay_address()
+            .context("Failed to auto-detect a TURN relay address; pass --turn-public-ip")?
+    };
+    info!("Embedded TURN relay address: {}:{}", turn_relay_ip, config.turn_port);
+
+    let turn_credentials = TurnCredentials::generate();
+    let ice_config = IceServerConfig {
+        stun_url: config.stun.clone(),
+        turn_url: format!("turn:{}:{}", turn_relay_ip, config.turn_port),
+        turn_username: turn_credentials.username.clone(),
+        turn_password: turn_credentials.password.clone(),
+    };
+
+    // Kept alive for the lifetime of the process; the main loop below never returns.
+    let _turn_server = turn_server::spawn_turn_server(config.turn_port, turn_relay_ip, &turn_credentials)
+        .await
+        .context("Failed to start embedded TURN server")?;
+
     // Create signaling state and server
-    let signaling_state = SignalingState::new(offer_tx, resize_tx, touch_tx, mouse_tx);
+    let signaling_state = SignalingState::new(offer_tx, remote_ice_tx, resize_tx, touch_tx, mouse_tx, ice_config.clone());
     let ice_tx = signaling_state.get_ice_sender();
     let signaling_server = SignalingServer::new(signaling_state.clone());
 
@@ -152,7 +181,7 @@ async fn main() -> Result<()> {
     let encoder_resize = encoder.get_resize_sender();
 
     // Spawn the session manager with ICE sender and encoder control
-    let session_manager = SessionManager::new(offer_rx, packet_rx, ice_tx, encoder_control);
+    let session_manager = SessionManager::new(offer_rx, packet_rx, remote_ice_rx, ice_tx, encoder_control, ice_config);
     tokio::spawn(async move {
         if let Err(e) = session_manager.run().await {
             tracing::error!("Session manager error: {}", e);

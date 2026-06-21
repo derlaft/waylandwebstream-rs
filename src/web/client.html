@@ -57,14 +57,20 @@
 
         async function start() {
             try {
+                setStatus('Fetching ICE config...', 'status-connecting');
+
+                // Fetch the STUN/TURN server list from the server (it embeds
+                // its own TURN relay, with credentials generated at startup).
+                const iceConfigResponse = await fetch('/ice-config');
+                if (!iceConfigResponse.ok) {
+                    throw new Error('Failed to fetch ICE config: ' + iceConfigResponse.statusText);
+                }
+                const { iceServers } = await iceConfigResponse.json();
+
                 setStatus('Creating peer connection...', 'status-connecting');
 
-                // Create RTCPeerConnection with STUN server
-                pc = new RTCPeerConnection({
-                    iceServers: [
-                        { urls: 'stun:stun.l.google.com:19302' }
-                    ]
-                });
+                // Create RTCPeerConnection with STUN + the embedded TURN relay
+                pc = new RTCPeerConnection({ iceServers });
 
                 // Handle incoming tracks
                 pc.ontrack = (event) => {
@@ -90,6 +96,25 @@
                     console.log('Connection state:', pc.connectionState);
                     if (pc.connectionState === 'failed') {
                         setStatus('Connection failed', 'status-error');
+                    }
+                };
+
+                // Attach the ICE candidate handler now, before any network
+                // round trip. Gathering starts as soon as setLocalDescription
+                // is called below, and candidates fired before a listener is
+                // attached are lost forever (events aren't replayed) - so
+                // this must happen before createOffer/setLocalDescription,
+                // not after the offer/answer exchange completes.
+                pc.onicecandidate = (event) => {
+                    if (event.candidate) {
+                        wsSend({
+                            type: 'ice',
+                            candidate: {
+                                candidate: event.candidate.candidate,
+                                sdpMLineIndex: event.candidate.sdpMLineIndex,
+                                sdpMid: event.candidate.sdpMid
+                            }
+                        });
                     }
                 };
 
@@ -136,9 +161,8 @@
             }
         }
 
-        // ICE gathering (and thus pc.onicecandidate) can start producing
-        // candidates before the WebSocket finishes its handshake, since it's
-        // only opened after the SDP offer/answer round trip completes.
+        // ICE gathering produces candidates well before the WebSocket opens
+        // (it isn't connected until after the SDP offer/answer round trip).
         // Queue anything sent before `ws.onopen` instead of throwing.
         let wsQueue = [];
         function wsSend(message) {
@@ -188,22 +212,6 @@
 
             ws.onclose = () => {
                 console.log('WebSocket closed');
-            };
-
-            // Send ICE candidates to server. Gathering can produce candidates
-            // before this WebSocket finishes connecting, so route through the
-            // queueing `wsSend` rather than calling `ws.send` directly.
-            pc.onicecandidate = (event) => {
-                if (event.candidate) {
-                    wsSend({
-                        type: 'ice',
-                        candidate: {
-                            candidate: event.candidate.candidate,
-                            sdpMLineIndex: event.candidate.sdpMLineIndex,
-                            sdpMid: event.candidate.sdpMid
-                        }
-                    });
-                }
             };
         }
 

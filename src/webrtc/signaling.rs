@@ -19,6 +19,24 @@ use tracing::{info, warn};
 use crate::input::mouse::MouseEvent;
 use crate::input::touch::TouchEvent;
 use crate::web::client_html::CLIENT_HTML;
+use crate::webrtc::turn_server::IceServerConfig;
+
+/// A single ICE server entry, shaped to match the `RTCIceServer` dictionary
+/// the browser's `RTCPeerConnection` constructor expects.
+#[derive(Serialize)]
+pub struct IceServerJson {
+    pub urls: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IceConfigResponse {
+    pub ice_servers: Vec<IceServerJson>,
+}
 
 /// SDP offer from the browser
 #[derive(Debug, Deserialize)]
@@ -75,23 +93,29 @@ pub struct SignalingState {
     ice_tx: broadcast::Sender<IceCandidate>,
     /// Channel to send offers from clients to the WebRTC session manager
     offer_tx: mpsc::Sender<(SdpOffer, tokio::sync::oneshot::Sender<SdpAnswer>)>,
+    /// Channel to forward ICE candidates trickled by clients to the WebRTC session manager
+    remote_ice_tx: mpsc::Sender<IceCandidate>,
     /// Channel to send resize requests from clients
     resize_tx: mpsc::Sender<(u32, u32)>,
     /// Channel to send touch events from clients
     touch_tx: mpsc::Sender<TouchEvent>,
     /// Channel to send pointer (mouse/pen) events from clients
     mouse_tx: mpsc::Sender<MouseEvent>,
+    /// STUN/TURN server list handed out to clients via `/ice-config`
+    ice_config: IceServerConfig,
 }
 
 impl SignalingState {
     pub fn new(
         offer_tx: mpsc::Sender<(SdpOffer, tokio::sync::oneshot::Sender<SdpAnswer>)>,
+        remote_ice_tx: mpsc::Sender<IceCandidate>,
         resize_tx: mpsc::Sender<(u32, u32)>,
         touch_tx: mpsc::Sender<TouchEvent>,
         mouse_tx: mpsc::Sender<MouseEvent>,
+        ice_config: IceServerConfig,
     ) -> Self {
         let (ice_tx, _) = broadcast::channel(16);
-        Self { ice_tx, offer_tx, resize_tx, touch_tx, mouse_tx }
+        Self { ice_tx, offer_tx, remote_ice_tx, resize_tx, touch_tx, mouse_tx, ice_config }
     }
 
     pub fn get_ice_receiver(&self) -> broadcast::Receiver<IceCandidate> {
@@ -129,6 +153,7 @@ impl SignalingServer {
         let router = Router::new()
             .route("/", get(serve_client))
             .route("/offer", post(handle_offer))
+            .route("/ice-config", get(handle_ice_config))
             .route("/ws", get(handle_websocket))
             .layer(TraceLayer::new_for_http())
             .with_state(state);
@@ -157,6 +182,25 @@ impl SignalingServer {
 /// Serve the HTML/JS client
 async fn serve_client() -> Html<&'static str> {
     Html(CLIENT_HTML)
+}
+
+/// Serve the STUN/TURN server list the client should use for ICE
+async fn handle_ice_config(State(state): State<SignalingState>) -> Json<IceConfigResponse> {
+    let ice_config = &state.ice_config;
+    Json(IceConfigResponse {
+        ice_servers: vec![
+            IceServerJson {
+                urls: vec![ice_config.stun_url.clone()],
+                username: None,
+                credential: None,
+            },
+            IceServerJson {
+                urls: vec![ice_config.turn_url.clone()],
+                username: Some(ice_config.turn_username.clone()),
+                credential: Some(ice_config.turn_password.clone()),
+            },
+        ],
+    })
 }
 
 /// Handle SDP offer from browser
@@ -229,7 +273,9 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                 match msg {
                     SignalingMessage::Ice { candidate } => {
                         info!("Received ICE candidate from client: {:?}", candidate);
-                        // TODO: Forward to WebRTC peer connection
+                        if let Err(e) = state.remote_ice_tx.send(candidate).await {
+                            warn!("Failed to forward ICE candidate to session manager: {}", e);
+                        }
                     }
                     SignalingMessage::Ready => {
                         info!("Client is ready");

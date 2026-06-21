@@ -12,6 +12,7 @@ use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
+use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::media::Sample;
@@ -24,6 +25,7 @@ use webrtc::track::track_local::TrackLocal;
 
 use crate::encoder::{EncodedPacket, EncoderControl};
 use crate::webrtc::signaling::{IceCandidate, SdpAnswer, SdpOffer};
+use crate::webrtc::turn_server::IceServerConfig;
 
 /// WebRTC session for a single client
 pub struct Session {
@@ -33,7 +35,7 @@ pub struct Session {
 
 impl Session {
     /// Create a new WebRTC session
-    pub async fn new(ice_tx: mpsc::Sender<IceCandidate>) -> Result<Self> {
+    pub async fn new(ice_tx: mpsc::Sender<IceCandidate>, ice_config: &IceServerConfig) -> Result<Self> {
         // Create a MediaEngine with H.264 support
         let mut media_engine = MediaEngine::default();
         
@@ -84,12 +86,22 @@ impl Session {
             .with_setting_engine(setting_engine)
             .build();
 
-        // Configure ICE servers (STUN)
+        // Configure ICE servers: STUN plus our embedded TURN relay, needed
+        // for networks like netbird's WireGuard overlay that can't carry the
+        // multicast mDNS traffic required to resolve browsers' obfuscated
+        // host candidates.
         let config = RTCConfiguration {
-            ice_servers: vec![RTCIceServer {
-                urls: vec!["stun:stun.l.google.com:19302".to_owned()],
-                ..Default::default()
-            }],
+            ice_servers: vec![
+                RTCIceServer {
+                    urls: vec![ice_config.stun_url.clone()],
+                    ..Default::default()
+                },
+                RTCIceServer {
+                    urls: vec![ice_config.turn_url.clone()],
+                    username: ice_config.turn_username.clone(),
+                    credential: ice_config.turn_password.clone(),
+                },
+            ],
             ..Default::default()
         };
 
@@ -218,6 +230,19 @@ impl Session {
         })
     }
 
+    /// Add a remote ICE candidate received (trickled) from the client
+    pub async fn add_ice_candidate(&self, candidate: IceCandidate) -> Result<()> {
+        self.peer_connection
+            .add_ice_candidate(RTCIceCandidateInit {
+                candidate: candidate.candidate,
+                sdp_mid: candidate.sdp_mid,
+                sdp_mline_index: Some(candidate.sdp_mline_index),
+                ..Default::default()
+            })
+            .await
+            .context("Failed to add remote ICE candidate")
+    }
+
     /// Send an encoded video packet over the track
     pub async fn send_video_packet(&self, packet: EncodedPacket) -> Result<()> {
         // Create a Sample for the track (duration ~33ms for 30fps)
@@ -250,8 +275,10 @@ impl Session {
 pub struct SessionManager {
     offer_rx: mpsc::Receiver<(SdpOffer, tokio::sync::oneshot::Sender<SdpAnswer>)>,
     packet_rx: mpsc::Receiver<EncodedPacket>,
+    remote_ice_rx: mpsc::Receiver<IceCandidate>,
     ice_tx: mpsc::Sender<IceCandidate>,
     encoder_control_tx: mpsc::Sender<EncoderControl>,
+    ice_config: IceServerConfig,
     active_session: Option<Arc<Session>>,
 }
 
@@ -259,14 +286,18 @@ impl SessionManager {
     pub fn new(
         offer_rx: mpsc::Receiver<(SdpOffer, tokio::sync::oneshot::Sender<SdpAnswer>)>,
         packet_rx: mpsc::Receiver<EncodedPacket>,
+        remote_ice_rx: mpsc::Receiver<IceCandidate>,
         ice_tx: mpsc::Sender<IceCandidate>,
         encoder_control_tx: mpsc::Sender<EncoderControl>,
+        ice_config: IceServerConfig,
     ) -> Self {
         Self {
             offer_rx,
             packet_rx,
+            remote_ice_rx,
             ice_tx,
             encoder_control_tx,
+            ice_config,
             active_session: None,
         }
     }
@@ -281,7 +312,7 @@ impl SessionManager {
                 Some((offer, answer_tx)) = self.offer_rx.recv() => {
                     info!("Received new offer, creating session");
                     
-                    match Session::new(self.ice_tx.clone()).await {
+                    match Session::new(self.ice_tx.clone(), &self.ice_config).await {
                         Ok(session) => {
                             match session.handle_offer(offer).await {
                                 Ok(answer) => {
@@ -301,6 +332,15 @@ impl SessionManager {
                         }
                         Err(e) => {
                             error!("Failed to create session: {}", e);
+                        }
+                    }
+                }
+
+                // Forward trickled ICE candidates from the client to the active session
+                Some(candidate) = self.remote_ice_rx.recv() => {
+                    if let Some(ref session) = self.active_session {
+                        if let Err(e) = session.add_ice_candidate(candidate).await {
+                            warn!("Failed to add remote ICE candidate: {}", e);
                         }
                     }
                 }
