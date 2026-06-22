@@ -181,9 +181,17 @@ reductions. Land 1–3 together so you can A/B against Selkies.
   here, the expected win didn't justify the added unsafe code and an extra failure
   mode (thread-pool setup) on this path.
 
-- [ ] **Encoder queue drops** — `main.rs:334` `frame_sender.try_send` silently drops
+- [x] **Encoder queue drops** — `main.rs:334` `frame_sender.try_send` silently drops
   frames when the encoder lags (channel cap 4). Fine as backpressure, but worth logging/
   counting so dropped frames don't masquerade as a pacing problem.
+  **Done:** added a `dropped_frames: u64` counter in the capture loop, incremented on
+  `try_send` failure. Logs a `warn!` on the first drop and every 30th after that
+  (matching the existing "log every 30 frames" cadence used elsewhere in the codebase)
+  rather than every single drop, since under sustained encoder lag this could fire up
+  to once per tick. A dropped frame also now counts toward `ticks_since_render`'s
+  staleness tracking (added for damage tracking, above) -- the encoder didn't actually
+  get a fresh frame that tick, so it should still count toward forcing the next
+  periodic render.
 
 ## Tier 4 — Cleanup (low risk, reduces confusion)
 

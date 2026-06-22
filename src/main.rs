@@ -277,6 +277,11 @@ async fn main() -> Result<()> {
     // out periodically (decoder resync after loss) rather than only once at
     // stream start.
     let mut ticks_since_render = 0u32;
+    // Total frames lost to `frame_sender.try_send` finding the encoder queue
+    // full (capacity 4). Expected as backpressure when the encoder lags, but
+    // worth surfacing -- otherwise dropped frames look identical to a pacing
+    // bug from the receiving end.
+    let mut dropped_frames = 0u64;
 
     loop {
         let loop_start = std::time::Instant::now();
@@ -364,9 +369,25 @@ async fn main() -> Result<()> {
                     };
 
                     // Send frame to encoder (non-blocking)
-                    if frame_sender.try_send(raw_frame).is_ok() {
-                        frame_count += 1;
-                        ticks_since_render = 0;
+                    match frame_sender.try_send(raw_frame) {
+                        Ok(()) => {
+                            frame_count += 1;
+                            ticks_since_render = 0;
+                        }
+                        Err(_) => {
+                            // Queue full: the encoder hasn't drained the
+                            // previous frame(s) yet. Counts toward staleness
+                            // too -- the encoder didn't actually get a fresh
+                            // frame this tick.
+                            dropped_frames += 1;
+                            ticks_since_render += 1;
+                            if dropped_frames == 1 || dropped_frames % 30 == 0 {
+                                warn!(
+                                    "Encoder queue full, dropped {} frame(s) so far",
+                                    dropped_frames
+                                );
+                            }
+                        }
                     }
                 }
             } else {
