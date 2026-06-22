@@ -68,6 +68,9 @@ pub struct WaylandWebStreamState {
     // cleared by `take_dirty()`. Lets the main loop skip render()+encode()
     // on frames where the screen provably hasn't changed.
     dirty: bool,
+
+    // Counts calls to `render()`, used to throttle its debug/trace logging.
+    frame_counter: u32,
 }
 
 impl WaylandWebStreamState {
@@ -137,6 +140,7 @@ impl WaylandWebStreamState {
             height,
             clock: Clock::new(),
             dirty: true,
+            frame_counter: 0,
         }
     }
 
@@ -200,16 +204,14 @@ impl WaylandWebStreamState {
         render_buffer.fill(0);
 
         let window_count = self.space.elements().count();
-        
+
         // Log every 30 frames (once per second at 30fps)
-        static mut FRAME_COUNTER: u32 = 0;
-        unsafe {
-            FRAME_COUNTER += 1;
-            if FRAME_COUNTER % 30 == 0 {
-                trace!("Rendering {} windows", window_count);
-            }
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+        let frame_counter = self.frame_counter;
+        if frame_counter % 30 == 0 {
+            trace!("Rendering {} windows", window_count);
         }
-        
+
         // Render each window
         for window in self.space.elements() {
             let location = self.space.element_location(window).unwrap_or((0, 0).into());
@@ -232,12 +234,10 @@ impl WaylandWebStreamState {
                             let buffer_stride = buffer_data.stride as u32;
                             let buffer_offset = buffer_data.offset as isize;
                             
-                            unsafe {
-                                if FRAME_COUNTER % 120 == 0 {
-                                    info!("Rendering buffer: {}x{}", buffer_width, buffer_height);
-                                }
+                            if frame_counter % 120 == 0 {
+                                info!("Rendering buffer: {}x{}", buffer_width, buffer_height);
                             }
-                            
+
                             // Access pixel data safely
                             let expected_len = (buffer_stride * buffer_height) as usize;
                             if buffer_offset as usize + expected_len <= len {
@@ -319,11 +319,6 @@ impl WaylandWebStreamState {
         Some(render_buffer)
     }
 
-    pub fn get_framebuffer(&self) -> Vec<u8> {
-        let buffer_size = (self.width * self.height * 4) as usize;
-        vec![0u8; buffer_size]
-    }
-    
     /// Resolves a point given in output-pixel coordinates to the topmost
     /// window plus that point translated into the window's own buffer-pixel
     /// space. Used by both touch and pointer injection.

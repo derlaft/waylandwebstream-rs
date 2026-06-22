@@ -1,5 +1,3 @@
-pub mod frame;
-
 use anyhow::{Context, Result};
 use ffmpeg_next as ffmpeg;
 use tokio::sync::{mpsc, watch};

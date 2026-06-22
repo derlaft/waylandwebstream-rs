@@ -195,12 +195,20 @@ reductions. Land 1–3 together so you can A/B against Selkies.
 
 ## Tier 4 — Cleanup (low risk, reduces confusion)
 
-- [ ] **Remove dead code:** `encoder/frame.rs` `FrameCapture` is entirely unused
+- [x] **Remove dead code:** `encoder/frame.rs` `FrameCapture` is entirely unused
   (`main.rs` does its own pacing); `state.rs:285 get_framebuffer()` returns a throwaway
   zero buffer and is never called.
+  **Done:** deleted `encoder/frame.rs` and its `pub mod frame;` declaration, and
+  removed `get_framebuffer()`. Confirmed both were unreferenced anywhere outside
+  their own definitions before removing.
 
-- [ ] **Replace `static mut FRAME_COUNTER`** — `state.rs:187`. Unsynchronized
+- [x] **Replace `static mut FRAME_COUNTER`** — `state.rs:187`. Unsynchronized
   `static mut` is UB-adjacent; use an instance field or `AtomicU32`.
+  **Done:** replaced with a `frame_counter: u32` field on `WaylandWebStreamState`,
+  incremented (with `wrapping_add`) at the top of `render()`, which already has
+  `&mut self`. The nested buffer-contents closure that also read the counter now
+  reads a local `Copy` snapshot taken before the loop instead of the static, so no
+  `unsafe` is needed anywhere in `render()` for this anymore.
 
 ---
 
