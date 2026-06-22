@@ -72,8 +72,4 @@ impl Config {
     pub fn get_initial_resolution(&self) -> anyhow::Result<(u32, u32)> {
         Self::parse_resolution(&self.initial_resolution)
     }
-
-    pub fn get_max_resolution(&self) -> anyhow::Result<(u32, u32)> {
-        Self::parse_resolution(&self.max_resolution)
-    }
 }

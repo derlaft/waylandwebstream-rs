@@ -7,7 +7,6 @@ use tracing::{error, info, warn};
 #[derive(Clone)]
 pub struct RawFrame {
     pub data: Vec<u8>,
-    pub timestamp: i64,
     pub capture_time: std::time::Instant,
 }
 
@@ -15,8 +14,6 @@ pub struct RawFrame {
 #[derive(Clone)]
 pub struct EncodedPacket {
     pub data: Vec<u8>,
-    pub timestamp: i64,
-    pub is_keyframe: bool,
     pub capture_time: std::time::Instant,
 }
 
@@ -83,44 +80,14 @@ pub struct EncoderHandle {
 pub type BufferReturnReceiver = std::sync::mpsc::Receiver<Vec<u8>>;
 
 impl EncoderHandle {
-    /// Send a frame to be encoded
-    pub async fn send_frame(&self, frame: RawFrame) -> Result<()> {
-        self.frame_tx
-            .send(frame)
-            .await
-            .context("Failed to send frame to encoder")
-    }
-
-    /// Try to send a frame without blocking
-    pub fn try_send_frame(&self, frame: RawFrame) -> Result<()> {
-        self.frame_tx
-            .try_send(frame)
-            .context("Failed to send frame to encoder (queue full)")
-    }
-
     /// Receive an encoded packet
     pub async fn recv_packet(&mut self) -> Option<EncodedPacket> {
         self.packet_rx.recv().await
     }
 
-    /// Request a resolution change
-    pub fn resize(&self, width: u32, height: u32) -> Result<()> {
-        self.resize_tx
-            .send(Some(ResolutionChange { width, height }))
-            .context("Failed to send resize request")
-    }
-
     /// Get a cloneable frame sender for use in other threads
     pub fn get_frame_sender(&self) -> mpsc::Sender<RawFrame> {
         self.frame_tx.clone()
-    }
-
-    /// Request a keyframe to be generated
-    pub async fn request_keyframe(&self) -> Result<()> {
-        self.control_tx
-            .send(EncoderControl::ForceKeyframe)
-            .await
-            .context("Failed to send keyframe request")
     }
 
     /// Get a cloneable control sender
@@ -452,13 +419,10 @@ fn encode_frame(
         let mut encoded_packet = ffmpeg::Packet::empty();
         match encoder.receive_packet(&mut encoded_packet) {
             Ok(_) => {
-                let is_keyframe = encoded_packet.is_key();
                 let data = encoded_packet.data().unwrap_or(&[]).to_vec();
-                
+
                 packets.push(EncodedPacket {
                     data,
-                    timestamp: raw_frame.timestamp,
-                    is_keyframe,
                     capture_time: raw_frame.capture_time,
                 });
             }

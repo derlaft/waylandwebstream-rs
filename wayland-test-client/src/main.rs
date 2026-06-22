@@ -1,4 +1,4 @@
-use std::os::unix::io::{AsFd, AsRawFd};
+use std::os::unix::io::AsFd;
 use wayland_client::{
     protocol::{wl_compositor, wl_shm, wl_shm_pool, wl_surface, wl_registry},
     Connection, Dispatch, QueueHandle,

@@ -36,8 +36,6 @@ pub struct TouchPoint {
 /// Internal state for a tracked touch
 #[derive(Debug, Clone)]
 struct TouchState {
-    /// Browser identifier
-    identifier: i32,
     /// Current X position in compositor coordinates
     x: f64,
     /// Current Y position in compositor coordinates
@@ -89,7 +87,6 @@ impl TouchHandler {
                 for touch in touches {
                     let (x, y) = self.to_compositor_coords(touch.x, touch.y);
                     let touch_state = TouchState {
-                        identifier: touch.identifier,
                         x,
                         y,
                         pressure: touch.pressure,
@@ -155,12 +152,18 @@ impl TouchHandler {
         }
     }
 
-    /// Get the number of currently active touches
+}
+
+#[cfg(test)]
+impl TouchHandler {
+    /// Get the number of currently active touches. Test-only: nothing in
+    /// the running server currently needs this at runtime.
     pub fn active_touch_count(&self) -> usize {
         self.active_touches.len()
     }
 
-    /// Clear all active touches (e.g., on disconnect)
+    /// Clear all active touches. Test-only: nothing in the running server
+    /// currently calls this (e.g. on client disconnect).
     pub fn clear_touches(&mut self) {
         debug!("Clearing {} active touches", self.active_touches.len());
         self.active_touches.clear();

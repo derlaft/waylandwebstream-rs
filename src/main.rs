@@ -262,9 +262,7 @@ async fn main() -> Result<()> {
     info!("Starting compositor render loop");
     
     // Main event loop for Wayland compositor (synchronous)
-    let mut frame_count = 0u64;
     let frame_interval = std::time::Duration::from_secs_f64(1.0 / config.framerate as f64);
-    let frame_timestamp_step = 90_000 / config.framerate as i64; // 90kHz RTP clock
     // Self-correcting deadline: advanced by exactly `frame_interval` each frame
     // rather than snapped to wake time, so timing error doesn't accumulate.
     let mut next_frame = std::time::Instant::now() + frame_interval;
@@ -364,14 +362,12 @@ async fn main() -> Result<()> {
                 if let Some(framebuffer) = state.render(spare_buffers.pop()) {
                     let raw_frame = encoder::RawFrame {
                         data: framebuffer,
-                        timestamp: (frame_count as i64) * frame_timestamp_step,
                         capture_time: std::time::Instant::now(),
                     };
 
                     // Send frame to encoder (non-blocking)
                     match frame_sender.try_send(raw_frame) {
                         Ok(()) => {
-                            frame_count += 1;
                             ticks_since_render = 0;
                         }
                         Err(_) => {

@@ -43,8 +43,6 @@ pub struct IceConfigResponse {
 #[derive(Debug, Deserialize)]
 pub struct SdpOffer {
     pub sdp: String,
-    #[serde(rename = "type")]
-    pub sdp_type: String,
 }
 
 /// SDP answer to the browser
@@ -138,13 +136,6 @@ impl SignalingState {
         self.ice_tx.subscribe()
     }
 
-    pub fn send_ice_candidate(&self, candidate: IceCandidate) -> Result<()> {
-        self.ice_tx
-            .send(candidate)
-            .context("Failed to broadcast ICE candidate")?;
-        Ok(())
-    }
-
     pub fn get_ice_sender(&self) -> mpsc::Sender<IceCandidate> {
         let tx = self.ice_tx.clone();
         let (ice_mpsc_tx, mut ice_mpsc_rx) = mpsc::channel::<IceCandidate>(16);
@@ -175,10 +166,6 @@ impl SignalingServer {
             .with_state(state);
 
         Self { router }
-    }
-
-    pub fn router(self) -> Router {
-        self.router
     }
 
     pub async fn serve(self, port: u16) -> Result<()> {

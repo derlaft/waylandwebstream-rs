@@ -3,10 +3,7 @@
 use smithay::{
     backend::{
         input::{Axis, AxisSource, ButtonState, TouchSlot},
-        renderer::{
-            pixman::PixmanRenderer,
-            utils::with_renderer_surface_state,
-        },
+        renderer::utils::with_renderer_surface_state,
     },
     delegate_compositor, delegate_output, delegate_seat, delegate_shm,
     delegate_xdg_shell,
@@ -48,15 +45,13 @@ pub struct WaylandWebStreamState {
     pub xdg_shell_state: XdgShellState,
     pub shm_state: ShmState,
     pub seat_state: SeatState<Self>,
-    pub output_manager_state: OutputManagerState,
-    
+
     // Desktop management
     pub space: Space<Window>,
     pub seat: Seat<Self>,
-    
+
     // Output and rendering
     pub output: Output,
-    pub renderer: Option<PixmanRenderer>,
     pub width: u32,
     pub height: u32,
     
@@ -88,7 +83,9 @@ impl WaylandWebStreamState {
         let compositor_state = SmithayCompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
-        let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
+        // Registers the wl_output/xdg-output globals as a side effect; the
+        // returned handle itself is never read afterwards.
+        OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let mut seat_state = SeatState::new();
 
         // Create output with specified dimensions
@@ -123,19 +120,14 @@ impl WaylandWebStreamState {
         let mut space = Space::default();
         space.map_output(&output, (0, 0));
 
-        // Create pixman renderer
-        let renderer = PixmanRenderer::new().ok();
-
         Self {
             compositor_state,
             xdg_shell_state,
             shm_state,
             seat_state,
-            output_manager_state,
             space,
             seat,
             output,
-            renderer,
             width,
             height,
             clock: Clock::new(),
