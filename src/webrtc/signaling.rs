@@ -168,8 +168,8 @@ impl SignalingServer {
         Self { router }
     }
 
-    pub async fn serve(self, port: u16) -> Result<()> {
-        let addr = format!("0.0.0.0:{}", port);
+    pub async fn serve(self, listen_addr: &str, port: u16) -> Result<()> {
+        let addr = format!("{}:{}", listen_addr, port);
         info!("Starting signaling server on {}", addr);
 
         let listener = tokio::net::TcpListener::bind(&addr)

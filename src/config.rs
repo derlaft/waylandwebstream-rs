@@ -16,6 +16,13 @@ pub struct Config {
     #[arg(long, default_value = "8080")]
     pub port: u16,
 
+    /// Address the HTTP signaling server binds to. Defaults to all
+    /// interfaces; set to 127.0.0.1 to only accept connections from a local
+    /// reverse proxy (e.g. one that adds authentication) instead of exposing
+    /// the server directly.
+    #[arg(long, default_value = "0.0.0.0")]
+    pub listen_addr: String,
+
     /// STUN server URL
     #[arg(long, default_value = "stun:stun.l.google.com:19302")]
     pub stun: String,

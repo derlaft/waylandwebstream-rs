@@ -155,7 +155,7 @@ async fn main() -> Result<()> {
         RateControl::Quality(crf) => info!("║  - Quality: CRF {}                                            ║", crf),
     }
     info!("║  - Keyframe interval: {} frames                              ║", keyframe_interval);
-    info!("║  - HTTP port: {}                                         ║", config.port);
+    info!("║  - HTTP listen address: {}:{}                          ║", config.listen_addr, config.port);
     info!("║  - Wayland display: {}                         ║", config.display_name);
     info!("╠══════════════════════════════════════════════════════════════╣");
     info!("║  Connect with browser:                                       ║");
@@ -222,9 +222,10 @@ async fn main() -> Result<()> {
     let signaling_server = SignalingServer::new(signaling_state.clone());
     
     // Spawn the signaling server
+    let listen_addr = config.listen_addr.clone();
     let port = config.port;
     tokio::spawn(async move {
-        if let Err(e) = signaling_server.serve(port).await {
+        if let Err(e) = signaling_server.serve(&listen_addr, port).await {
             tracing::error!("Signaling server error: {}", e);
         }
     });
