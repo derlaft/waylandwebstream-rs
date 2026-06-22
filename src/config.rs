@@ -33,6 +33,10 @@ pub struct Config {
     #[arg(long, default_value = "60")]
     pub framerate: u32,
 
+    /// Video bitrate in bits per second
+    #[arg(long, default_value = "2000000")]
+    pub bitrate: usize,
+
     /// Wayland display name
     #[arg(long, default_value = "wayland-wws-0")]
     pub display_name: String,

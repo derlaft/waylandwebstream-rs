@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
         width,
         height,
         framerate: config.framerate,
-        bitrate: 2_000_000,
+        bitrate: config.bitrate,
         keyframe_interval: config.framerate * 2,
     };
     
@@ -146,7 +146,7 @@ async fn main() -> Result<()> {
     info!("╠══════════════════════════════════════════════════════════════╣");
     info!("║  Server Configuration:                                       ║");
     info!("║  - Resolution: {}x{} @ {}fps                       ║", width, height, config.framerate);
-    info!("║  - Bitrate: 2 Mbps, H.264 baseline profile                  ║");
+    info!("║  - Bitrate: {} bps, H.264 baseline profile               ║", config.bitrate);
     info!("║  - HTTP port: {}                                         ║", config.port);
     info!("║  - Wayland display: {}                         ║", config.display_name);
     info!("╠══════════════════════════════════════════════════════════════╣");
