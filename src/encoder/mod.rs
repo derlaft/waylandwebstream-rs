@@ -9,8 +9,6 @@ use tracing::{error, info, warn};
 #[derive(Clone)]
 pub struct RawFrame {
     pub data: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
     pub timestamp: i64,
     pub capture_time: std::time::Instant,
 }
@@ -181,6 +179,12 @@ fn encoder_thread(
     // Create initial encoder context
     let mut encoder = create_encoder(&config)?;
     let mut scaler = create_scaler(&config)?;
+    let mut input_frame = create_input_frame(config.width, config.height);
+    // Unlike `input_frame`, this owns a real (refcounted) buffer, so
+    // `avcodec_send_frame` is allowed to keep a reference to it instead of
+    // copying -- see the safety note in `encode_frame` on why reusing it
+    // across calls is still fine here.
+    let mut yuv_frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, config.width, config.height);
     let mut frame_count = 0i64;
     let mut force_keyframe = false;
 
@@ -233,6 +237,8 @@ fn encoder_thread(
                     (Ok(new_encoder), Ok(new_scaler)) => {
                         encoder = new_encoder;
                         scaler = new_scaler;
+                        input_frame = create_input_frame(config.width, config.height);
+                        yuv_frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, config.width, config.height);
                         frame_count = 0; // Reset frame count to force IDR
                         info!("Encoder reinitialized successfully");
                     }
@@ -261,7 +267,14 @@ fn encoder_thread(
         }
 
         // Encode the frame
-        let encode_result = encode_frame(&mut encoder, &mut scaler, &raw_frame, frame_count);
+        let encode_result = encode_frame(
+            &mut encoder,
+            &mut scaler,
+            &mut input_frame,
+            &mut yuv_frame,
+            &raw_frame,
+            frame_count,
+        );
 
         // The encoder has already copied everything it needs out of
         // raw_frame.data (encode_frame only borrows it) -- hand the buffer
@@ -366,41 +379,69 @@ fn create_scaler(config: &EncoderConfig) -> Result<ffmpeg::software::scaling::Co
     Ok(scaler)
 }
 
+/// Create a BGRA frame with no backing buffer of its own -- `encode_frame`
+/// points its `data[0]`/`linesize[0]` directly at each `RawFrame`'s buffer
+/// instead of copying into it, so this never needs (and must never get)
+/// an owned buffer via `alloc()`.
+fn create_input_frame(width: u32, height: u32) -> ffmpeg::frame::Video {
+    let mut frame = ffmpeg::frame::Video::empty();
+    frame.set_format(ffmpeg::format::Pixel::BGRA);
+    frame.set_width(width);
+    frame.set_height(height);
+    frame
+}
+
 /// Encode a single frame
 fn encode_frame(
     encoder: &mut ffmpeg::encoder::Video,
     scaler: &mut ffmpeg::software::scaling::Context,
+    input_frame: &mut ffmpeg::frame::Video,
+    yuv_frame: &mut ffmpeg::frame::Video,
     raw_frame: &RawFrame,
     frame_number: i64,
 ) -> Result<Vec<EncodedPacket>> {
-    // Create input frame (BGRA)
-    let mut input_frame = ffmpeg::frame::Video::new(
-        ffmpeg::format::Pixel::BGRA,
-        raw_frame.width,
-        raw_frame.height,
-    );
-    
-    // Copy raw data to frame
-    input_frame.data_mut(0).copy_from_slice(&raw_frame.data);
-
-    // Create output frame (YUV420P)
-    let mut yuv_frame = ffmpeg::frame::Video::new(
-        ffmpeg::format::Pixel::YUV420P,
-        raw_frame.width,
-        raw_frame.height,
-    );
+    // Point the input frame straight at the render buffer instead of
+    // copying into an owned one -- swscale only reads through this
+    // pointer within this call, and `raw_frame` outlives it. Stride is
+    // `width * 4`: that's how `render()` packs `render_buffer`, with no
+    // row padding.
+    let expected_len = (input_frame.width() * input_frame.height() * 4) as usize;
+    if raw_frame.data.len() < expected_len {
+        anyhow::bail!(
+            "raw frame buffer ({} bytes) too small for {}x{} BGRA ({} bytes expected)",
+            raw_frame.data.len(),
+            input_frame.width(),
+            input_frame.height(),
+            expected_len
+        );
+    }
+    unsafe {
+        let ptr = input_frame.as_mut_ptr();
+        (*ptr).data[0] = raw_frame.data.as_ptr() as *mut u8;
+        (*ptr).linesize[0] = (input_frame.width() * 4) as i32;
+    }
 
     // Convert BGRA to YUV420P
-    scaler.run(&input_frame, &mut yuv_frame)?;
+    scaler.run(input_frame, yuv_frame)?;
 
     // Set frame properties
     yuv_frame.set_pts(Some(frame_number));
     yuv_frame.set_kind(ffmpeg::picture::Type::None);
 
     // Encode frame
-    encoder.send_frame(&yuv_frame)?;
+    encoder.send_frame(yuv_frame)?;
 
-    // Receive encoded packets
+    // Safety note on reusing `yuv_frame`: avcodec_send_frame() is allowed to
+    // keep a reference to a refcounted AVFrame rather than copy it, and
+    // sws_scale (above, next call) writes into it without checking whether
+    // anyone else still holds it. That's only safe here because the encoder
+    // is configured (tune=zerolatency, bframes=0, no lookahead) to have zero
+    // frame delay, so draining receive_packet() below to EAGAIN guarantees
+    // libx264 is done reading this frame's pixels before we return and the
+    // next call's scaler.run() overwrites the same buffer. If the encoder
+    // config ever gains buffering/reordering (B-frames, lookahead), this
+    // assumption breaks and yuv_frame would need to go back to being
+    // allocated fresh per call (or use av_frame_make_writable first).
     let mut packets = Vec::new();
     loop {
         let mut encoded_packet = ffmpeg::Packet::empty();

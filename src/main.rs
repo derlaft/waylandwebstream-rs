@@ -339,8 +339,6 @@ async fn main() -> Result<()> {
             if let Some(framebuffer) = state.render(spare_buffers.pop()) {
                 let raw_frame = encoder::RawFrame {
                     data: framebuffer,
-                    width: state.width,
-                    height: state.height,
                     timestamp: (frame_count as i64) * frame_timestamp_step,
                     capture_time: std::time::Instant::now(),
                 };

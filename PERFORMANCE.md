@@ -108,8 +108,9 @@ reductions. Land 1–3 together so you can A/B against Selkies.
   target size) only happens for the frame or two a client lags a viewport resize by,
   so the old per-pixel loop stays as the fallback for that transient path; optimizing
   it further isn't worth the added code for something that's never the steady state.
+  User note: this made the first easily visible positive improvement. 
 
-- [ ] **Reuse encoder frames & drop the BGRA intermediate** — `encoder/mod.rs:357-374`.
+- [x] **Reuse encoder frames & drop the BGRA intermediate** — `encoder/mod.rs:357-374`.
   - Both `frame::Video` allocations are fixed-size — allocate once, reuse across calls,
     reset on resize.
   - Feed swscale directly from the render buffer's pointer+stride to eliminate copy #2
@@ -117,6 +118,25 @@ reductions. Land 1–3 together so you can A/B against Selkies.
   - That `copy_from_slice` also assumes `linesize == width*4`; works at 16-aligned
     widths but is fragile with stride padding — copy row-by-row respecting `linesize`,
     or remove the copy as above.
+  **Done:** `input_frame` (BGRA) and `yuv_frame` (YUV420P) are now created once in
+  `encoder_thread` and reused across calls, recreated only on resize/reinit (same
+  place the encoder/scaler already get recreated). `input_frame` is never allocated
+  via `alloc()` — `encode_frame` points its `data[0]`/`linesize[0]` straight at each
+  `RawFrame`'s buffer (`linesize = width*4`, which matches how `render()` packs
+  `render_buffer` with no row padding, so this isn't the fragile assumption the
+  original `copy_from_slice` made), removing copy #2 entirely. Verified `Video::empty()`
+  + manual `set_format`/`set_width`/`set_height` never calls `av_frame_get_buffer`
+  (checked `ffmpeg-next` 8.1.0 source), so `input_frame` never owns a buffer and the
+  pointer-aliasing is safe — `raw_frame` outlives the `sws_scale` call that reads it.
+  `yuv_frame` *is* a real owned/refcounted buffer (`Video::new()` → `alloc()`), so
+  reusing it relies on the encoder having zero frame delay (tune=zerolatency,
+  bframes=0, no lookahead) so that draining `receive_packet()` to EAGAIN each call
+  guarantees libx264 is done reading it before the next `scaler.run()` overwrites it;
+  documented this invariant in `encoder/mod.rs` since it'd silently break if B-frames/
+  lookahead were ever turned on. Confirmed via `cargo test -- --test-threads=1`
+  (the suite isn't parallel-safe — two tests share the `wayland-test-0` socket name —
+  that's pre-existing and unrelated) that the full pipeline, including a mid-stream
+  resize that reinitializes the encoder/scaler/frames, still passes.
 
 ## Tier 3 — Further efficiency
 

@@ -34,8 +34,6 @@ impl FrameCapture {
         &mut self,
         encoder: &EncoderHandle,
         framebuffer: Vec<u8>,
-        width: u32,
-        height: u32,
     ) -> Result<bool> {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_frame_time);
@@ -51,8 +49,6 @@ impl FrameCapture {
 
         let frame = RawFrame {
             data: framebuffer,
-            width,
-            height,
             timestamp,
             capture_time: std::time::Instant::now(),
         };
