@@ -169,18 +169,19 @@ impl WaylandWebStreamState {
         });
     }
 
-    pub fn render(&mut self) -> Option<Vec<u8>> {
+    /// Renders the current frame. `reuse_buffer`, if given, is an
+    /// already-allocated buffer (typically handed back by the encoder once
+    /// it's done with a previous frame) that gets cleared and rendered into
+    /// instead of allocating a fresh ~8MB buffer every frame.
+    pub fn render(&mut self, reuse_buffer: Option<Vec<u8>>) -> Option<Vec<u8>> {
         let buffer_size = (self.width * self.height * 4) as usize;
-        let mut render_buffer = vec![0u8; buffer_size];
-        
-        // Clear to black background
-        for pixel in render_buffer.chunks_exact_mut(4) {
-            pixel[0] = 0;   // B
-            pixel[1] = 0;   // G
-            pixel[2] = 0;   // R
-            pixel[3] = 255; // A
-        }
-        
+        let mut render_buffer = reuse_buffer.unwrap_or_default();
+        render_buffer.resize(buffer_size, 0);
+        // Alpha is irrelevant here -- this buffer only ever feeds the BGRA->
+        // YUV420P conversion in the encoder, which doesn't read it -- so a
+        // plain memset clear (vs. a per-pixel store loop) is safe.
+        render_buffer.fill(0);
+
         let window_count = self.space.elements().count();
         
         // Log every 30 frames (once per second at 30fps)

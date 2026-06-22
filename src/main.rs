@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
         keyframe_interval,
     };
     
-    let encoder = spawn_encoder(encoder_config)?;
+    let (encoder, buffer_return_rx) = spawn_encoder(encoder_config)?;
 
     // Create channels for WebRTC
     let (offer_tx, offer_rx) = mpsc::channel(4);
@@ -261,6 +261,9 @@ async fn main() -> Result<()> {
     // Self-correcting deadline: advanced by exactly `frame_interval` each frame
     // rather than snapped to wake time, so timing error doesn't accumulate.
     let mut next_frame = std::time::Instant::now() + frame_interval;
+    // Buffers the encoder thread has finished with, recycled into render()
+    // instead of allocating a fresh ~8MB framebuffer every frame.
+    let mut spare_buffers: Vec<Vec<u8>> = Vec::new();
 
     loop {
         let loop_start = std::time::Instant::now();
@@ -329,7 +332,11 @@ async fn main() -> Result<()> {
         if now >= next_frame {
             state.send_frames();
 
-            if let Some(framebuffer) = state.render() {
+            while let Ok(buf) = buffer_return_rx.try_recv() {
+                spare_buffers.push(buf);
+            }
+
+            if let Some(framebuffer) = state.render(spare_buffers.pop()) {
                 let raw_frame = encoder::RawFrame {
                     data: framebuffer,
                     width: state.width,

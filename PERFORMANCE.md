@@ -77,10 +77,23 @@ reductions. Land 1–3 together so you can A/B against Selkies.
 
 ## Tier 2 — Copy & allocation reduction (biggest CPU wins)
 
-- [ ] **Reuse the render framebuffer** — `state.rs:172-182`. `vec![0u8; w*h*4]`
+- [x] **Reuse the render framebuffer** — `state.rs:172-182`. `vec![0u8; w*h*4]`
   (~8MB at 1080p) is allocated **every frame** and cleared pixel-by-pixel. Keep a
   persistent buffer on the state struct; clear with `fill(0)`, or skip the clear for
   the region a fullscreen window fully overwrites.
+  **Done:** `render()` now takes `Option<Vec<u8>>` and reuses/resizes it instead of
+  always allocating, and clears with `fill(0)` instead of a per-pixel store loop
+  (alpha is never read downstream, so a plain memset is safe). The buffer still has
+  to cross the render→encoder thread boundary by move (it's sent in `RawFrame`), so
+  true reuse needed a way to get it back: `encoder/mod.rs` now has a
+  `std::sync::mpsc::Sender<Vec<u8>>`/`Receiver` pair (`BufferReturnReceiver`) —
+  the encoder thread sends `raw_frame.data` back immediately after
+  `encode_frame` (which only borrows it) returns, and `main.rs` drains that
+  receiver into a small `Vec<Vec<u8>>` pool each frame, popping one to pass into
+  `state.render()`. Didn't implement the "skip clear for fullscreen window" path —
+  verifying a window's render fully covers the buffer (position, partial commits,
+  multiple windows) is easy to get subtly wrong, and `fill(0)` already turns the
+  per-pixel loop into a single memset, which is most of the win.
 
 - [ ] **Add fast paths to the scaling copy** — `state.rs:238-254`. This is likely the
   largest single CPU cost. Per output pixel it does two `u64` divisions, two bounds

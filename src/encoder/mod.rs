@@ -81,6 +81,11 @@ pub struct EncoderHandle {
     control_tx: mpsc::Sender<EncoderControl>,
 }
 
+/// Receives back `RawFrame` buffers once the encoder thread has copied their
+/// contents into its own frame and no longer needs them, so the render loop
+/// can reuse them instead of allocating a fresh buffer every frame.
+pub type BufferReturnReceiver = std::sync::mpsc::Receiver<Vec<u8>>;
+
 impl EncoderHandle {
     /// Send a frame to be encoded
     pub async fn send_frame(&self, frame: RawFrame) -> Result<()> {
@@ -134,7 +139,7 @@ impl EncoderHandle {
 }
 
 /// Spawn the encoder thread
-pub fn spawn_encoder(config: EncoderConfig) -> Result<EncoderHandle> {
+pub fn spawn_encoder(config: EncoderConfig) -> Result<(EncoderHandle, BufferReturnReceiver)> {
     // Initialize FFmpeg
     ffmpeg::init().context("Failed to initialize FFmpeg")?;
 
@@ -142,20 +147,24 @@ pub fn spawn_encoder(config: EncoderConfig) -> Result<EncoderHandle> {
     let (packet_tx, packet_rx) = mpsc::channel::<EncodedPacket>(16);
     let (resize_tx, resize_rx) = watch::channel::<Option<ResolutionChange>>(None);
     let (control_tx, control_rx) = mpsc::channel::<EncoderControl>(8);
+    let (buffer_return_tx, buffer_return_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
     // Spawn encoder thread
     std::thread::spawn(move || {
-        if let Err(e) = encoder_thread(config, frame_rx, packet_tx, resize_rx, control_rx) {
+        if let Err(e) = encoder_thread(config, frame_rx, packet_tx, resize_rx, control_rx, buffer_return_tx) {
             error!("Encoder thread failed: {}", e);
         }
     });
 
-    Ok(EncoderHandle {
-        frame_tx,
-        packet_rx,
-        resize_tx,
-        control_tx,
-    })
+    Ok((
+        EncoderHandle {
+            frame_tx,
+            packet_rx,
+            resize_tx,
+            control_tx,
+        },
+        buffer_return_rx,
+    ))
 }
 
 /// Encoder thread main loop
@@ -165,6 +174,7 @@ fn encoder_thread(
     packet_tx: mpsc::Sender<EncodedPacket>,
     mut resize_rx: watch::Receiver<Option<ResolutionChange>>,
     mut control_rx: mpsc::Receiver<EncoderControl>,
+    buffer_return_tx: std::sync::mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
     info!("Encoder thread started with config: {:?}", config);
 
@@ -251,7 +261,17 @@ fn encoder_thread(
         }
 
         // Encode the frame
-        match encode_frame(&mut encoder, &mut scaler, &raw_frame, frame_count) {
+        let encode_result = encode_frame(&mut encoder, &mut scaler, &raw_frame, frame_count);
+
+        // The encoder has already copied everything it needs out of
+        // raw_frame.data (encode_frame only borrows it) -- hand the buffer
+        // back to the render loop so it can reuse it instead of allocating a
+        // fresh one next frame. Ignore failure: it just means the render
+        // loop has dropped the receiver, in which case the buffer is freed
+        // normally.
+        let _ = buffer_return_tx.send(raw_frame.data);
+
+        match encode_result {
             Ok(packets) => {
                 for packet in packets {
                     if packet_tx.blocking_send(packet).is_err() {

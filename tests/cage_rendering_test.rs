@@ -81,7 +81,7 @@ fn cage_window_renders_visible_content_not_black() {
                     state.send_frames();
                     display.flush_clients().expect("failed to flush clients");
                 }
-                captured = state.render();
+                captured = state.render(None);
                 break;
             }
         }
