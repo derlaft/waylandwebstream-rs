@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use interceptor::registry::Registry;
 use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -34,6 +34,10 @@ pub struct Session {
     peer_connection: Arc<webrtc::peer_connection::RTCPeerConnection>,
     video_track: Arc<TrackLocalStaticSample>,
     frame_duration: Duration,
+    /// (capture Instant, wall-clock SystemTime) of the first packet sent,
+    /// used to translate later packets' `capture_time` into a SystemTime
+    /// that tracks capture cadence rather than send-time jitter.
+    capture_epoch: Mutex<Option<(Instant, SystemTime)>>,
 }
 
 impl Session {
@@ -192,6 +196,7 @@ impl Session {
             peer_connection,
             video_track,
             frame_duration: Duration::from_secs_f64(1.0 / framerate as f64),
+            capture_epoch: Mutex::new(None),
         })
     }
 
@@ -253,10 +258,20 @@ impl Session {
 
     /// Send an encoded video packet over the track
     pub async fn send_video_packet(&self, packet: EncodedPacket) -> Result<()> {
+        // Anchor capture_time (an Instant) to a SystemTime once, then derive
+        // every later timestamp from that anchor plus elapsed capture time.
+        // This makes RTP timestamps track capture cadence instead of jittery
+        // send time (which varies with encoder/channel scheduling delay).
+        let timestamp = {
+            let mut epoch = self.capture_epoch.lock().unwrap();
+            let (base_instant, base_systime) = *epoch.get_or_insert_with(|| (packet.capture_time, SystemTime::now()));
+            base_systime + packet.capture_time.duration_since(base_instant)
+        };
+
         let sample = Sample {
             data: Bytes::from(packet.data),
             duration: self.frame_duration,
-            timestamp: std::time::SystemTime::now(),
+            timestamp,
             ..Default::default()
         };
         

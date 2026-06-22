@@ -59,11 +59,17 @@ reductions. Land 1–3 together so you can A/B against Selkies.
   small while still giving the decoder room to absorb timing jitter. Should be
   A/B'd against Selkies per the measurement task below.
 
-- [ ] **Use capture-based sample timestamps** — `session.rs:255-261`.
+- [x] **Use capture-based sample timestamps** — `session.rs:255-261`.
   `Sample { timestamp: SystemTime::now(), duration: frame_duration }` makes RTP
   timestamps reflect *send* time (jittery), not *capture* time. `packet.capture_time`
   is already carried end-to-end — derive a monotonic capture-based timestamp so playout
   cadence matches capture cadence. Interacts badly with the zero jitter buffer above.
+  **Done:** added a `capture_epoch: Mutex<Option<(Instant, SystemTime)>>` to
+  `Session`, set from the first packet's `capture_time`/`SystemTime::now()` pair.
+  Every later packet's `Sample.timestamp` is now `base_systime +
+  (packet.capture_time - base_instant)`, so RTP timestamps track capture cadence
+  instead of send-time jitter (encoder/channel scheduling delay no longer shows
+  up as timestamp noise).
 
 - [ ] **Measure before/after.** Use the existing latency reporting + `getStats()`
   output in `client.html`. Watch jitterBufferDelay, framesDecoded cadence, and the
