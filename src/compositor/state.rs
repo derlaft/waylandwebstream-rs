@@ -188,7 +188,7 @@ impl WaylandWebStreamState {
         unsafe {
             FRAME_COUNTER += 1;
             if FRAME_COUNTER % 30 == 0 {
-                info!("Rendering {} windows", window_count);
+                trace!("Rendering {} windows", window_count);
             }
         }
         
