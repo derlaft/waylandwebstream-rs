@@ -164,8 +164,11 @@ async fn main() -> Result<()> {
         use crate::latency::LatencyReport;
         let (latency_tx, mut latency_rx) = mpsc::channel::<LatencyReport>(16);
         
+        info!("Latency reporting pipeline initialized");
+        
         // Spawn task to log detailed latency reports
         tokio::spawn(async move {
+            info!("Latency reporting task started, waiting for reports...");
             while let Some(report) = latency_rx.recv().await {
                 info!("═══ Latency Report ═══");
                 if let Some(v) = report.input_ms {

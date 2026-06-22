@@ -40,7 +40,7 @@ use smithay::{
         seat::WaylandFocus,
     },
 };
-use tracing::info;
+use tracing::{info, trace};
 
 pub struct WaylandWebStreamState {
     // Core Smithay states
@@ -565,7 +565,7 @@ impl smithay::wayland::compositor::CompositorHandler for WaylandWebStreamState {
             .cloned()
         {
             window.on_commit();
-            info!("Window surface committed");
+            trace!("Window surface committed");
         }
 
         // Surface state is updated, frame callbacks will be sent in main loop

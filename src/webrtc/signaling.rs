@@ -86,9 +86,16 @@ pub enum SignalingMessage {
         event: MouseEvent,
     },
     #[serde(rename = "latency")]
-    Latency { 
-        #[serde(flatten)]
-        report: LatencyReport 
+    Latency {
+        #[serde(default)]
+        encoding_ms: Option<f64>,
+        #[serde(default)]
+        network_ms: Option<f64>,
+        #[serde(default)]
+        jitter_buffer_ms: Option<f64>,
+        #[serde(default)]
+        decoding_ms: Option<f64>,
+        total_ms: f64,
     },
 }
 
@@ -305,11 +312,23 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                             warn!("Failed to send pointer event: {}", e);
                         }
                     }
-                    SignalingMessage::Latency { report } => {
+                    SignalingMessage::Latency { encoding_ms, network_ms, jitter_buffer_ms, decoding_ms, total_ms } => {
+                        info!("Received latency message from client: {:.1}ms total", total_ms);
                         if let Some(ref latency_tx) = state.latency_tx {
+                            let mut report = LatencyReport::new();
+                            report.encoding_ms = encoding_ms;
+                            report.network_ms = network_ms;
+                            report.jitter_buffer_ms = jitter_buffer_ms;
+                            report.decoding_ms = decoding_ms;
+                            report.total_ms = total_ms;
+                            
                             if let Err(e) = latency_tx.send(report).await {
                                 warn!("Failed to send latency report: {}", e);
+                            } else {
+                                info!("Latency report forwarded to handler");
                             }
+                        } else {
+                            warn!("Received latency report but latency_tx is None");
                         }
                     }
                 }

@@ -168,15 +168,23 @@
                             const encodingEstimate = 16.7; // ~1 frame at 60fps
                             const totalLatency = networkMs + avgJitterMs + avgDecodeMs + encodingEstimate;
                             
+                            // Log to console
+                            console.log(`[latency] Total: ${totalLatency.toFixed(1)}ms (network: ${networkMs.toFixed(1)}ms, jitter: ${avgJitterMs.toFixed(1)}ms, decode: ${avgDecodeMs.toFixed(1)}ms, encode: ${encodingEstimate.toFixed(1)}ms)`);
+                            
                             // Send detailed report via WebSocket
-                            wsSend({
-                                type: 'latency',
-                                encoding_ms: encodingEstimate,
-                                network_ms: networkMs,
-                                jitter_buffer_ms: avgJitterMs,
-                                decoding_ms: avgDecodeMs,
-                                total_ms: totalLatency
-                            });
+                            try {
+                                wsSend({
+                                    type: 'latency',
+                                    encoding_ms: encodingEstimate,
+                                    network_ms: networkMs,
+                                    jitter_buffer_ms: avgJitterMs,
+                                    decoding_ms: avgDecodeMs,
+                                    total_ms: totalLatency
+                                });
+                                console.log('[latency] Report sent via WebSocket');
+                            } catch (e) {
+                                console.error('[latency] Failed to send report:', e);
+                            }
                         });
                     }
                 }, 1000); // Report every 1 second
