@@ -79,16 +79,16 @@
                         video.srcObject = event.streams[0];
                         setStatus('Connected - Streaming', 'status-connected');
 
-                        // By default browsers hold back ~150-200ms of video in a
-                        // jitter buffer to smooth over network timing variance.
-                        // We'd rather drop a frame than queue it, so ask for the
-                        // smallest buffer the implementation allows. Both names
+                        // A zero playout buffer turns every capture/send timing
+                        // irregularity into an audible/visible stall instead of
+                        // smoothing over it, which made things look worse, not
+                        // better. Use a small target buffer instead. Both names
                         // exist in the wild (jitterBufferTarget is the newer
                         // replacement for the older playoutDelayHint); set both
                         // since support is inconsistent across browsers.
                         const receiver = event.receiver;
-                        try { receiver.jitterBufferTarget = 0; } catch (e) {}
-                        try { receiver.playoutDelayHint = 0; } catch (e) {}
+                        try { receiver.jitterBufferTarget = 0.05; } catch (e) {}
+                        try { receiver.playoutDelayHint = 0.05; } catch (e) {}
                     }
                 };
 

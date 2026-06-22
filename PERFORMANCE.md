@@ -49,11 +49,15 @@ reductions. Land 1–3 together so you can A/B against Selkies.
     without changing behavior; the dynamic timeout achieves the same effect with
     a smaller diff.
 
-- [ ] **Stop zeroing the client jitter buffer** — `client.html:90-91`
+- [x] **Stop zeroing the client jitter buffer** — `client.html:90-91`
   (`jitterBufferTarget = 0`, `playoutDelayHint = 0`). With capture jitter (above),
   a zero playout buffer turns every timing irregularity into a stall/drop. Selkies
   does *not* zero this. **Try:** default, or a small target (~50–100ms), then measure.
   Counterintuitively likely to *lower* perceived latency by removing stutter.
+  **Done:** set both `jitterBufferTarget` and `playoutDelayHint` to `0.05` (50ms)
+  instead of `0`. Picked the low end of the suggested range to keep added latency
+  small while still giving the decoder room to absorb timing jitter. Should be
+  A/B'd against Selkies per the measurement task below.
 
 - [ ] **Use capture-based sample timestamps** — `session.rs:255-261`.
   `Sample { timestamp: SystemTime::now(), duration: frame_duration }` makes RTP
