@@ -303,6 +303,11 @@ pub struct SessionManager {
     ice_config: IceServerConfig,
     framerate: u32,
     active_session: Option<Arc<Session>>,
+    /// Set when a new session is established so the capture loop renders a
+    /// frame immediately instead of waiting on damage or the next periodic
+    /// keyframe-cadence render -- otherwise a newly connected client sees
+    /// nothing until the screen happens to change.
+    force_render: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SessionManager {
@@ -314,6 +319,7 @@ impl SessionManager {
         encoder_control_tx: mpsc::Sender<EncoderControl>,
         ice_config: IceServerConfig,
         framerate: u32,
+        force_render: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             offer_rx,
@@ -324,6 +330,7 @@ impl SessionManager {
             ice_config,
             framerate,
             active_session: None,
+            force_render,
         }
     }
 
@@ -345,7 +352,12 @@ impl SessionManager {
                                     self.active_session = Some(Arc::new(session));
                                     info!("WebRTC session established");
                                     
-                                    // Request keyframe for new session
+                                    // Request keyframe for new session, and make sure the
+                                    // capture loop actually renders+sends a frame for it to
+                                    // ride on -- otherwise, with damage tracking, an idle
+                                    // screen would leave this client with no video until the
+                                    // next change or periodic keyframe-cadence render.
+                                    self.force_render.store(true, std::sync::atomic::Ordering::Relaxed);
                                     if let Err(e) = self.encoder_control_tx.send(EncoderControl::ForceKeyframe).await {
                                         warn!("Failed to request keyframe: {}", e);
                                     }

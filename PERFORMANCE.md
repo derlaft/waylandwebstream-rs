@@ -140,10 +140,27 @@ reductions. Land 1–3 together so you can A/B against Selkies.
 
 ## Tier 3 — Further efficiency
 
-- [ ] **Damage tracking.** Every frame is fully re-rendered + color-converted even on a
+- [x] **Damage tracking.** Every frame is fully re-rendered + color-converted even on a
   static screen. x264 emits tiny P-frames so *encode* stays cheap, but the render copy
   and swscale run unconditionally. Add a dirty flag to skip render+encode when the
   buffer is unchanged (modulo keyframe cadence).
+  **Done:** added a `dirty: bool` to `WaylandWebStreamState` (`state.rs`), set on any
+  surface commit, window map/unmap, or output resize, and consumed via
+  `take_dirty()`. `main.rs`'s capture loop now only calls `state.render()` (and feeds
+  the encoder) when `take_dirty()` is true, a new WebRTC session just connected, or
+  `keyframe_interval` ticks have passed since the last actual render — the latter is
+  a safety net so a fresh keyframe still goes out periodically on a static screen
+  (decoder resync after loss) and so a late joiner isn't stuck waiting indefinitely.
+  The "new session" case needed its own plumbing: `SessionManager` already requests
+  `EncoderControl::ForceKeyframe` on a new offer, but that only takes effect on the
+  *next* frame the encoder receives — with damage tracking, an idle screen might not
+  produce one for a while. Added a `force_render: Arc<AtomicBool>` threaded from
+  `main.rs` into `SessionManager`, set alongside the existing `ForceKeyframe` send, so
+  the capture loop renders immediately for a newly connected client instead of
+  leaving it with no video until the screen changes or the periodic safety net fires.
+  Did not attempt buffer-content comparison (e.g. hashing) to detect no-op commits —
+  that cost would likely exceed the render it's meant to avoid skipping; a commit is
+  conservatively always treated as damage.
 
 - [ ] **swscale threading / flags** — `encoder/mod.rs:335-347`. `FAST_BILINEAR` is
   irrelevant since src dims == dst dims (pure colorspace convert). swscale is

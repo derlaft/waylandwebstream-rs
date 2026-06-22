@@ -4,6 +4,7 @@ use smithay::reexports::{
     calloop::EventLoop,
     wayland_server::Display,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn, Level};
@@ -228,8 +229,14 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Set by the session manager when a new WebRTC session is established, so
+    // the capture loop renders+sends a frame right away even if the screen
+    // hasn't changed -- otherwise a newly connected client would see nothing
+    // until the next damage or the next periodic keyframe-cadence render.
+    let force_render = Arc::new(AtomicBool::new(false));
+
     // Spawn the session manager
-    let session_manager = SessionManager::new(offer_rx, packet_rx, remote_ice_rx, ice_tx.clone(), encoder_control, ice_config, config.framerate);
+    let session_manager = SessionManager::new(offer_rx, packet_rx, remote_ice_rx, ice_tx.clone(), encoder_control, ice_config, config.framerate, force_render.clone());
     tokio::spawn(async move {
         if let Err(e) = session_manager.run().await {
             tracing::error!("Session manager error: {}", e);
@@ -264,6 +271,12 @@ async fn main() -> Result<()> {
     // Buffers the encoder thread has finished with, recycled into render()
     // instead of allocating a fresh ~8MB framebuffer every frame.
     let mut spare_buffers: Vec<Vec<u8>> = Vec::new();
+    // Ticks since the last actual render+encode. Bounds how stale the stream
+    // can get on an unchanging screen: even with nothing dirty, force a
+    // render every `keyframe_interval` ticks so a fresh keyframe still goes
+    // out periodically (decoder resync after loss) rather than only once at
+    // stream start.
+    let mut ticks_since_render = 0u32;
 
     loop {
         let loop_start = std::time::Instant::now();
@@ -336,17 +349,28 @@ async fn main() -> Result<()> {
                 spare_buffers.push(buf);
             }
 
-            if let Some(framebuffer) = state.render(spare_buffers.pop()) {
-                let raw_frame = encoder::RawFrame {
-                    data: framebuffer,
-                    timestamp: (frame_count as i64) * frame_timestamp_step,
-                    capture_time: std::time::Instant::now(),
-                };
+            // `take_dirty()` must run unconditionally (not short-circuited by
+            // `||`) so the flag is always consumed, even on ticks where a
+            // forced render makes its value moot.
+            let screen_dirty = state.take_dirty();
+            let new_client = force_render.swap(false, Ordering::Relaxed);
+            let stale = ticks_since_render >= keyframe_interval;
+            if screen_dirty || new_client || stale {
+                if let Some(framebuffer) = state.render(spare_buffers.pop()) {
+                    let raw_frame = encoder::RawFrame {
+                        data: framebuffer,
+                        timestamp: (frame_count as i64) * frame_timestamp_step,
+                        capture_time: std::time::Instant::now(),
+                    };
 
-                // Send frame to encoder (non-blocking)
-                if frame_sender.try_send(raw_frame).is_ok() {
-                    frame_count += 1;
+                    // Send frame to encoder (non-blocking)
+                    if frame_sender.try_send(raw_frame).is_ok() {
+                        frame_count += 1;
+                        ticks_since_render = 0;
+                    }
                 }
+            } else {
+                ticks_since_render += 1;
             }
 
             // Advance by exactly one interval (self-correcting cadence) rather

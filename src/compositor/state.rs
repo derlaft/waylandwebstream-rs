@@ -62,6 +62,12 @@ pub struct WaylandWebStreamState {
     
     // Clock for timing
     pub clock: Clock<Monotonic>,
+
+    // Set whenever something that affects the rendered picture changes
+    // (a surface commit, a window being mapped/unmapped, or a resize) and
+    // cleared by `take_dirty()`. Lets the main loop skip render()+encode()
+    // on frames where the screen provably hasn't changed.
+    dirty: bool,
 }
 
 impl WaylandWebStreamState {
@@ -130,7 +136,17 @@ impl WaylandWebStreamState {
             width,
             height,
             clock: Clock::new(),
+            dirty: true,
         }
+    }
+
+    /// Returns whether the rendered picture may have changed since the last
+    /// call, and clears the flag. Conservative: a commit that re-attaches
+    /// pixel-identical content still counts as dirty, since detecting that
+    /// would require comparing buffer contents (the cost this is meant to
+    /// avoid).
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.dirty, false)
     }
 
     pub fn resize_output(&mut self, width: u32, height: u32) {
@@ -145,6 +161,7 @@ impl WaylandWebStreamState {
         self.output.set_preferred(mode);
         self.width = width;
         self.height = height;
+        self.dirty = true;
 
         // Tell every mapped client window about the new viewport size so it
         // redraws to fill the screen instead of staying at its old size.
@@ -530,7 +547,8 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
         #[allow(deprecated)]
         let window = Window::new(surface);
         self.space.map_element(window, (0, 0), false);
-        
+        self.dirty = true;
+
         info!("Window mapped to space. Total windows: {}", self.space.elements().count());
     }
     
@@ -545,6 +563,7 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
 
         if let Some(window) = window {
             self.space.unmap_elem(&window);
+            self.dirty = true;
         }
 
         info!("Window unmapped from space. Total windows: {}", self.space.elements().count());
@@ -573,6 +592,11 @@ impl smithay::wayland::compositor::CompositorHandler for WaylandWebStreamState {
         // Handle surface commits - apply pending state
         use smithay::backend::renderer::utils::on_commit_buffer_handler;
         on_commit_buffer_handler::<Self>(surface);
+
+        // A commit may have attached new pixel content -- conservatively
+        // assume it did rather than comparing buffers, which would cost
+        // more than the render this is meant to let us skip.
+        self.dirty = true;
 
         // `Window::bbox()` is a cache that only `Window::on_commit()` refreshes;
         // without this, it stays at its initial (0,0) forever and `surface_at`'s
