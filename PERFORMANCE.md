@@ -28,7 +28,7 @@ client jitter buffer) that are the most likely reasons Selkies looks smoother.
 These are small, low-risk, and target the actual complaint more directly than copy
 reductions. Land 1–3 together so you can A/B against Selkies.
 
-- [ ] **Fix frame pacing** — `main.rs:263-343`. Capture is gated on
+- [x] **Fix frame pacing** — `main.rs:263-343`. Capture is gated on
   `loop_start.duration_since(last_frame) >= frame_interval`, then sets
   `last_frame = loop_start`. Problems:
   - Timing is only checked once per loop iteration, and the iteration is gated by
@@ -40,6 +40,14 @@ reductions. Land 1–3 together so you can A/B against Selkies.
   - **Try:** drive capture from a calloop `Timer` source at `frame_interval`, and
     accumulate `last_frame += frame_interval` instead of snapping to wake time.
   - This is the single highest-leverage smoothness fix.
+  - **Done:** replaced `last_frame` with a self-correcting `next_frame` deadline
+    (`next_frame += frame_interval`, resyncing to `now` only after a stall) and
+    made the `event_loop.dispatch` timeout track time-remaining-until-deadline
+    (capped at 16ms) instead of always waiting a fixed 16ms. Skipped the literal
+    calloop `Timer` source — the loop already calls `dispatch` manually each
+    iteration with an explicit timeout, so a `Timer` source would duplicate that
+    without changing behavior; the dynamic timeout achieves the same effect with
+    a smaller diff.
 
 - [ ] **Stop zeroing the client jitter buffer** — `client.html:90-91`
   (`jitterBufferTarget = 0`, `playoutDelayHint = 0`). With capture jitter (above),

@@ -258,11 +258,13 @@ async fn main() -> Result<()> {
     let mut frame_count = 0u64;
     let frame_interval = std::time::Duration::from_secs_f64(1.0 / config.framerate as f64);
     let frame_timestamp_step = 90_000 / config.framerate as i64; // 90kHz RTP clock
-    let mut last_frame = std::time::Instant::now();
-    
+    // Self-correcting deadline: advanced by exactly `frame_interval` each frame
+    // rather than snapped to wake time, so timing error doesn't accumulate.
+    let mut next_frame = std::time::Instant::now() + frame_interval;
+
     loop {
         let loop_start = std::time::Instant::now();
-        
+
         // Check for resize requests (non-blocking)
         if let Ok((req_width, req_height)) = resize_rx.try_recv() {
             // Ensure dimensions are divisible by 16 for optimal H.264 encoding
@@ -303,8 +305,13 @@ async fn main() -> Result<()> {
             mouse_handler.handle_event(mouse_event, &mut state);
         }
         
-        // Dispatch Wayland events (non-blocking with 16ms timeout)
-        event_loop.dispatch(std::time::Duration::from_millis(16), &mut state)
+        // Dispatch Wayland events, capped at 16ms but never waiting past the
+        // next frame deadline — otherwise this wait dominates the loop period
+        // and capture lands at ~2x frame_interval instead of on cadence.
+        let dispatch_timeout = next_frame
+            .saturating_duration_since(loop_start)
+            .min(std::time::Duration::from_millis(16));
+        event_loop.dispatch(dispatch_timeout, &mut state)
             .context("Event loop dispatch failed")?;
 
         display.dispatch_clients(&mut state)
@@ -318,7 +325,8 @@ async fn main() -> Result<()> {
         // clients that redraw on every `frame.done` (e.g. cage) would otherwise
         // repaint as fast as the event loop spins instead of at the rate we
         // actually capture and encode, burning CPU for frames nobody captures.
-        if loop_start.duration_since(last_frame) >= frame_interval {
+        let now = std::time::Instant::now();
+        if now >= next_frame {
             state.send_frames();
 
             if let Some(framebuffer) = state.render() {
@@ -335,7 +343,15 @@ async fn main() -> Result<()> {
                     frame_count += 1;
                 }
             }
-            last_frame = loop_start;
+
+            // Advance by exactly one interval (self-correcting cadence) rather
+            // than snapping to `now`, which would let timing error accumulate.
+            // If we've fallen behind by more than an interval (e.g. a stall),
+            // resync to now instead of bursting frames to catch up.
+            next_frame += frame_interval;
+            if next_frame < now {
+                next_frame = now + frame_interval;
+            }
 
             display.flush_clients()
                 .context("Failed to flush Wayland clients")?;
