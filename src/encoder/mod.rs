@@ -260,6 +260,18 @@ fn create_encoder(config: &EncoderConfig) -> Result<ffmpeg::encoder::Video> {
     opts.set("repeat_headers", "1"); // Include SPS/PPS with every keyframe
     opts.set("annex_b", "1"); // Use Annex B format (required for RTP)
 
+    // Cap how far a single frame's size can exceed the target bitrate.
+    // Without a VBV limit, x264's "bitrate" is only an average over the
+    // whole stream - an IDR frame (every keyframe_interval frames) can come
+    // out several times larger than a P-frame, and at 2Mbps a ~250KB
+    // keyframe alone takes ~1 second to drain through the link. That shows
+    // up as the receive-side jitter buffer ballooning every GOP and then
+    // draining back down. Bounding vbv-bufsize caps that worst case.
+    let vbv_maxrate_kbps = (config.bitrate / 1000).max(1);
+    let vbv_bufsize_kbps = (vbv_maxrate_kbps / 4).max(1); // ~250ms worth of frames
+    opts.set("vbv-maxrate", &vbv_maxrate_kbps.to_string());
+    opts.set("vbv-bufsize", &vbv_bufsize_kbps.to_string());
+
     let encoder = encoder.open_with(opts)?;
     
     info!("Encoder initialized: {}x{} @ {}fps, {} bps", 

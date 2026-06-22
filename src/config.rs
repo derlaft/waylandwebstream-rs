@@ -30,7 +30,7 @@ pub struct Config {
     pub turn_public_ip: Option<String>,
 
     /// Target framerate
-    #[arg(long, default_value = "30")]
+    #[arg(long, default_value = "60")]
     pub framerate: u32,
 
     /// Wayland display name

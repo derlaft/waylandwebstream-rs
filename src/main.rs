@@ -83,9 +83,9 @@ async fn main() -> Result<()> {
     let encoder_config = EncoderConfig {
         width,
         height,
-        framerate: 30,
+        framerate: config.framerate,
         bitrate: 2_000_000,
-        keyframe_interval: 60,
+        keyframe_interval: config.framerate * 2,
     };
     
     let encoder = spawn_encoder(encoder_config)?;
@@ -145,7 +145,7 @@ async fn main() -> Result<()> {
     info!("║  ✓ Touch input handling (multi-touch support)               ║");
     info!("╠══════════════════════════════════════════════════════════════╣");
     info!("║  Server Configuration:                                       ║");
-    info!("║  - Resolution: {}x{} @ 30fps                       ║", width, height);
+    info!("║  - Resolution: {}x{} @ {}fps                       ║", width, height, config.framerate);
     info!("║  - Bitrate: 2 Mbps, H.264 baseline profile                  ║");
     info!("║  - HTTP port: {}                                         ║", config.port);
     info!("║  - Wayland display: {}                         ║", config.display_name);
@@ -181,7 +181,7 @@ async fn main() -> Result<()> {
     let encoder_resize = encoder.get_resize_sender();
 
     // Spawn the session manager with ICE sender and encoder control
-    let session_manager = SessionManager::new(offer_rx, packet_rx, remote_ice_rx, ice_tx, encoder_control, ice_config);
+    let session_manager = SessionManager::new(offer_rx, packet_rx, remote_ice_rx, ice_tx, encoder_control, ice_config, config.framerate);
     tokio::spawn(async move {
         if let Err(e) = session_manager.run().await {
             tracing::error!("Session manager error: {}", e);
@@ -208,7 +208,8 @@ async fn main() -> Result<()> {
     
     // Main event loop for Wayland compositor (synchronous)
     let mut frame_count = 0u64;
-    let frame_interval = std::time::Duration::from_millis(17); // ~60fps
+    let frame_interval = std::time::Duration::from_secs_f64(1.0 / config.framerate as f64);
+    let frame_timestamp_step = 90_000 / config.framerate as i64; // 90kHz RTP clock
     let mut last_frame = std::time::Instant::now();
     
     loop {
@@ -277,7 +278,7 @@ async fn main() -> Result<()> {
                     data: framebuffer,
                     width: state.width,
                     height: state.height,
-                    timestamp: (frame_count * 3000) as i64, // 90kHz clock, 30fps
+                    timestamp: (frame_count as i64) * frame_timestamp_step,
                 };
 
                 // Send frame to encoder (non-blocking)

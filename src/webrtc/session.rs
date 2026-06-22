@@ -31,11 +31,12 @@ use crate::webrtc::turn_server::IceServerConfig;
 pub struct Session {
     peer_connection: Arc<webrtc::peer_connection::RTCPeerConnection>,
     video_track: Arc<TrackLocalStaticSample>,
+    frame_duration: Duration,
 }
 
 impl Session {
     /// Create a new WebRTC session
-    pub async fn new(ice_tx: mpsc::Sender<IceCandidate>, ice_config: &IceServerConfig) -> Result<Self> {
+    pub async fn new(ice_tx: mpsc::Sender<IceCandidate>, ice_config: &IceServerConfig, framerate: u32) -> Result<Self> {
         // Create a MediaEngine with H.264 support
         let mut media_engine = MediaEngine::default();
         
@@ -184,6 +185,7 @@ impl Session {
         Ok(Self {
             peer_connection,
             video_track,
+            frame_duration: Duration::from_secs_f64(1.0 / framerate as f64),
         })
     }
 
@@ -245,10 +247,9 @@ impl Session {
 
     /// Send an encoded video packet over the track
     pub async fn send_video_packet(&self, packet: EncodedPacket) -> Result<()> {
-        // Create a Sample for the track (duration ~33ms for 30fps)
         let sample = Sample {
             data: Bytes::from(packet.data),
-            duration: Duration::from_millis(33),
+            duration: self.frame_duration,
             timestamp: std::time::SystemTime::now(),
             ..Default::default()
         };
@@ -279,6 +280,7 @@ pub struct SessionManager {
     ice_tx: mpsc::Sender<IceCandidate>,
     encoder_control_tx: mpsc::Sender<EncoderControl>,
     ice_config: IceServerConfig,
+    framerate: u32,
     active_session: Option<Arc<Session>>,
 }
 
@@ -290,6 +292,7 @@ impl SessionManager {
         ice_tx: mpsc::Sender<IceCandidate>,
         encoder_control_tx: mpsc::Sender<EncoderControl>,
         ice_config: IceServerConfig,
+        framerate: u32,
     ) -> Self {
         Self {
             offer_rx,
@@ -298,6 +301,7 @@ impl SessionManager {
             ice_tx,
             encoder_control_tx,
             ice_config,
+            framerate,
             active_session: None,
         }
     }
@@ -312,7 +316,7 @@ impl SessionManager {
                 Some((offer, answer_tx)) = self.offer_rx.recv() => {
                     info!("Received new offer, creating session");
                     
-                    match Session::new(self.ice_tx.clone(), &self.ice_config).await {
+                    match Session::new(self.ice_tx.clone(), &self.ice_config, self.framerate).await {
                         Ok(session) => {
                             match session.handle_offer(offer).await {
                                 Ok(answer) => {
