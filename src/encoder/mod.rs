@@ -364,7 +364,14 @@ fn create_encoder(config: &EncoderConfig) -> Result<ffmpeg::encoder::Video> {
     Ok(encoder)
 }
 
-/// Create swscale context for pixel format conversion
+/// Create swscale context for pixel format conversion. Source and
+/// destination dimensions are always identical here (the encoder is
+/// reinitialized to match `render()`'s output on every resize) -- this
+/// context only ever does a colorspace conversion, never a resize. swscale
+/// picks a dedicated "unscaled" SIMD converter for that case regardless of
+/// the resampling flag (the flag only affects the filter built for an
+/// actual scale), so `POINT` (cheapest, no interpolation) communicates
+/// intent accurately without claiming a bilinear filter is in play.
 fn create_scaler(config: &EncoderConfig) -> Result<ffmpeg::software::scaling::Context> {
     let scaler = ffmpeg::software::scaling::Context::get(
         ffmpeg::format::Pixel::BGRA,
@@ -373,7 +380,7 @@ fn create_scaler(config: &EncoderConfig) -> Result<ffmpeg::software::scaling::Co
         ffmpeg::format::Pixel::YUV420P,
         config.width,
         config.height,
-        ffmpeg::software::scaling::Flags::FAST_BILINEAR,
+        ffmpeg::software::scaling::Flags::POINT,
     )?;
 
     Ok(scaler)

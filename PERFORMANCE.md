@@ -162,9 +162,24 @@ reductions. Land 1–3 together so you can A/B against Selkies.
   that cost would likely exceed the render it's meant to avoid skipping; a commit is
   conservatively always treated as damage.
 
-- [ ] **swscale threading / flags** — `encoder/mod.rs:335-347`. `FAST_BILINEAR` is
+- [x] **swscale threading / flags** — `encoder/mod.rs:335-347`. `FAST_BILINEAR` is
   irrelevant since src dims == dst dims (pure colorspace convert). swscale is
   single-threaded; consider thread count. Lower priority — the render loop dominates.
+  **Done:** swapped `FAST_BILINEAR` for `POINT` in `create_scaler` -- functionally a
+  no-op (confirmed in the `ffmpeg-next` source: src/dst dims are always identical
+  here, since the encoder is reinitialized to match on every resize, so swscale's
+  `sws_init_context` takes its dedicated "unscaled" SIMD converter path for a pure
+  colorspace conversion, selected purely by format pair and bypassing the resampling
+  filter the flag controls entirely) -- but `POINT` states the actual intent (no
+  interpolation) instead of naming a filter that's never built. Did **not** pursue
+  swscale thread count: the safe `ffmpeg-next` API (`Context::get` → `sws_getContext`)
+  doesn't expose it -- it requires the raw `sws_alloc_context`/`av_opt_set_int`/
+  `sws_init_context` sequence via `ffmpeg_next::ffi` instead of a single call, more
+  unsafe surface for a function that's already on the SIMD unscaled-converter path.
+  Given the doc's own conclusion that the render loop dominates, and that swscale's
+  threading model parallelizes by row-slices of a resize filter that doesn't run
+  here, the expected win didn't justify the added unsafe code and an extra failure
+  mode (thread-pool setup) on this path.
 
 - [ ] **Encoder queue drops** — `main.rs:334` `frame_sender.try_send` silently drops
   frames when the encoder lags (channel cap 4). Fine as backpressure, but worth logging/
