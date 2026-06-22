@@ -37,6 +37,14 @@ pub struct Config {
     #[arg(long, default_value = "2000000")]
     pub bitrate: usize,
 
+    /// Keyframe interval in frames (GOP size). Lower values mean smaller,
+    /// more frequent keyframes instead of large periodic bursts, which
+    /// reduces the receive-side jitter buffer needed to absorb them - at
+    /// the cost of a bit more average bitrate. Defaults to 2 seconds worth
+    /// of frames at the configured framerate.
+    #[arg(long)]
+    pub keyframe_interval: Option<u32>,
+
     /// Wayland display name
     #[arg(long, default_value = "wayland-wws-0")]
     pub display_name: String,

@@ -82,12 +82,13 @@ async fn main() -> Result<()> {
         .context("Failed to insert listening socket into event loop")?;
 
     // Initialize encoder
+    let keyframe_interval = config.keyframe_interval.unwrap_or(config.framerate * 2);
     let encoder_config = EncoderConfig {
         width,
         height,
         framerate: config.framerate,
         bitrate: config.bitrate,
-        keyframe_interval: config.framerate * 2,
+        keyframe_interval,
     };
     
     let encoder = spawn_encoder(encoder_config)?;
@@ -145,6 +146,7 @@ async fn main() -> Result<()> {
     info!("║  Server Configuration:                                       ║");
     info!("║  - Resolution: {}x{} @ {}fps                       ║", width, height, config.framerate);
     info!("║  - Bitrate: {} bps                                          ║", config.bitrate);
+    info!("║  - Keyframe interval: {} frames                              ║", keyframe_interval);
     info!("║  - HTTP port: {}                                         ║", config.port);
     info!("║  - Wayland display: {}                         ║", config.display_name);
     info!("╠══════════════════════════════════════════════════════════════╣");
