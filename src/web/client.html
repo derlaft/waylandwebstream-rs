@@ -106,7 +106,16 @@
                     lastFrameTime = now;
                 });
                 
-                // Periodically report detailed latency stats via WebSocket
+                // Periodically report detailed latency stats via WebSocket.
+                // jitterBufferDelay/EmittedCount and totalDecodeTime/framesDecoded
+                // are lifetime cumulative counters per the WebRTC stats spec, not
+                // instantaneous values - dividing the raw totals gives the
+                // all-time average since the connection started. A single
+                // congestion spike then permanently drags that average up
+                // because the denominator grows too slowly to dilute it back
+                // down. Track deltas between polls instead, as startStatsLogging
+                // already does below, so the report reflects the last second.
+                let lastReportStats = null;
                 setInterval(() => {
                     if (pc && pc.connectionState === 'connected') {
                         pc.getStats().then(stats => {
@@ -115,7 +124,7 @@
                             let jitterBufferEmittedCount = 0;
                             let framesDecoded = 0;
                             let totalDecodeTime = 0;
-                            
+
                             stats.forEach(report => {
                                 // Get RTT from candidate pair
                                 if (report.type === 'candidate-pair') {
@@ -125,14 +134,14 @@
                                         }
                                     }
                                 }
-                                
+
                                 // Get remote candidate RTT if available
                                 if (report.type === 'remote-candidate' && report.roundTripTime) {
                                     if (rtt === null) {
                                         rtt = report.roundTripTime;
                                     }
                                 }
-                                
+
                                 // Get jitter buffer and decode stats from inbound-rtp
                                 if (report.type === 'inbound-rtp' && report.kind === 'video') {
                                     if (report.jitterBufferDelay !== undefined && report.jitterBufferEmittedCount !== undefined) {
@@ -145,24 +154,33 @@
                                     }
                                 }
                             });
-                            
+
                             // If we still don't have RTT, estimate from localhost
                             if (rtt === null || rtt === 0) {
-                                const isLocalhost = window.location.hostname === 'localhost' || 
+                                const isLocalhost = window.location.hostname === 'localhost' ||
                                                    window.location.hostname === '127.0.0.1';
                                 rtt = isLocalhost ? 1 : 50; // 1ms for localhost, 50ms default fallback
                             }
-                            
-                            // Calculate average jitter buffer delay per frame
-                            const avgJitterMs = jitterBufferEmittedCount > 0 
-                                ? (jitterBufferDelay / jitterBufferEmittedCount) * 1000 
-                                : 0;
-                            
-                            // Calculate average decode time per frame
-                            const avgDecodeMs = framesDecoded > 0
-                                ? (totalDecodeTime / framesDecoded) * 1000
-                                : 0;
-                            
+
+                            // Calculate jitter buffer delay and decode time
+                            // per frame over just the window since the last
+                            // poll, using the cumulative counters as deltas.
+                            let avgJitterMs = 0;
+                            let avgDecodeMs = 0;
+                            if (lastReportStats) {
+                                const deltaJitterCount = jitterBufferEmittedCount - lastReportStats.jitterBufferEmittedCount;
+                                if (deltaJitterCount > 0) {
+                                    const deltaJitterDelay = jitterBufferDelay - lastReportStats.jitterBufferDelay;
+                                    avgJitterMs = (deltaJitterDelay / deltaJitterCount) * 1000;
+                                }
+                                const deltaFramesDecoded = framesDecoded - lastReportStats.framesDecoded;
+                                if (deltaFramesDecoded > 0) {
+                                    const deltaDecodeTime = totalDecodeTime - lastReportStats.totalDecodeTime;
+                                    avgDecodeMs = (deltaDecodeTime / deltaFramesDecoded) * 1000;
+                                }
+                            }
+                            lastReportStats = { jitterBufferDelay, jitterBufferEmittedCount, framesDecoded, totalDecodeTime };
+
                             // Build detailed latency report
                             const networkMs = rtt / 2; // One-way network delay
                             const encodingEstimate = 16.7; // ~1 frame at 60fps
@@ -187,7 +205,7 @@
                             }
                         });
                     }
-                }, 1000); // Report every 1 second
+                }, 30000); // Report every 30 seconds
 
                 // Handle ICE connection state changes
                 pc.oniceconnectionstatechange = () => {
