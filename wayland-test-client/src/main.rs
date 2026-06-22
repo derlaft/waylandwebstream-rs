@@ -87,11 +87,14 @@ fn main() {
     surface.damage(0, 0, width as i32, height as i32);
     surface.commit();
     
-    println!("Window created with red content, running for 5 seconds...");
-    
-    // Run for 5 seconds to allow screenshot capture
+    println!("Window created with red content, running for 30 seconds...");
+
+    // The WebRTC capture script (tests/webrtc_capture.js) budgets up to ~10s
+    // for page navigation, 15s waiting for the video to start playing, plus
+    // a 2s settle -- comfortably under 30s, but 5s (the old value) raced
+    // that budget and made the integration test flaky under load.
     let start = std::time::Instant::now();
-    while state.running && start.elapsed().as_secs() < 5 {
+    while state.running && start.elapsed().as_secs() < 30 {
         event_queue.blocking_dispatch(&mut state).unwrap();
     }
     
