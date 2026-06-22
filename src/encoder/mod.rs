@@ -15,6 +15,13 @@ pub struct RawFrame {
 pub struct EncodedPacket {
     pub data: Vec<u8>,
     pub capture_time: std::time::Instant,
+    /// Whether this packet is an IDR/keyframe, as reported by the encoder.
+    /// WebCodecs needs each chunk tagged `key` or `delta` to know which ones
+    /// it can start decoding from.
+    pub is_keyframe: bool,
+    /// Monotonic packet id (wraps), used by consumers to detect drops/gaps
+    /// without depending on RTP sequencing.
+    pub frame_id: u32,
 }
 
 /// Resolution change event
@@ -152,6 +159,7 @@ fn encoder_thread(
     let mut yuv_frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, config.width, config.height);
     let mut frame_count = 0i64;
     let mut force_keyframe = false;
+    let mut next_frame_id = 0u32;
 
     loop {
         // Check for control messages (non-blocking)
@@ -239,6 +247,7 @@ fn encoder_thread(
             &mut yuv_frame,
             &raw_frame,
             frame_count,
+            &mut next_frame_id,
         );
 
         // The encoder has already copied everything it needs out of
@@ -371,6 +380,7 @@ fn encode_frame(
     yuv_frame: &mut ffmpeg::frame::Video,
     raw_frame: &RawFrame,
     frame_number: i64,
+    next_frame_id: &mut u32,
 ) -> Result<Vec<EncodedPacket>> {
     // Point the input frame straight at the render buffer instead of
     // copying into an owned one -- swscale only reads through this
@@ -420,10 +430,15 @@ fn encode_frame(
         match encoder.receive_packet(&mut encoded_packet) {
             Ok(_) => {
                 let data = encoded_packet.data().unwrap_or(&[]).to_vec();
+                let is_keyframe = encoded_packet.is_key();
+                let frame_id = *next_frame_id;
+                *next_frame_id = next_frame_id.wrapping_add(1);
 
                 packets.push(EncodedPacket {
                     data,
                     capture_time: raw_frame.capture_time,
+                    is_keyframe,
+                    frame_id,
                 });
             }
             Err(ffmpeg::Error::Other { errno: ffmpeg::error::EAGAIN }) => {

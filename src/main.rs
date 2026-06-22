@@ -219,6 +219,7 @@ async fn main() -> Result<()> {
     // Create signaling state and server
     let signaling_state = SignalingState::new(offer_tx.clone(), remote_ice_tx.clone(), resize_tx, touch_tx, mouse_tx, latency_tx, ice_config.clone());
     let ice_tx = signaling_state.get_ice_sender();
+    let video_tx = signaling_state.get_video_sender();
     let signaling_server = SignalingServer::new(signaling_state.clone());
     
     // Spawn the signaling server
@@ -244,10 +245,14 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Spawn the encoder packet forwarding task
+    // Spawn the encoder packet forwarding task: every encoded packet goes to
+    // both the WebRTC session manager (legacy path) and the `/stream`
+    // WebSocket broadcast (new WebCodecs path), so the two can be A/B tested
+    // side by side before the WebRTC path is retired.
     tokio::spawn(async move {
         let mut encoder_handle = encoder;
         while let Some(packet) = encoder_handle.recv_packet().await {
+            let _ = video_tx.send(packet.clone());
             if packet_tx.send(packet).await.is_err() {
                 break;
             }
