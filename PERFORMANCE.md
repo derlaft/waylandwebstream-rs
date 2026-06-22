@@ -95,16 +95,19 @@ reductions. Land 1–3 together so you can A/B against Selkies.
   multiple windows) is easy to get subtly wrong, and `fill(0)` already turns the
   per-pixel loop into a single memset, which is most of the win.
 
-- [ ] **Add fast paths to the scaling copy** — `state.rs:238-254`. This is likely the
+- [x] **Add fast paths to the scaling copy** — `state.rs:238-254`. This is likely the
   largest single CPU cost. Per output pixel it does two `u64` divisions, two bounds
   checks, and a 4-byte copy (~125M iterations/sec at 1080p60), on the compositor thread.
   Windows are configured fullscreen, so in steady state **buffer size == output size** —
-  yet the general scaling path always runs. Add:
-  - `buffer_w==target_w && buffer_h==target_h && stride==width*4` → one whole-buffer
-    `copy_from_slice` (single memcpy).
-  - vertical-only scaling → per-row `copy_from_slice`.
-  - general case → precompute the `src_x` lookup table once per row instead of dividing
-    per pixel.
+  yet the general scaling path always ran.
+  **Done:** added a `buffer_width == target_width && buffer_height == target_height`
+  fast path that copies row-by-row with `copy_from_slice` (respecting `buffer_stride`,
+  so no assumption about padding), replacing the per-pixel divide+copy loop for the
+  steady-state case. Deliberately did **not** add the vertical-only or general-case
+  (lookup-table) fast paths from the original plan — actual scaling (buffer size !=
+  target size) only happens for the frame or two a client lags a viewport resize by,
+  so the old per-pixel loop stays as the fallback for that transient path; optimizing
+  it further isn't worth the added code for something that's never the steady state.
 
 - [ ] **Reuse encoder frames & drop the BGRA intermediate** — `encoder/mod.rs:357-374`.
   - Both `frame::Video` allocations are fixed-size — allocate once, reuse across calls,

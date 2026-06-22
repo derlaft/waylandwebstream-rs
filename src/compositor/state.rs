@@ -237,18 +237,37 @@ impl WaylandWebStreamState {
                                 let target_height = self.height.saturating_sub(window_pos_y);
 
                                 if buffer_width > 0 && buffer_height > 0 && target_width > 0 && target_height > 0 {
-                                    for dest_y in 0..target_height {
-                                        let src_y = (dest_y as u64 * buffer_height as u64 / target_height as u64) as u32;
-                                        for dest_x in 0..target_width {
-                                            let src_x = (dest_x as u64 * buffer_width as u64 / target_width as u64) as u32;
+                                    if buffer_width == target_width && buffer_height == target_height {
+                                        // Steady-state case: the client buffer already matches
+                                        // its target 1:1 (the common case, since windows are
+                                        // configured fullscreen). Scaling only matters for the
+                                        // frame or two a client lags a viewport resize by, so
+                                        // there's no need to fast-path that path too -- just
+                                        // copy row-by-row (respecting stride) instead of running
+                                        // the per-pixel scaling loop below.
+                                        let row_bytes = (buffer_width * 4) as usize;
+                                        for y in 0..buffer_height {
+                                            let src_idx = (y * buffer_stride) as usize;
+                                            let dest_idx = (((window_pos_y + y) * self.width + window_pos_x) * 4) as usize;
+                                            if src_idx + row_bytes <= pixel_data.len() && dest_idx + row_bytes <= render_buffer.len() {
+                                                render_buffer[dest_idx..dest_idx + row_bytes]
+                                                    .copy_from_slice(&pixel_data[src_idx..src_idx + row_bytes]);
+                                            }
+                                        }
+                                    } else {
+                                        for dest_y in 0..target_height {
+                                            let src_y = (dest_y as u64 * buffer_height as u64 / target_height as u64) as u32;
+                                            for dest_x in 0..target_width {
+                                                let src_x = (dest_x as u64 * buffer_width as u64 / target_width as u64) as u32;
 
-                                            let src_idx = (src_y * buffer_stride + src_x * 4) as usize;
-                                            let dest_idx = (((window_pos_y + dest_y) * self.width + (window_pos_x + dest_x)) * 4) as usize;
+                                                let src_idx = (src_y * buffer_stride + src_x * 4) as usize;
+                                                let dest_idx = (((window_pos_y + dest_y) * self.width + (window_pos_x + dest_x)) * 4) as usize;
 
-                                            if src_idx + 3 < pixel_data.len() && dest_idx + 3 < render_buffer.len() {
-                                                // Copy ARGB8888/XRGB8888 pixel
-                                                render_buffer[dest_idx..dest_idx + 4]
-                                                    .copy_from_slice(&pixel_data[src_idx..src_idx + 4]);
+                                                if src_idx + 3 < pixel_data.len() && dest_idx + 3 < render_buffer.len() {
+                                                    // Copy ARGB8888/XRGB8888 pixel
+                                                    render_buffer[dest_idx..dest_idx + 4]
+                                                        .copy_from_slice(&pixel_data[src_idx..src_idx + 4]);
+                                                }
                                             }
                                         }
                                     }
