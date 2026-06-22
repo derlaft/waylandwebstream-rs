@@ -33,9 +33,17 @@ pub struct Config {
     #[arg(long, default_value = "60")]
     pub framerate: u32,
 
-    /// Video bitrate in bits per second
+    /// Video bitrate in bits per second (constant bitrate mode). Ignored if
+    /// --crf is set.
     #[arg(long, default_value = "2000000")]
     pub bitrate: usize,
+
+    /// Enable constant quality mode using this x264 CRF value (0-51, lower
+    /// is higher quality/larger frames; 18-28 is a typical range) instead of
+    /// targeting a constant bitrate. Frame size will vary with scene
+    /// complexity since there is no bitrate cap in this mode.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=51))]
+    pub crf: Option<u8>,
 
     /// Keyframe interval in frames (GOP size). Lower values mean smaller,
     /// more frequent keyframes instead of large periodic bursts, which

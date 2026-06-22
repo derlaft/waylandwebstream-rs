@@ -31,13 +31,26 @@ pub struct ResolutionChange {
     pub height: u32,
 }
 
+/// How the encoder targets output size vs. quality
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RateControl {
+    /// Target an average bitrate (bits per second), capped by a VBV window
+    /// so individual frames (e.g. keyframes) can't balloon the jitter buffer.
+    Bitrate(usize),
+    /// Target a constant quality via x264's CRF: each frame gets whatever
+    /// bits it needs to hit the quality level, so output size varies with
+    /// scene complexity instead of being capped. Range 0-51, lower = better
+    /// quality/bigger frames; x264's default is 23.
+    Quality(u8),
+}
+
 /// Encoder configuration
 #[derive(Clone, Debug)]
 pub struct EncoderConfig {
     pub width: u32,
     pub height: u32,
     pub framerate: u32,
-    pub bitrate: usize,
+    pub rate_control: RateControl,
     pub keyframe_interval: u32,
 }
 
@@ -47,7 +60,7 @@ impl Default for EncoderConfig {
             width: 1280,
             height: 720,
             framerate: 30,
-            bitrate: 2_000_000, // 2 Mbps
+            rate_control: RateControl::Bitrate(2_000_000), // 2 Mbps
             keyframe_interval: 60, // 2 seconds at 30fps
         }
     }
@@ -170,20 +183,25 @@ fn encoder_thread(
                     force_keyframe = true;
                 }
                 EncoderControl::ChangeBitrate(new_bitrate) => {
-                    if new_bitrate != config.bitrate {
-                        info!("Changing bitrate from {} to {} bps", config.bitrate, new_bitrate);
-                        config.bitrate = new_bitrate;
-                        
-                        // Reinitialize encoder with new bitrate
-                        match create_encoder(&config) {
-                            Ok(new_encoder) => {
-                                encoder = new_encoder;
-                                frame_count = 0; // Reset frame count to force IDR
-                                info!("Encoder reinitialized with new bitrate");
-                            }
-                            Err(e) => {
-                                error!("Failed to reinitialize encoder with new bitrate: {}", e);
-                            }
+                    if config.rate_control == RateControl::Bitrate(new_bitrate) {
+                        continue;
+                    }
+                    if !matches!(config.rate_control, RateControl::Bitrate(_)) {
+                        warn!("Ignoring bitrate change request: encoder is in constant-quality mode");
+                        continue;
+                    }
+                    info!("Changing bitrate from {:?} to {} bps", config.rate_control, new_bitrate);
+                    config.rate_control = RateControl::Bitrate(new_bitrate);
+
+                    // Reinitialize encoder with new bitrate
+                    match create_encoder(&config) {
+                        Ok(new_encoder) => {
+                            encoder = new_encoder;
+                            frame_count = 0; // Reset frame count to force IDR
+                            info!("Encoder reinitialized with new bitrate");
+                        }
+                        Err(e) => {
+                            error!("Failed to reinitialize encoder with new bitrate: {}", e);
                         }
                     }
                 }
@@ -266,7 +284,6 @@ fn create_encoder(config: &EncoderConfig) -> Result<ffmpeg::encoder::Video> {
     encoder.set_format(ffmpeg::format::Pixel::YUV420P);
     encoder.set_frame_rate(Some(ffmpeg::Rational::new(config.framerate as i32, 1)));
     encoder.set_time_base(ffmpeg::Rational::new(1, config.framerate as i32));
-    encoder.set_bit_rate(config.bitrate);
 
     // Set x264-specific options for low latency
     let mut opts = ffmpeg::Dictionary::new();
@@ -281,22 +298,35 @@ fn create_encoder(config: &EncoderConfig) -> Result<ffmpeg::encoder::Video> {
     opts.set("repeat_headers", "1"); // Include SPS/PPS with every keyframe
     opts.set("annex_b", "1"); // Use Annex B format (required for RTP)
 
-    // Cap how far a single frame's size can exceed the target bitrate.
-    // Without a VBV limit, x264's "bitrate" is only an average over the
-    // whole stream - an IDR frame (every keyframe_interval frames) can come
-    // out several times larger than a P-frame, and at 2Mbps a ~250KB
-    // keyframe alone takes ~1 second to drain through the link. That shows
-    // up as the receive-side jitter buffer ballooning every GOP and then
-    // draining back down. Bounding vbv-bufsize caps that worst case.
-    let vbv_maxrate_kbps = (config.bitrate / 1000).max(1);
-    let vbv_bufsize_kbps = (vbv_maxrate_kbps / 4).max(1); // ~250ms worth of frames
-    opts.set("vbv-maxrate", &vbv_maxrate_kbps.to_string());
-    opts.set("vbv-bufsize", &vbv_bufsize_kbps.to_string());
+    match config.rate_control {
+        RateControl::Bitrate(bitrate) => {
+            encoder.set_bit_rate(bitrate);
+
+            // Cap how far a single frame's size can exceed the target bitrate.
+            // Without a VBV limit, x264's "bitrate" is only an average over the
+            // whole stream - an IDR frame (every keyframe_interval frames) can come
+            // out several times larger than a P-frame, and at 2Mbps a ~250KB
+            // keyframe alone takes ~1 second to drain through the link. That shows
+            // up as the receive-side jitter buffer ballooning every GOP and then
+            // draining back down. Bounding vbv-bufsize caps that worst case.
+            let vbv_maxrate_kbps = (bitrate / 1000).max(1);
+            let vbv_bufsize_kbps = (vbv_maxrate_kbps / 4).max(1); // ~250ms worth of frames
+            opts.set("vbv-maxrate", &vbv_maxrate_kbps.to_string());
+            opts.set("vbv-bufsize", &vbv_bufsize_kbps.to_string());
+        }
+        RateControl::Quality(crf) => {
+            // No VBV cap here: constant quality means frame size is whatever
+            // the scene needs, so a busy frame (e.g. a keyframe) can be much
+            // larger than at a fixed bitrate. Capping it would defeat the
+            // point of asking for constant quality.
+            opts.set("crf", &crf.to_string());
+        }
+    }
 
     let encoder = encoder.open_with(opts)?;
-    
-    info!("Encoder initialized: {}x{} @ {}fps, {} bps", 
-          config.width, config.height, config.framerate, config.bitrate);
+
+    info!("Encoder initialized: {}x{} @ {}fps, {:?}",
+          config.width, config.height, config.framerate, config.rate_control);
 
     Ok(encoder)
 }

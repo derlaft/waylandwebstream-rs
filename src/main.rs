@@ -19,7 +19,7 @@ mod webrtc;
 
 
 use compositor::CompositorState;
-use encoder::{EncoderConfig, spawn_encoder};
+use encoder::{EncoderConfig, RateControl, spawn_encoder};
 use input::mouse::MouseHandler;
 use input::touch::TouchHandler;
 use webrtc::session::SessionManager;
@@ -83,11 +83,15 @@ async fn main() -> Result<()> {
 
     // Initialize encoder
     let keyframe_interval = config.keyframe_interval.unwrap_or(config.framerate * 2);
+    let rate_control = match config.crf {
+        Some(crf) => RateControl::Quality(crf),
+        None => RateControl::Bitrate(config.bitrate),
+    };
     let encoder_config = EncoderConfig {
         width,
         height,
         framerate: config.framerate,
-        bitrate: config.bitrate,
+        rate_control,
         keyframe_interval,
     };
     
@@ -145,7 +149,10 @@ async fn main() -> Result<()> {
     info!("╠══════════════════════════════════════════════════════════════╣");
     info!("║  Server Configuration:                                       ║");
     info!("║  - Resolution: {}x{} @ {}fps                       ║", width, height, config.framerate);
-    info!("║  - Bitrate: {} bps                                          ║", config.bitrate);
+    match rate_control {
+        RateControl::Bitrate(bps) => info!("║  - Bitrate: {} bps                                          ║", bps),
+        RateControl::Quality(crf) => info!("║  - Quality: CRF {}                                            ║", crf),
+    }
     info!("║  - Keyframe interval: {} frames                              ║", keyframe_interval);
     info!("║  - HTTP port: {}                                         ║", config.port);
     info!("║  - Wayland display: {}                         ║", config.display_name);
