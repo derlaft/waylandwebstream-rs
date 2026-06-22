@@ -347,6 +347,16 @@ impl SessionManager {
                             match session.handle_offer(offer).await {
                                 Ok(answer) => {
                                     let _ = answer_tx.send(answer);
+
+                                    // Tear down the previous session (if any) now that the
+                                    // new one is in place, rather than just dropping it --
+                                    // otherwise its RTCPeerConnection and ICE agent linger
+                                    // instead of being explicitly closed.
+                                    if let Some(old_session) = self.active_session.take() {
+                                        if let Err(e) = old_session.close().await {
+                                            warn!("Failed to close previous session: {}", e);
+                                        }
+                                    }
                                     self.active_session = Some(Arc::new(session));
                                     info!("WebRTC session established");
                                     
