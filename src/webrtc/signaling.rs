@@ -18,6 +18,7 @@ use tracing::{info, warn};
 
 use crate::input::mouse::MouseEvent;
 use crate::input::touch::TouchEvent;
+use crate::latency::LatencyReport;
 use crate::web::client_html::CLIENT_HTML;
 use crate::webrtc::turn_server::IceServerConfig;
 
@@ -84,6 +85,11 @@ pub enum SignalingMessage {
         #[serde(flatten)]
         event: MouseEvent,
     },
+    #[serde(rename = "latency")]
+    Latency { 
+        #[serde(flatten)]
+        report: LatencyReport 
+    },
 }
 
 /// Shared state for the signaling server
@@ -101,6 +107,8 @@ pub struct SignalingState {
     touch_tx: mpsc::Sender<TouchEvent>,
     /// Channel to send pointer (mouse/pen) events from clients
     mouse_tx: mpsc::Sender<MouseEvent>,
+    /// Channel to send latency reports from clients
+    latency_tx: Option<mpsc::Sender<LatencyReport>>,
     /// STUN/TURN server list handed out to clients via `/ice-config`
     ice_config: IceServerConfig,
 }
@@ -112,10 +120,11 @@ impl SignalingState {
         resize_tx: mpsc::Sender<(u32, u32)>,
         touch_tx: mpsc::Sender<TouchEvent>,
         mouse_tx: mpsc::Sender<MouseEvent>,
+        latency_tx: Option<mpsc::Sender<LatencyReport>>,
         ice_config: IceServerConfig,
     ) -> Self {
         let (ice_tx, _) = broadcast::channel(16);
-        Self { ice_tx, offer_tx, remote_ice_tx, resize_tx, touch_tx, mouse_tx, ice_config }
+        Self { ice_tx, offer_tx, remote_ice_tx, resize_tx, touch_tx, mouse_tx, latency_tx, ice_config }
     }
 
     pub fn get_ice_receiver(&self) -> broadcast::Receiver<IceCandidate> {
@@ -294,6 +303,13 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                         // Pointer events can be frequent, so only log at debug level
                         if let Err(e) = state.mouse_tx.send(event).await {
                             warn!("Failed to send pointer event: {}", e);
+                        }
+                    }
+                    SignalingMessage::Latency { report } => {
+                        if let Some(ref latency_tx) = state.latency_tx {
+                            if let Err(e) = latency_tx.send(report).await {
+                                warn!("Failed to send latency report: {}", e);
+                            }
                         }
                     }
                 }

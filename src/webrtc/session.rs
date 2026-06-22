@@ -12,6 +12,8 @@ use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
+use webrtc::data_channel::RTCDataChannel;
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -131,10 +133,14 @@ impl Session {
         // Read RTCP packets in a separate task
         tokio::spawn(async move {
             let mut rtcp_buf = vec![0u8; 1500];
-            while let Ok((_, _)) = rtp_sender.read(&mut rtcp_buf).await {
-                // Handle RTCP feedback (for adaptive bitrate in the future)
+            while let Ok((packets, _)) = rtp_sender.read(&mut rtcp_buf).await {
+                if !packets.is_empty() {
+                    tracing::debug!("Received {} RTCP feedback packet(s)", packets.len());
+                }
             }
         });
+
+
 
         // Set up connection state handlers
         let pc = Arc::downgrade(&peer_connection);

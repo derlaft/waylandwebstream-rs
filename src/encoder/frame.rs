@@ -54,6 +54,7 @@ impl FrameCapture {
             width,
             height,
             timestamp,
+            capture_time: std::time::Instant::now(),
         };
 
         // Try to send frame (non-blocking)

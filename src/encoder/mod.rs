@@ -12,6 +12,7 @@ pub struct RawFrame {
     pub width: u32,
     pub height: u32,
     pub timestamp: i64,
+    pub capture_time: std::time::Instant,
 }
 
 /// Encoded video packet (H.264 NAL units)
@@ -20,6 +21,7 @@ pub struct EncodedPacket {
     pub data: Vec<u8>,
     pub timestamp: i64,
     pub is_keyframe: bool,
+    pub capture_time: std::time::Instant,
 }
 
 /// Resolution change event
@@ -55,6 +57,7 @@ impl Default for EncoderConfig {
 #[derive(Clone, Debug)]
 pub enum EncoderControl {
     ForceKeyframe,
+    ChangeBitrate(usize),
 }
 
 /// Handle for controlling the encoder thread
@@ -165,6 +168,24 @@ fn encoder_thread(
                 EncoderControl::ForceKeyframe => {
                     info!("Keyframe requested");
                     force_keyframe = true;
+                }
+                EncoderControl::ChangeBitrate(new_bitrate) => {
+                    if new_bitrate != config.bitrate {
+                        info!("Changing bitrate from {} to {} bps", config.bitrate, new_bitrate);
+                        config.bitrate = new_bitrate;
+                        
+                        // Reinitialize encoder with new bitrate
+                        match create_encoder(&config) {
+                            Ok(new_encoder) => {
+                                encoder = new_encoder;
+                                frame_count = 0; // Reset frame count to force IDR
+                                info!("Encoder reinitialized with new bitrate");
+                            }
+                            Err(e) => {
+                                error!("Failed to reinitialize encoder with new bitrate: {}", e);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -342,6 +363,7 @@ fn encode_frame(
                     data,
                     timestamp: raw_frame.timestamp,
                     is_keyframe,
+                    capture_time: raw_frame.capture_time,
                 });
             }
             Err(ffmpeg::Error::Other { errno: ffmpeg::error::EAGAIN }) => {

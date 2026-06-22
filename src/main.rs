@@ -13,8 +13,10 @@ mod compositor;
 mod config;
 mod encoder;
 mod input;
+mod latency;
 mod web;
 mod webrtc;
+
 
 use compositor::CompositorState;
 use encoder::{EncoderConfig, spawn_encoder};
@@ -125,17 +127,12 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to start embedded TURN server")?;
 
-    // Create signaling state and server
-    let signaling_state = SignalingState::new(offer_tx, remote_ice_tx, resize_tx, touch_tx, mouse_tx, ice_config.clone());
-    let ice_tx = signaling_state.get_ice_sender();
-    let signaling_server = SignalingServer::new(signaling_state.clone());
-
     // Create touch and pointer handlers
     let mut touch_handler = TouchHandler::new(width, height);
     let mut mouse_handler = MouseHandler::new(width, height);
 
     info!("\n╔══════════════════════════════════════════════════════════════╗");
-    info!("║  Phase 4 Implementation: Basic Touch Input                  ║");
+    info!("║  WaylandWebStream - Latency Reporting Enabled               ║");
     info!("╠══════════════════════════════════════════════════════════════╣");
     info!("║  ✓ WebRTC peer connection with H.264 support                ║");
     info!("║  ✓ HTTP/WebSocket signaling server                          ║");
@@ -143,29 +140,73 @@ async fn main() -> Result<()> {
     info!("║  ✓ Browser client with video playback                       ║");
     info!("║  ✓ ICE/STUN support for NAT traversal                       ║");
     info!("║  ✓ Touch input handling (multi-touch support)               ║");
+    info!("║  ✓ Client-to-server latency reporting                       ║");
     info!("╠══════════════════════════════════════════════════════════════╣");
     info!("║  Server Configuration:                                       ║");
     info!("║  - Resolution: {}x{} @ {}fps                       ║", width, height, config.framerate);
-    info!("║  - Bitrate: {} bps, H.264 baseline profile               ║", config.bitrate);
+    info!("║  - Bitrate: {} bps                                          ║", config.bitrate);
     info!("║  - HTTP port: {}                                         ║", config.port);
     info!("║  - Wayland display: {}                         ║", config.display_name);
     info!("╠══════════════════════════════════════════════════════════════╣");
     info!("║  Connect with browser:                                       ║");
     info!("║  http://localhost:{}                                      ║", config.port);
-    info!("╠══════════════════════════════════════════════════════════════╣");
-    info!("║  Touch Input Features:                                       ║");
-    info!("║  - Multi-touch support with coordinate mapping               ║");
-    info!("║  - Touch pressure sensitivity                                ║");
-    info!("║  - Automatic coordinate normalization                        ║");
-    info!("║  - Touch event batching and efficient processing             ║");
-    info!("╠══════════════════════════════════════════════════════════════╣");
-    info!("║  Next Steps (Phase 5):                                       ║");
-    info!("║  - Integrate touch with Wayland virtual input device         ║");
-    info!("║  - Add keyboard/mouse support                                ║");
-    info!("║  - Bidirectional data channel communication                  ║");
     info!("╚══════════════════════════════════════════════════════════════╝\n");
 
     info!("Server starting on port {}...", config.port);
+    
+    // Get frame sender, encoder control sender, and resize sender before moving encoder
+    let frame_sender = encoder.get_frame_sender();
+    let encoder_control = encoder.get_control_sender();
+    let encoder_resize = encoder.get_resize_sender();
+
+    // Set up latency reporting pipeline
+    let latency_tx = {
+        use crate::latency::LatencyReport;
+        let (latency_tx, mut latency_rx) = mpsc::channel::<LatencyReport>(16);
+        
+        // Spawn task to log detailed latency reports
+        tokio::spawn(async move {
+            while let Some(report) = latency_rx.recv().await {
+                info!("═══ Latency Report ═══");
+                if let Some(v) = report.input_ms {
+                    info!("  Input:          {:>6.1} ms", v);
+                }
+                if let Some(v) = report.capture_to_encode_ms {
+                    info!("  Capture→Encode: {:>6.1} ms", v);
+                }
+                if let Some(v) = report.encoding_ms {
+                    info!("  Encoding:       {:>6.1} ms", v);
+                }
+                if let Some(v) = report.encode_to_send_ms {
+                    info!("  Encode→Send:    {:>6.1} ms", v);
+                }
+                if let Some(v) = report.network_ms {
+                    info!("  Network:        {:>6.1} ms", v);
+                }
+                if let Some(v) = report.jitter_buffer_ms {
+                    info!("  Jitter buffer:  {:>6.1} ms", v);
+                }
+                if let Some(v) = report.receive_to_decode_ms {
+                    info!("  Receive→Decode: {:>6.1} ms", v);
+                }
+                if let Some(v) = report.decoding_ms {
+                    info!("  Decoding:       {:>6.1} ms", v);
+                }
+                if let Some(v) = report.decode_to_display_ms {
+                    info!("  Decode→Display: {:>6.1} ms", v);
+                }
+                info!("  ══════════════════════");
+                info!("  TOTAL:          {:>6.1} ms", report.total_ms);
+            }
+        });
+        
+        Some(latency_tx)
+    };
+
+    // Create signaling state and server
+    let signaling_state = SignalingState::new(offer_tx.clone(), remote_ice_tx.clone(), resize_tx, touch_tx, mouse_tx, latency_tx, ice_config.clone());
+    let ice_tx = signaling_state.get_ice_sender();
+    let signaling_server = SignalingServer::new(signaling_state.clone());
     
     // Spawn the signaling server
     let port = config.port;
@@ -175,13 +216,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Get frame sender, encoder control sender, and resize sender before moving encoder
-    let frame_sender = encoder.get_frame_sender();
-    let encoder_control = encoder.get_control_sender();
-    let encoder_resize = encoder.get_resize_sender();
-
-    // Spawn the session manager with ICE sender and encoder control
-    let session_manager = SessionManager::new(offer_rx, packet_rx, remote_ice_rx, ice_tx, encoder_control, ice_config, config.framerate);
+    // Spawn the session manager
+    let session_manager = SessionManager::new(offer_rx, packet_rx, remote_ice_rx, ice_tx.clone(), encoder_control, ice_config, config.framerate);
     tokio::spawn(async move {
         if let Err(e) = session_manager.run().await {
             tracing::error!("Session manager error: {}", e);
@@ -279,6 +315,7 @@ async fn main() -> Result<()> {
                     width: state.width,
                     height: state.height,
                     timestamp: (frame_count as i64) * frame_timestamp_step,
+                    capture_time: std::time::Instant::now(),
                 };
 
                 // Send frame to encoder (non-blocking)
