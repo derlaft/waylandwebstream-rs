@@ -40,6 +40,13 @@
 
     detachInput = attachInput(canvas, sendControl);
 
+    // Keyboard events only reach a focused element, and there's no other
+    // focusable content on the page competing for it -- so focus the canvas
+    // immediately rather than requiring a click first (clicking still
+    // re-focuses it too, e.g. after the side panel steals focus; see
+    // input.ts's pointerdown handler).
+    canvas.focus();
+
     window.addEventListener('beforeunload', teardown);
   });
 
@@ -50,7 +57,7 @@
 </script>
 
 <div class="stage">
-  <canvas bind:this={canvas}></canvas>
+  <canvas bind:this={canvas} tabindex="0"></canvas>
 </div>
 
 <style>
@@ -70,5 +77,6 @@
     user-select: none;
     -webkit-user-select: none;
     -webkit-touch-callout: none;
+    outline: none;
   }
 </style>

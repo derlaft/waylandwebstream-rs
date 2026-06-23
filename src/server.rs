@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use crate::adaptive_bitrate::BitrateEvent;
 use crate::encoder::{EncodedPacket, EncoderControl};
+use crate::input::keyboard::KeyboardEvent;
 use crate::input::mouse::MouseEvent;
 use crate::input::touch::TouchEvent;
 use crate::latency::LatencyReport;
@@ -44,6 +45,11 @@ pub enum SignalingMessage {
     Pointer {
         #[serde(flatten)]
         event: MouseEvent,
+    },
+    #[serde(rename = "key")]
+    Key {
+        #[serde(flatten)]
+        event: KeyboardEvent,
     },
     /// Sent when the client's WebCodecs decoder falls behind and has to drop
     /// frames -- waiting out the periodic GOP-cycle keyframe (every
@@ -94,6 +100,8 @@ pub struct SignalingState {
     touch_tx: mpsc::Sender<TouchEvent>,
     /// Channel to send pointer (mouse/pen) events from clients
     mouse_tx: mpsc::Sender<MouseEvent>,
+    /// Channel to send keyboard events from clients
+    key_tx: mpsc::Sender<KeyboardEvent>,
     /// Channel to send latency reports from clients
     latency_tx: Option<mpsc::Sender<LatencyReport>>,
     /// Feeds keyframe-request and latency signals to the adaptive bitrate
@@ -141,6 +149,7 @@ impl SignalingState {
         resize_tx: mpsc::Sender<(u32, u32)>,
         touch_tx: mpsc::Sender<TouchEvent>,
         mouse_tx: mpsc::Sender<MouseEvent>,
+        key_tx: mpsc::Sender<KeyboardEvent>,
         latency_tx: Option<mpsc::Sender<LatencyReport>>,
         bitrate_event_tx: Option<mpsc::Sender<BitrateEvent>>,
         encoder_control_tx: mpsc::Sender<EncoderControl>,
@@ -155,6 +164,7 @@ impl SignalingState {
             resize_tx,
             touch_tx,
             mouse_tx,
+            key_tx,
             latency_tx,
             bitrate_event_tx,
             video_tx,
@@ -274,6 +284,11 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                         // Pointer events can be frequent, so only log at debug level
                         if let Err(e) = state.mouse_tx.send(event).await {
                             warn!("Failed to send pointer event: {}", e);
+                        }
+                    }
+                    SignalingMessage::Key { event } => {
+                        if let Err(e) = state.key_tx.send(event).await {
+                            warn!("Failed to send key event: {}", e);
                         }
                     }
                     SignalingMessage::RequestKeyframe => {
@@ -506,6 +521,7 @@ mod tests {
         let (resize_tx, _resize_rx) = mpsc::channel(4);
         let (touch_tx, _touch_rx) = mpsc::channel(4);
         let (mouse_tx, _mouse_rx) = mpsc::channel(4);
+        let (key_tx, _key_rx) = mpsc::channel(4);
         let (encoder_control_tx, mut encoder_control_rx) = mpsc::channel(4);
         let (pending_ping_tx, _pending_ping_rx) = mpsc::channel(4);
         let (_bitrate_tx, bitrate_rx) = watch::channel(2_000_000usize);
@@ -517,6 +533,7 @@ mod tests {
             resize_tx,
             touch_tx,
             mouse_tx,
+            key_tx,
             None,
             None,
             encoder_control_tx,

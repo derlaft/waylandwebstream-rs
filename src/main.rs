@@ -149,6 +149,7 @@ async fn main() -> Result<()> {
     let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32)>(4);
     let (touch_tx, mut touch_rx) = mpsc::channel(32); // Higher capacity for touch events
     let (mouse_tx, mut mouse_rx) = mpsc::channel(64); // Higher capacity for pointer moves
+    let (key_tx, mut key_rx) = mpsc::channel(64); // Higher capacity for key repeat bursts
     // Forwards a client's `ping` (control channel) to the packet-forwarding
     // loop below, which stamps it onto the next outgoing video frame.
     let (pending_ping_tx, mut pending_ping_rx) = mpsc::channel::<f64>(8);
@@ -282,6 +283,7 @@ async fn main() -> Result<()> {
         resize_tx,
         touch_tx,
         mouse_tx,
+        key_tx,
         latency_tx,
         bitrate_event_tx,
         encoder_control,
@@ -449,6 +451,9 @@ async fn main() -> Result<()> {
         }
         while let Ok(mouse_event) = mouse_rx.try_recv() {
             mouse_handler.handle_event(mouse_event, &mut state);
+        }
+        while let Ok(key_event) = key_rx.try_recv() {
+            input::keyboard::handle_event(key_event, &mut state);
         }
         
         // Dispatch Wayland events, capped at 16ms but never waiting past the

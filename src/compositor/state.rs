@@ -2,7 +2,7 @@
 
 use smithay::{
     backend::{
-        input::{Axis, AxisSource, ButtonState, TouchSlot},
+        input::{Axis, AxisSource, ButtonState, KeyState, TouchSlot},
         renderer::utils::with_renderer_surface_state,
     },
     delegate_compositor, delegate_output, delegate_seat, delegate_shm,
@@ -10,6 +10,7 @@ use smithay::{
     desktop::{Space, Window},
     input::{
         Seat, SeatState,
+        keyboard::FilterResult,
         pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent as PointerMotionEvent},
         touch::{DownEvent, MotionEvent, UpEvent},
     },
@@ -557,6 +558,33 @@ impl WaylandWebStreamState {
         }
     }
 
+    /// Press or release a key (Linux evdev keycode, e.g. `KEY_A`).
+    pub fn key(&mut self, keycode: u32, pressed: bool) {
+        let Some(keyboard) = self.seat.get_keyboard() else { return };
+        let time = self.clock.now().as_millis();
+        // xkbcommon's `Keycode` uses XKB/X11 numbering, which is evdev + 8.
+        keyboard.input::<(), _>(
+            self,
+            smithay::input::keyboard::Keycode::new(keycode + 8),
+            if pressed { KeyState::Pressed } else { KeyState::Released },
+            SERIAL_COUNTER.next_serial(),
+            time,
+            |_, _, _| FilterResult::Forward,
+        );
+    }
+
+    /// Sets keyboard focus to the topmost mapped window, mirroring
+    /// `surface_at`'s "topmost window always wins" hit-testing model --
+    /// this compositor only ever has one full-screen-configured topmost
+    /// window at a time, so there's no separate focus-follows-click policy
+    /// to track.
+    fn update_keyboard_focus(&mut self) {
+        let Some(keyboard) = self.seat.get_keyboard() else { return };
+        let surface = self.space.elements().last().and_then(|w| w.wl_surface()).map(|s| s.into_owned());
+        let serial = SERIAL_COUNTER.next_serial();
+        keyboard.set_focus(self, surface, serial);
+    }
+
     pub fn send_frames(&mut self) {
         // Send frame callbacks to all surfaces so they know when to render.
         //
@@ -604,6 +632,7 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
         self.space.map_element(window, (0, 0), false);
         let full_damage = self.full_output_damage();
         self.add_damage(full_damage);
+        self.update_keyboard_focus();
 
         info!("Window mapped to space. Total windows: {}", self.space.elements().count());
     }
@@ -621,6 +650,7 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
             self.space.unmap_elem(&window);
             let full_damage = self.full_output_damage();
             self.add_damage(full_damage);
+            self.update_keyboard_focus();
         }
 
         info!("Window unmapped from space. Total windows: {}", self.space.elements().count());

@@ -1,8 +1,9 @@
 // Mirrors the wire protocol implemented by the Rust server. Keep this file
 // in sync with the source of truth: src/server.rs (SignalingMessage),
 // src/input/touch.rs (TouchEvent/TouchPoint), src/input/mouse.rs
-// (MouseEvent/PointerPoint), and the /stream binary frame format documented
-// in src/server.rs next to `encode_video_frame`.
+// (MouseEvent/PointerPoint), src/input/keyboard.rs (KeyboardEvent), and the
+// /stream binary frame format documented in src/server.rs next to
+// `encode_video_frame`.
 
 export interface TouchPoint {
   identifier: number;
@@ -34,12 +35,22 @@ export type PointerMessage =
   | { eventType: 'pointercancel'; pointer: PointerPoint }
   | { eventType: 'wheel'; x: number; y: number; deltaX: number; deltaY: number };
 
+// `code` is `KeyboardEvent.code` -- the physical, layout-independent key
+// identifier (e.g. "KeyA", "ShiftLeft") -- never `KeyboardEvent.key`, which
+// is the layout-resolved character. The server's own XKB keymap resolves
+// the resulting keysym from this physical key, the same way real hardware
+// does (see src/input/keyboard.rs).
+export type KeyMessage =
+  | { eventType: 'keydown'; code: string }
+  | { eventType: 'keyup'; code: string };
+
 /// Messages the client sends over the `/ws` control channel.
 export type ClientMessage =
   | { type: 'ready' }
   | { type: 'resize'; width: number; height: number }
   | ({ type: 'touch' } & TouchMessage)
   | ({ type: 'pointer' } & PointerMessage)
+  | ({ type: 'key' } & KeyMessage)
   | { type: 'request_keyframe' }
   | { type: 'ping'; client_ts: number }
   | {

@@ -15,6 +15,10 @@ path = "src/touch_client.rs"
 name = "wayland-pointer-client"
 path = "src/pointer_client.rs"
 
+[[bin]]
+name = "wayland-keyboard-client"
+path = "src/keyboard_client.rs"
+
 [dependencies]
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }

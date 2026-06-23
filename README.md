@@ -79,7 +79,7 @@ compositor's input pipeline.
 | Video encoding | [ffmpeg-next](https://github.com/zmwangx/rust-ffmpeg) | H.264 encoding from raw framebuffer pixels |
 | Streaming | built-in (axum WebSocket) | Binary H.264 frame delivery over `/stream`, decoded client-side with WebCodecs |
 | Control channel | built-in (hyper/axum) | HTTP + WebSocket (`/ws`) for input, resize, and latency messages |
-| Input | direct Smithay injection | Touch/keyboard/mouse events injected into SeatState |
+| Input | direct Smithay injection | Touch/keyboard/mouse events injected into SeatState; keyboard forwards physical key identity (`KeyboardEvent.code`), so the browser's OS keyboard layout should match the server's XKB layout for correct characters |
 | Web client | [Svelte](https://svelte.dev) + [Vite](https://vite.dev), embedded via `rust-embed` | `<canvas>` + WebCodecs decode, touch/pointer capture, collapsible stats panel; compiled to a static bundle and baked into the binary |
 
 ## Requirements
