@@ -16,7 +16,10 @@ use tokio::sync::{broadcast, mpsc};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
-use crate::encoder::EncodedPacket;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use crate::encoder::{EncodedPacket, EncoderControl};
 use crate::input::mouse::MouseEvent;
 use crate::input::touch::TouchEvent;
 use crate::latency::LatencyReport;
@@ -123,6 +126,15 @@ pub struct SignalingState {
     /// backlog would be stale by the time they're sent anyway. The next
     /// periodic keyframe resyncs any client that fell behind and missed some.
     video_tx: broadcast::Sender<EncodedPacket>,
+    /// Lets a new `/stream` client request a fresh keyframe, the same way
+    /// `SessionManager` does for new WebRTC sessions -- without this, a
+    /// client connecting while the screen is idle could wait until the next
+    /// damage or GOP-cycle keyframe before seeing anything decodable.
+    encoder_control_tx: mpsc::Sender<EncoderControl>,
+    /// Same purpose as `SessionManager`'s copy: force the capture loop to
+    /// render+encode a frame right away for a newly connected client to ride
+    /// on, rather than waiting on damage or the periodic keyframe cadence.
+    force_render: Arc<AtomicBool>,
 }
 
 impl SignalingState {
@@ -134,10 +146,24 @@ impl SignalingState {
         mouse_tx: mpsc::Sender<MouseEvent>,
         latency_tx: Option<mpsc::Sender<LatencyReport>>,
         ice_config: IceServerConfig,
+        encoder_control_tx: mpsc::Sender<EncoderControl>,
+        force_render: Arc<AtomicBool>,
     ) -> Self {
         let (ice_tx, _) = broadcast::channel(16);
         let (video_tx, _) = broadcast::channel(3);
-        Self { ice_tx, offer_tx, remote_ice_tx, resize_tx, touch_tx, mouse_tx, latency_tx, ice_config, video_tx }
+        Self {
+            ice_tx,
+            offer_tx,
+            remote_ice_tx,
+            resize_tx,
+            touch_tx,
+            mouse_tx,
+            latency_tx,
+            ice_config,
+            video_tx,
+            encoder_control_tx,
+            force_render,
+        }
     }
 
     pub fn get_ice_receiver(&self) -> broadcast::Receiver<IceCandidate> {
@@ -372,6 +398,15 @@ async fn video_stream_handler(socket: WebSocket, state: SignalingState) {
     let (mut sender, _receiver) = socket.split();
     let mut video_rx = state.get_video_sender().subscribe();
 
+    // Request a fresh keyframe and force a render right away, mirroring what
+    // SessionManager does for new WebRTC sessions -- otherwise this client
+    // has no decodable frame to start from until the screen happens to
+    // change or the next GOP-cycle keyframe comes around.
+    state.force_render.store(true, Ordering::Relaxed);
+    if let Err(e) = state.encoder_control_tx.send(EncoderControl::ForceKeyframe).await {
+        warn!("Failed to request keyframe for new video stream client: {}", e);
+    }
+
     loop {
         let packet = match video_rx.recv().await {
             Ok(packet) => packet,
@@ -455,6 +490,8 @@ mod tests {
         let (resize_tx, _resize_rx) = mpsc::channel(4);
         let (touch_tx, _touch_rx) = mpsc::channel(4);
         let (mouse_tx, _mouse_rx) = mpsc::channel(4);
+        let (encoder_control_tx, mut encoder_control_rx) = mpsc::channel(4);
+        let force_render = Arc::new(AtomicBool::new(false));
 
         let ice_config = IceServerConfig {
             stun_url: "stun:stun.l.google.com:19302".to_string(),
@@ -471,6 +508,8 @@ mod tests {
             mouse_tx,
             None,
             ice_config,
+            encoder_control_tx,
+            force_render.clone(),
         );
         let video_tx = state.get_video_sender();
         let server = SignalingServer::new(state);
@@ -486,6 +525,12 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let mut stream = ws_handshake(addr, "/stream").await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(force_render.load(Ordering::Relaxed), "connecting should force a render");
+        assert!(matches!(
+            encoder_control_rx.try_recv(),
+            Ok(EncoderControl::ForceKeyframe)
+        ), "connecting should request a fresh keyframe");
 
         assert!(video_tx
             .send(EncodedPacket {

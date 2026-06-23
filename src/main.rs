@@ -216,12 +216,29 @@ async fn main() -> Result<()> {
         Some(latency_tx)
     };
 
+    // Set by the session manager (and the `/stream` handler) when a new
+    // client connects, so the capture loop renders+sends a frame right away
+    // even if the screen hasn't changed -- otherwise a newly connected
+    // client would see nothing until the next damage or the next periodic
+    // keyframe-cadence render.
+    let force_render = Arc::new(AtomicBool::new(false));
+
     // Create signaling state and server
-    let signaling_state = SignalingState::new(offer_tx.clone(), remote_ice_tx.clone(), resize_tx, touch_tx, mouse_tx, latency_tx, ice_config.clone());
+    let signaling_state = SignalingState::new(
+        offer_tx.clone(),
+        remote_ice_tx.clone(),
+        resize_tx,
+        touch_tx,
+        mouse_tx,
+        latency_tx,
+        ice_config.clone(),
+        encoder_control.clone(),
+        force_render.clone(),
+    );
     let ice_tx = signaling_state.get_ice_sender();
     let video_tx = signaling_state.get_video_sender();
     let signaling_server = SignalingServer::new(signaling_state.clone());
-    
+
     // Spawn the signaling server
     let listen_addr = config.listen_addr.clone();
     let port = config.port;
@@ -230,12 +247,6 @@ async fn main() -> Result<()> {
             tracing::error!("Signaling server error: {}", e);
         }
     });
-
-    // Set by the session manager when a new WebRTC session is established, so
-    // the capture loop renders+sends a frame right away even if the screen
-    // hasn't changed -- otherwise a newly connected client would see nothing
-    // until the next damage or the next periodic keyframe-cadence render.
-    let force_render = Arc::new(AtomicBool::new(false));
 
     // Spawn the session manager
     let session_manager = SessionManager::new(offer_rx, packet_rx, remote_ice_rx, ice_tx.clone(), encoder_control, ice_config, config.framerate, force_render.clone());

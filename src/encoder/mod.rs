@@ -137,6 +137,50 @@ pub fn spawn_encoder(config: EncoderConfig) -> Result<(EncoderHandle, BufferRetu
     ))
 }
 
+/// Drain and apply any pending control messages without blocking. Split out
+/// so it can be called both before and after waiting for the next raw
+/// frame -- see the call site after `blocking_recv` for why that second
+/// call matters.
+fn drain_control_messages(
+    control_rx: &mut mpsc::Receiver<EncoderControl>,
+    config: &mut EncoderConfig,
+    encoder: &mut ffmpeg::encoder::Video,
+    frame_count: &mut i64,
+    force_keyframe: &mut bool,
+) {
+    while let Ok(control) = control_rx.try_recv() {
+        match control {
+            EncoderControl::ForceKeyframe => {
+                info!("Keyframe requested");
+                *force_keyframe = true;
+            }
+            EncoderControl::ChangeBitrate(new_bitrate) => {
+                if config.rate_control == RateControl::Bitrate(new_bitrate) {
+                    continue;
+                }
+                if !matches!(config.rate_control, RateControl::Bitrate(_)) {
+                    warn!("Ignoring bitrate change request: encoder is in constant-quality mode");
+                    continue;
+                }
+                info!("Changing bitrate from {:?} to {} bps", config.rate_control, new_bitrate);
+                config.rate_control = RateControl::Bitrate(new_bitrate);
+
+                // Reinitialize encoder with new bitrate
+                match create_encoder(config) {
+                    Ok(new_encoder) => {
+                        *encoder = new_encoder;
+                        *frame_count = 0; // Reset frame count to force IDR
+                        info!("Encoder reinitialized with new bitrate");
+                    }
+                    Err(e) => {
+                        error!("Failed to reinitialize encoder with new bitrate: {}", e);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Encoder thread main loop
 fn encoder_thread(
     mut config: EncoderConfig,
@@ -163,37 +207,7 @@ fn encoder_thread(
 
     loop {
         // Check for control messages (non-blocking)
-        while let Ok(control) = control_rx.try_recv() {
-            match control {
-                EncoderControl::ForceKeyframe => {
-                    info!("Keyframe requested");
-                    force_keyframe = true;
-                }
-                EncoderControl::ChangeBitrate(new_bitrate) => {
-                    if config.rate_control == RateControl::Bitrate(new_bitrate) {
-                        continue;
-                    }
-                    if !matches!(config.rate_control, RateControl::Bitrate(_)) {
-                        warn!("Ignoring bitrate change request: encoder is in constant-quality mode");
-                        continue;
-                    }
-                    info!("Changing bitrate from {:?} to {} bps", config.rate_control, new_bitrate);
-                    config.rate_control = RateControl::Bitrate(new_bitrate);
-
-                    // Reinitialize encoder with new bitrate
-                    match create_encoder(&config) {
-                        Ok(new_encoder) => {
-                            encoder = new_encoder;
-                            frame_count = 0; // Reset frame count to force IDR
-                            info!("Encoder reinitialized with new bitrate");
-                        }
-                        Err(e) => {
-                            error!("Failed to reinitialize encoder with new bitrate: {}", e);
-                        }
-                    }
-                }
-            }
-        }
+        drain_control_messages(&mut control_rx, &mut config, &mut encoder, &mut frame_count, &mut force_keyframe);
 
         // Check for resize events
         if resize_rx.has_changed().unwrap_or(false) {
@@ -232,10 +246,25 @@ fn encoder_thread(
             }
         };
 
-        // Force keyframe if requested by resetting frame count
-        if force_keyframe {
+        // Drain again now that we actually have a frame in hand: a
+        // ForceKeyframe sent right before this exact frame was produced
+        // (the common case -- a new client's connect handler requests one
+        // and the capture loop renders+sends a frame for it moments later)
+        // would otherwise sit unseen until the *next* frame, since the
+        // check above can run before the request even arrives if the
+        // thread was already parked in `blocking_recv`.
+        drain_control_messages(&mut control_rx, &mut config, &mut encoder, &mut frame_count, &mut force_keyframe);
+
+        // Resetting `frame_count` here did nothing useful: libx264 places
+        // IDRs based on its own internal frame counter against `g`/
+        // `keyint_min`, not on the PTS values we assign, and rewinding our
+        // PTS counter on a live encoder context just makes it non-monotonic.
+        // The actual way to force an IDR out of libx264 via ffmpeg is to tag
+        // the frame `AV_PICTURE_TYPE_I` before sending it -- see
+        // `encode_frame`.
+        let force_this_frame = force_keyframe;
+        if force_this_frame {
             info!("Forcing keyframe");
-            frame_count = 0;
             force_keyframe = false;
         }
 
@@ -248,6 +277,7 @@ fn encoder_thread(
             &raw_frame,
             frame_count,
             &mut next_frame_id,
+            force_this_frame,
         );
 
         // The encoder has already copied everything it needs out of
@@ -381,6 +411,7 @@ fn encode_frame(
     raw_frame: &RawFrame,
     frame_number: i64,
     next_frame_id: &mut u32,
+    force_keyframe: bool,
 ) -> Result<Vec<EncodedPacket>> {
     // Point the input frame straight at the render buffer instead of
     // copying into an owned one -- swscale only reads through this
@@ -406,9 +437,15 @@ fn encode_frame(
     // Convert BGRA to YUV420P
     scaler.run(input_frame, yuv_frame)?;
 
-    // Set frame properties
+    // Set frame properties. Tagging the frame `I` is what actually forces
+    // libx264 to emit an IDR on demand -- `None` lets it decide normally per
+    // the `g`/`keyint_min` GOP settings.
     yuv_frame.set_pts(Some(frame_number));
-    yuv_frame.set_kind(ffmpeg::picture::Type::None);
+    yuv_frame.set_kind(if force_keyframe {
+        ffmpeg::picture::Type::I
+    } else {
+        ffmpeg::picture::Type::None
+    });
 
     // Encode frame
     encoder.send_frame(yuv_frame)?;
