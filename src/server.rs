@@ -7,7 +7,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    response::{Html, Response},
+    response::Response,
     routing::get,
     Router,
 };
@@ -25,7 +25,7 @@ use crate::encoder::{EncodedPacket, EncoderControl};
 use crate::input::mouse::MouseEvent;
 use crate::input::touch::TouchEvent;
 use crate::latency::LatencyReport;
-use crate::web::client_html::CLIENT_HTML;
+use crate::web::{serve_asset, serve_index};
 
 /// Signaling messages between client and server
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,9 +134,10 @@ pub struct SignalingServer {
 impl SignalingServer {
     pub fn new(state: SignalingState) -> Self {
         let router = Router::new()
-            .route("/", get(serve_client))
+            .route("/", get(serve_index))
             .route("/ws", get(handle_websocket))
             .route("/stream", get(handle_video_stream))
+            .fallback(serve_asset)
             .layer(TraceLayer::new_for_http())
             .with_state(state);
 
@@ -155,11 +156,6 @@ impl SignalingServer {
             .await
             .context("Signaling server error")
     }
-}
-
-/// Serve the HTML/JS client
-async fn serve_client() -> Html<&'static str> {
-    Html(CLIENT_HTML)
 }
 
 /// Handle the control WebSocket (`/ws`): touch/pointer/resize/latency and

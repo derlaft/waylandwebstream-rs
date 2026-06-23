@@ -1,0 +1,216 @@
+// Connects to `/stream`, decodes H.264 via WebCodecs, and paints onto a
+// canvas. Ported behavior-for-behavior from the old src/web/client.html
+// (see git history) into a typed module; see comments below for the policy
+// each piece of logic encodes.
+import {
+  DECODER_CONFIG,
+  STREAM_FRAME_HEADER_BYTES,
+  parseStreamFrameHeader,
+  type ClientMessage,
+} from './protocol';
+import { reportArrivalStats, reportDecodeLatency, setResolution } from './stats';
+
+// VideoDecoder's internal decode queue has no cap of its own: if frames
+// arrive faster than they can be decoded (bursty/slow remote network,
+// decode contention), the backlog grows without bound and every queued
+// frame's reported latency climbs forever. Mirror the server's "skip to
+// newest, resync on next keyframe" policy (src/server.rs) here too.
+const MAX_DECODE_QUEUE = 2;
+
+const DIAGNOSTICS_INTERVAL_MS = 5000;
+
+export interface VideoStreamOptions {
+  canvas: HTMLCanvasElement;
+  /// Used to send `request_keyframe` and periodic `latency` reports over
+  /// the `/ws` control channel. Decoupled from a concrete socket here
+  /// because lib/control.ts (the /ws owner) lands in a later phase.
+  sendControl: (msg: ClientMessage) => void;
+}
+
+export class VideoStream {
+  private readonly canvas: HTMLCanvasElement;
+  private readonly ctx: CanvasRenderingContext2D;
+  private readonly sendControl: (msg: ClientMessage) => void;
+
+  private ws: WebSocket | null = null;
+  private decoder: VideoDecoder | null = null;
+
+  // Drop deltas until the first keyframe is fed: a delta decoded without a
+  // preceding keyframe has no reference picture to diff against.
+  private keyframeSeen = false;
+  // Dedupes resync requests; cleared once a keyframe arrives.
+  private keyframeRequestPending = false;
+  // Set false to force the next decoded frame to re-measure the canvas
+  // buffer; viewport.ts calls notifyResizeRequested() after sending a
+  // resize so the size picks up the new resolution.
+  private canvasSized = false;
+
+  private lastArrivalTime: number | null = null;
+  private arrivalGapSamples: number[] = [];
+  private maxQueueSeenInWindow = 0;
+  private maxFrameBytesInWindow = 0;
+  private decodeLatencySamples: number[] = [];
+  private diagnosticsTimer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(opts: VideoStreamOptions) {
+    this.canvas = opts.canvas;
+    const ctx = this.canvas.getContext('2d');
+    if (!ctx) {
+      throw new Error('2D canvas context unavailable');
+    }
+    this.ctx = ctx;
+    this.sendControl = opts.sendControl;
+  }
+
+  connect(): void {
+    this.setupDecoder();
+    this.connectSocket();
+    this.diagnosticsTimer = setInterval(() => this.flushDiagnostics(), DIAGNOSTICS_INTERVAL_MS);
+  }
+
+  /// Seam for viewport.ts: call after sending a `resize` request so the
+  /// next decoded frame (at the new resolution) re-measures the canvas.
+  notifyResizeRequested(): void {
+    this.canvasSized = false;
+  }
+
+  close(): void {
+    if (this.diagnosticsTimer !== null) {
+      clearInterval(this.diagnosticsTimer);
+      this.diagnosticsTimer = null;
+    }
+    this.ws?.close();
+    this.ws = null;
+    if (this.decoder && this.decoder.state !== 'closed') {
+      this.decoder.close();
+    }
+    this.decoder = null;
+  }
+
+  private setupDecoder(): void {
+    this.decoder = new VideoDecoder({
+      output: (frame) => this.handleFrame(frame),
+      error: (e) => console.error('Decoder error:', e),
+    });
+    this.decoder.configure(DECODER_CONFIG);
+  }
+
+  private handleFrame(frame: VideoFrame): void {
+    if (!this.canvasSized) {
+      this.canvas.width = frame.displayWidth;
+      this.canvas.height = frame.displayHeight;
+      this.canvasSized = true;
+      setResolution(frame.displayWidth, frame.displayHeight);
+    }
+    this.ctx.drawImage(frame, 0, 0);
+    this.decodeLatencySamples.push(performance.now() - frame.timestamp / 1000);
+    frame.close();
+  }
+
+  private requestKeyframe(): void {
+    if (this.keyframeRequestPending) return;
+    this.keyframeRequestPending = true;
+    this.sendControl({ type: 'request_keyframe' });
+  }
+
+  private connectSocket(): void {
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${wsProtocol}//${window.location.host}/stream`;
+
+    const ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+    ws.onmessage = (event) => this.onStreamMessage(event.data as ArrayBuffer);
+    ws.onerror = (e) => console.error('Video stream error:', e);
+    this.ws = ws;
+  }
+
+  private onStreamMessage(buf: ArrayBuffer): void {
+    const decoder = this.decoder;
+    if (!decoder) return;
+
+    const { isKeyframe } = parseStreamFrameHeader(buf);
+
+    const arrivalNow = performance.now();
+    if (this.lastArrivalTime !== null) {
+      this.arrivalGapSamples.push(arrivalNow - this.lastArrivalTime);
+    }
+    this.lastArrivalTime = arrivalNow;
+    this.maxQueueSeenInWindow = Math.max(this.maxQueueSeenInWindow, decoder.decodeQueueSize);
+    this.maxFrameBytesInWindow = Math.max(this.maxFrameBytesInWindow, buf.byteLength);
+
+    if (decoder.decodeQueueSize > MAX_DECODE_QUEUE) {
+      if (!isKeyframe) {
+        // Already backlogged -- drop this delta rather than add to the
+        // queue, and ask for a fresh keyframe to resync instead of waiting
+        // out the rest of the GOP.
+        this.keyframeSeen = false;
+        this.requestKeyframe();
+        return;
+      }
+      // A keyframe arrived while backlogged: flush the decoder so it
+      // catches up immediately instead of working through stale frames
+      // already queued.
+      decoder.reset();
+      decoder.configure(DECODER_CONFIG);
+    }
+
+    const data = new Uint8Array(buf, STREAM_FRAME_HEADER_BYTES);
+
+    if (!isKeyframe && !this.keyframeSeen) {
+      return;
+    }
+    if (isKeyframe) {
+      this.keyframeSeen = true;
+      this.keyframeRequestPending = false;
+    }
+
+    const chunk = new EncodedVideoChunk({
+      type: isKeyframe ? 'key' : 'delta',
+      // No presentation clock to sync to here; arrival time just needs to
+      // be monotonic microseconds, and doubles as a decode-latency stamp.
+      timestamp: Math.round(performance.now() * 1000),
+      data,
+    });
+
+    try {
+      decoder.decode(chunk);
+    } catch (e) {
+      console.error('Decode error:', e);
+    }
+  }
+
+  private flushDiagnostics(): void {
+    if (this.arrivalGapSamples.length > 0) {
+      const sorted = [...this.arrivalGapSamples].sort((a, b) => a - b);
+      const n = sorted.length;
+      const avgMs = this.arrivalGapSamples.reduce((a, b) => a + b, 0) / n;
+      const maxMs = sorted[n - 1];
+      const p95Ms = sorted[Math.floor(n * 0.95)];
+      // A "burst" is several messages arriving within a couple ms of each
+      // other -- much tighter than one frame interval, so it means a batch
+      // was released all at once rather than delivered at a steady cadence.
+      const burstCount = this.arrivalGapSamples.filter((g) => g < 3).length;
+
+      reportArrivalStats({
+        avgMs,
+        p95Ms,
+        maxMs,
+        burstCount,
+        maxQueue: this.maxQueueSeenInWindow,
+        maxFrameBytes: this.maxFrameBytesInWindow,
+      });
+
+      this.arrivalGapSamples = [];
+      this.maxQueueSeenInWindow = 0;
+      this.maxFrameBytesInWindow = 0;
+    }
+
+    if (this.decodeLatencySamples.length === 0) return;
+    const avgMs =
+      this.decodeLatencySamples.reduce((a, b) => a + b, 0) / this.decodeLatencySamples.length;
+    this.decodeLatencySamples = [];
+
+    reportDecodeLatency(avgMs);
+    this.sendControl({ type: 'latency', decoding_ms: avgMs, total_ms: avgMs });
+  }
+}

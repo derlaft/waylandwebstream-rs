@@ -80,45 +80,64 @@ Decoder config to carry over verbatim:
 `{ codec: 'avc1.42E01F', optimizeForLatency: true }` (baseline 3.1, Annex-B,
 SPS/PPS inline on keyframes — no `description`).
 
-## 4. Phase 1 — Scaffold + build/embed wiring
+## 4. Phase 1 — Scaffold + build/embed wiring ✅ done
 
-- [ ] `npm create vite@latest web -- --template svelte-ts`; trim to essentials.
-- [ ] Pin deps; keep `dependencies` empty/near-empty (Svelte/Vite are devDeps).
+- [x] `npm create vite@latest web -- --template svelte-ts`; trim to essentials.
+- [x] Pin deps; keep `dependencies` empty/near-empty (Svelte/Vite are devDeps).
       No UI kit, no icon lib (inline SVG), no state lib (Svelte stores only).
-- [ ] `vite.config.ts`: set `build.outDir = "dist"`, **single-file-ish output**
+- [x] `vite.config.ts`: set `build.outDir = "dist"`, **single-file-ish output**
       (let Vite hash assets; we'll embed the whole `dist/`). Add a dev `server.proxy`
       so `/ws` and `/stream` (with `ws: true`) and `/` proxy to the Rust server
       (e.g. `http://127.0.0.1:8080`) — enables `vite dev` with a live backend.
-- [ ] `.gitignore`: add `web/node_modules/` and `web/dist/`.
-- [ ] **Embed strategy** in Rust: add `rust-embed` dependency, embed `web/dist`.
+      (`/` itself is **not** proxied — that would hand Vite's own dev `index.html`
+      off to the backend and break `vite dev`/HMR; only the two socket paths are.)
+- [x] `.gitignore`: add `web/node_modules/` and `web/dist/`.
+- [x] **Embed strategy** in Rust: add `rust-embed` dependency, embed `web/dist`.
       Add a `build.rs` that runs the Vite build (`npm ci && npm run build` in `web/`)
       so `cargo build` produces a self-contained binary. Guard it: if the `web/dist`
       already exists and sources are unchanged, skip; if `npm`/`node` is missing,
       fail with a clear message (or fall back to a committed prebuilt `dist/` —
       decide and document). Re-run on changes to `web/src/**`.
-- [ ] Acceptance: `cargo build` produces a binary that serves the new app at `/`;
+- [x] Acceptance: `cargo build` produces a binary that serves the new app at `/`;
       `cd web && npm run dev` serves the app against a running Rust backend.
 
-## 5. Phase 2 — Stream/decode core (`lib/stream.ts`)
+  **Known regression accepted by user:** `/` now serves the (still placeholder)
+  Svelte app instead of the old `client.html`, so
+  `tests/integration_test.rs::test_compositor_pipeline` (Puppeteer waits for a
+  `<canvas>`) fails until Phase 3/4 wire up `Stage.svelte`.
+
+## 5. Phase 2 — Stream/decode core (`lib/stream.ts`) ✅ done
 
 Port the *behavior* of `client.html` (it is well-tuned) into a typed module.
 Preserve every comment-documented policy:
 
-- [ ] `MAX_DECODE_QUEUE = 2`; if `decoder.decodeQueueSize > MAX` and the incoming
+- [x] `MAX_DECODE_QUEUE = 2`; if `decoder.decodeQueueSize > MAX` and the incoming
       frame is a delta → drop it, set `keyframeSeen=false`, and `requestKeyframe()`.
-- [ ] If backlogged and a **key** frame arrives → `decoder.reset()` + reconfigure,
+- [x] If backlogged and a **key** frame arrives → `decoder.reset()` + reconfigure,
       then decode it (flush stale queue).
-- [ ] Drop deltas until first keyframe fed (`keyframeSeen` gate).
-- [ ] `requestKeyframe()` dedupe via `keyframeRequestPending`, cleared on next key.
-- [ ] `EncodedVideoChunk.timestamp = round(performance.now()*1000)` (µs, monotonic;
+- [x] Drop deltas until first keyframe fed (`keyframeSeen` gate).
+- [x] `requestKeyframe()` dedupe via `keyframeRequestPending`, cleared on next key.
+- [x] `EncodedVideoChunk.timestamp = round(performance.now()*1000)` (µs, monotonic;
       doubles as decode-latency stamp).
-- [ ] On decoded frame: size canvas buffer to `frame.displayWidth/Height` **once per
+- [x] On decoded frame: size canvas buffer to `frame.displayWidth/Height` **once per
       resolution change** (`canvasSized` flag, reset by viewport module on resize),
       `ctx.drawImage(frame,0,0)`, record `performance.now() - frame.timestamp/1000`,
       `frame.close()`.
-- [ ] Arrival-gap + queue + frame-byte diagnostics → push into `stats.ts` store
+- [x] Arrival-gap + queue + frame-byte diagnostics → push into `stats.ts` store
       (instead of `console.log`); keep the 5s aggregation for the latency report.
-- [ ] Keep `binaryType='arraybuffer'`. Clean up decoder on teardown.
+- [x] Keep `binaryType='arraybuffer'`. Clean up decoder on teardown.
+
+  Added `lib/protocol.ts` (wire-format types/mirror of `SignalingMessage`) and
+  `lib/stats.ts` (the Svelte store) as supporting pieces, both ahead of their
+  nominal phases since `stream.ts` needs them to type-check. `VideoStream`
+  takes an injected `sendControl` callback rather than owning `/ws` itself,
+  since `lib/control.ts` doesn't exist until Phase 5 — Phase 5 just needs to
+  pass its send function in.
+
+  **Not yet wired into the app** (no `Stage.svelte`/canvas exists yet — that's
+  Phase 3/4), so this is verified by `npm run check` (clean) and code review
+  only, not a live browser run. Bundle size is unchanged after adding these
+  files, confirming they're currently dead code pending that wiring.
 
 ## 6. Phase 3 — Viewport / scaling / resize (`lib/viewport.ts`) — THE bug fix
 
