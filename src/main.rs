@@ -114,6 +114,16 @@ async fn main() -> Result<()> {
     let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32)>(4);
     let (touch_tx, mut touch_rx) = mpsc::channel(32); // Higher capacity for touch events
     let (mouse_tx, mut mouse_rx) = mpsc::channel(64); // Higher capacity for pointer moves
+    // Forwards a client's `ping` (control channel) to the packet-forwarding
+    // loop below, which stamps it onto the next outgoing video frame.
+    let (pending_ping_tx, mut pending_ping_rx) = mpsc::channel::<f64>(8);
+    // Current encoder target bitrate, surfaced to clients over `/ws`. CRF
+    // (constant-quality) mode has no bitrate target, hence the 0 sentinel.
+    let initial_bitrate_for_display = match rate_control {
+        RateControl::Bitrate(bps) => bps,
+        RateControl::Quality(_) => 0,
+    };
+    let (bitrate_tx, bitrate_rx) = tokio::sync::watch::channel(initial_bitrate_for_display);
 
     // Create touch and pointer handlers
     let mut touch_handler = TouchHandler::new(width, height);
@@ -216,6 +226,7 @@ async fn main() -> Result<()> {
             adaptive_config,
             encoder_control.clone(),
             bitrate_event_rx,
+            bitrate_tx.clone(),
         );
         tokio::spawn(controller.run());
         Some(bitrate_event_tx)
@@ -240,6 +251,8 @@ async fn main() -> Result<()> {
         bitrate_event_tx,
         encoder_control,
         force_render.clone(),
+        pending_ping_tx,
+        bitrate_rx,
     );
     let video_tx = signaling_state.get_video_sender();
     let signaling_server = SignalingServer::new(signaling_state);
@@ -254,10 +267,53 @@ async fn main() -> Result<()> {
     });
 
     // Spawn the encoder packet forwarding task: every encoded packet goes to
-    // the `/stream` WebSocket broadcast for WebCodecs clients.
+    // the `/stream` WebSocket broadcast for WebCodecs clients. Also where a
+    // pending client ping gets stamped onto the next packet (see
+    // `SignalingMessage::Ping` in src/server.rs), and where the server-only
+    // legs of the latency pipeline (capture→encode, encoding, encode→send)
+    // get aggregated and logged -- these don't need synchronized clocks
+    // since they're plain `Instant` deltas on this side only.
     tokio::spawn(async move {
         let mut encoder_handle = encoder;
-        while let Some(packet) = encoder_handle.recv_packet().await {
+        let mut stage_totals_ms = (0.0f64, 0.0f64, 0.0f64); // (capture_to_encode, encoding, encode_to_send)
+        let mut stage_count = 0u32;
+        let mut last_stage_log = std::time::Instant::now();
+        const STAGE_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+        while let Some(mut packet) = encoder_handle.recv_packet().await {
+            // Drain to the *latest* pending ping, not just the next one in
+            // the queue: frames are only forced out every `keyframe_interval`
+            // ticks when the screen is idle, so pings (sent every second)
+            // can back up several deep. Echoing the oldest queued one would
+            // measure a fake multi-second round trip against a ping that's
+            // long since stale, even though the live one is fine.
+            let mut latest_ping = None;
+            while let Ok(client_ts) = pending_ping_rx.try_recv() {
+                latest_ping = Some(client_ts);
+            }
+            if let Some(client_ts) = latest_ping {
+                packet.ping_echo_client_ts = Some(client_ts);
+            }
+
+            let encode_to_send_ms = packet.encode_complete.elapsed().as_secs_f64() * 1000.0;
+            stage_totals_ms.0 += packet.capture_to_encode_ms;
+            stage_totals_ms.1 += packet.encoding_ms;
+            stage_totals_ms.2 += encode_to_send_ms;
+            stage_count += 1;
+
+            if last_stage_log.elapsed() >= STAGE_LOG_INTERVAL {
+                info!(
+                    "Server pipeline (avg over {} frames): capture→encode {:.1}ms, encoding {:.1}ms, encode→send {:.1}ms",
+                    stage_count,
+                    stage_totals_ms.0 / stage_count as f64,
+                    stage_totals_ms.1 / stage_count as f64,
+                    stage_totals_ms.2 / stage_count as f64,
+                );
+                stage_totals_ms = (0.0, 0.0, 0.0);
+                stage_count = 0;
+                last_stage_log = std::time::Instant::now();
+            }
+
             let _ = video_tx.send(packet);
         }
     });
@@ -371,6 +427,7 @@ async fn main() -> Result<()> {
                 if let Some(framebuffer) = state.render(spare_buffers.pop()) {
                     let raw_frame = encoder::RawFrame {
                         data: framebuffer,
+                        capture_instant: std::time::Instant::now(),
                     };
 
                     // Send frame to encoder (non-blocking)

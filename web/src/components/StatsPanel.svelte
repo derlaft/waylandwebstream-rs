@@ -6,8 +6,15 @@
   <dt>Connection</dt>
   <dd>{$streamStats.connectionState}</dd>
 
-  <dt>Decode latency</dt>
-  <dd>{$streamStats.decodeLatencyMs.toFixed(1)} ms</dd>
+  <dt>End-to-end latency</dt>
+  <dd>{$streamStats.endToEndLatencyMs.toFixed(1)} ms</dd>
+
+  <dt>Bitrate</dt>
+  <dd>
+    {$streamStats.bitrateBps > 0
+      ? `${($streamStats.bitrateBps / 1_000_000).toFixed(2)} Mbps`
+      : '—'}
+  </dd>
 
   <dt>Resolution</dt>
   <dd>

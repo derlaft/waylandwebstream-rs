@@ -8,7 +8,7 @@ import {
   parseStreamFrameHeader,
   type ClientMessage,
 } from './protocol';
-import { reportArrivalStats, reportDecodeLatency, setResolution } from './stats';
+import { reportArrivalStats, reportEndToEndLatency, setResolution } from './stats';
 
 // VideoDecoder's internal decode queue has no cap of its own: if frames
 // arrive faster than they can be decoded (bursty/slow remote network,
@@ -18,6 +18,11 @@ import { reportArrivalStats, reportDecodeLatency, setResolution } from './stats'
 const MAX_DECODE_QUEUE = 2;
 
 const DIAGNOSTICS_INTERVAL_MS = 5000;
+
+// How often to probe round-trip latency (network + whole server pipeline).
+// Faster than DIAGNOSTICS_INTERVAL_MS so a few samples land in every
+// reporting window.
+const PING_INTERVAL_MS = 1000;
 
 // Resizing the canvas *bitmap* (not its CSS size) on every frame whose
 // dimensions actually changed -- rather than once, gated by an external
@@ -69,6 +74,16 @@ export class VideoStream {
   private decodeLatencySamples: number[] = [];
   private diagnosticsTimer: ReturnType<typeof setInterval> | null = null;
 
+  // Round-trip latency samples, one per echoed ping (see `sendPing` and the
+  // `pingEchoClientTs` handling below). Each echo carries back exactly the
+  // `performance.now()` value this client sent it with, so `rtt = now -
+  // echo` needs no clock sync between client and server.
+  private rttSamples: number[] = [];
+  // Sticky across reporting windows so a quiet window (no ping happened to
+  // land) still shows the last real measurement instead of dropping to 0.
+  private lastRttMs = 0;
+  private pingTimer: ReturnType<typeof setInterval> | null = null;
+
   constructor(opts: VideoStreamOptions) {
     this.canvas = opts.canvas;
     const ctx = this.canvas.getContext('2d');
@@ -83,12 +98,17 @@ export class VideoStream {
     this.setupDecoder();
     this.connectSocket();
     this.diagnosticsTimer = setInterval(() => this.flushDiagnostics(), DIAGNOSTICS_INTERVAL_MS);
+    this.pingTimer = setInterval(() => this.sendPing(), PING_INTERVAL_MS);
   }
 
   close(): void {
     if (this.diagnosticsTimer !== null) {
       clearInterval(this.diagnosticsTimer);
       this.diagnosticsTimer = null;
+    }
+    if (this.pingTimer !== null) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
     }
     this.ws?.close();
     this.ws = null;
@@ -115,6 +135,10 @@ export class VideoStream {
     frame.close();
   }
 
+  private sendPing(): void {
+    this.sendControl({ type: 'ping', client_ts: performance.now() });
+  }
+
   private requestKeyframe(): void {
     if (this.keyframeRequestPending) return;
     this.keyframeRequestPending = true;
@@ -136,13 +160,19 @@ export class VideoStream {
     const decoder = this.decoder;
     if (!decoder) return;
 
-    const { isKeyframe } = parseStreamFrameHeader(buf);
+    const { isKeyframe, pingEchoClientTs } = parseStreamFrameHeader(buf);
 
     const arrivalNow = performance.now();
     if (this.lastArrivalTime !== null) {
       this.arrivalGapSamples.push(arrivalNow - this.lastArrivalTime);
     }
     this.lastArrivalTime = arrivalNow;
+    // Recorded regardless of what happens to this frame below (dropped for
+    // backlog, gated pending a keyframe, etc.) -- it's measuring this
+    // frame's transit time, not whether we end up decoding it.
+    if (pingEchoClientTs !== null) {
+      this.rttSamples.push(arrivalNow - pingEchoClientTs);
+    }
     this.maxQueueSeenInWindow = Math.max(this.maxQueueSeenInWindow, decoder.decodeQueueSize);
     this.maxFrameBytesInWindow = Math.max(this.maxFrameBytesInWindow, buf.byteLength);
 
@@ -213,12 +243,26 @@ export class VideoStream {
       this.maxFrameBytesInWindow = 0;
     }
 
+    if (this.rttSamples.length > 0) {
+      this.lastRttMs = this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length;
+      this.rttSamples = [];
+    }
+
     if (this.decodeLatencySamples.length === 0) return;
-    const avgMs =
+    const decodeAvgMs =
       this.decodeLatencySamples.reduce((a, b) => a + b, 0) / this.decodeLatencySamples.length;
     this.decodeLatencySamples = [];
 
-    reportDecodeLatency(avgMs);
-    this.sendControl({ type: 'latency', decoding_ms: avgMs, total_ms: avgMs });
+    // Glass-to-glass: ping round-trip (network + capture→encode→send on the
+    // server, all folded in -- see the wire format doc in protocol.ts) plus
+    // this client's own decode time.
+    const totalMs = this.lastRttMs + decodeAvgMs;
+    reportEndToEndLatency(totalMs);
+    this.sendControl({
+      type: 'latency',
+      network_ms: this.lastRttMs,
+      decoding_ms: decodeAvgMs,
+      total_ms: totalMs,
+    });
   }
 }

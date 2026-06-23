@@ -32,7 +32,7 @@
 //! this controller can address per-client.
 
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info};
 
 use crate::encoder::EncoderControl;
@@ -202,6 +202,9 @@ pub struct AdaptiveBitrateController {
     adjustment_interval: Duration,
     encoder_control_tx: mpsc::Sender<EncoderControl>,
     event_rx: mpsc::Receiver<BitrateEvent>,
+    /// Surfaces the current target bitrate to `/ws` clients (see
+    /// `SignalingState::bitrate_rx` in src/server.rs).
+    bitrate_tx: watch::Sender<usize>,
 }
 
 impl AdaptiveBitrateController {
@@ -209,6 +212,7 @@ impl AdaptiveBitrateController {
         config: AdaptiveBitrateConfig,
         encoder_control_tx: mpsc::Sender<EncoderControl>,
         event_rx: mpsc::Receiver<BitrateEvent>,
+        bitrate_tx: watch::Sender<usize>,
     ) -> Self {
         let adjustment_interval = config.adjustment_interval;
         Self {
@@ -216,6 +220,7 @@ impl AdaptiveBitrateController {
             adjustment_interval,
             encoder_control_tx,
             event_rx,
+            bitrate_tx,
         }
     }
 
@@ -258,5 +263,6 @@ impl AdaptiveBitrateController {
             .encoder_control_tx
             .send(EncoderControl::ChangeBitrate(new_rate))
             .await;
+        let _ = self.bitrate_tx.send(new_rate);
     }
 }

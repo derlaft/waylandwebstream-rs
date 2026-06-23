@@ -2,8 +2,8 @@
 // `{type:"ready"}` on open, and reflect connection state into stats.ts for
 // StatsPanel.svelte. Auto-reconnect is still deferred -- a `closed`/`error`
 // state here is terminal until the page is reloaded.
-import type { ClientMessage } from './protocol';
-import { setConnectionState } from './stats';
+import type { ClientMessage, ServerMessage } from './protocol';
+import { setBitrate, setConnectionState } from './stats';
 
 export class ControlChannel {
   private ws: WebSocket | null = null;
@@ -29,6 +29,7 @@ export class ControlChannel {
       console.error('Control WebSocket error:', e);
     };
     ws.onclose = () => setConnectionState('closed');
+    ws.onmessage = (event) => this.onServerMessage(event.data as string);
     this.ws = ws;
   }
 
@@ -44,5 +45,18 @@ export class ControlChannel {
   close(): void {
     this.ws?.close();
     this.ws = null;
+  }
+
+  private onServerMessage(data: string): void {
+    let msg: ServerMessage;
+    try {
+      msg = JSON.parse(data);
+    } catch (e) {
+      console.error('Failed to parse control message:', e);
+      return;
+    }
+    if (msg.type === 'bitrate') {
+      setBitrate(msg.bps);
+    }
   }
 }

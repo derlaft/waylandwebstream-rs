@@ -41,6 +41,7 @@ export type ClientMessage =
   | ({ type: 'touch' } & TouchMessage)
   | ({ type: 'pointer' } & PointerMessage)
   | { type: 'request_keyframe' }
+  | { type: 'ping'; client_ts: number }
   | {
       type: 'latency';
       encoding_ms?: number;
@@ -50,22 +51,36 @@ export type ClientMessage =
       total_ms: number;
     };
 
+/// Messages the server pushes to the client over `/ws`.
+export type ServerMessage = { type: 'bitrate'; bps: number };
+
 /// `/stream` binary frame format, one WebSocket message per H.264 frame:
-///   byte 0    : frame_type (0 = delta, 1 = key)
-///   bytes 1-4 : frame_id (u32, big-endian)
-///   bytes 5.. : raw Annex-B H.264 for the whole frame
-export const STREAM_FRAME_HEADER_BYTES = 5;
+///   byte 0     : frame_type (0 = delta, 1 = key)
+///   bytes 1-4  : frame_id (u32, big-endian)
+///   byte 5     : has_ping_echo (0 or 1)
+///   bytes 6-13 : ping_echo_client_ts (f64, big-endian; valid only if byte 5 == 1)
+///   bytes 14.. : raw Annex-B H.264 for the whole frame
+///
+/// The ping echo round-trips a `ping` this client sent (see `VideoStream.sendPing`)
+/// back on whichever frame next leaves the server's encoder -- comparing
+/// `pingEchoClientTs` against this client's own clock on arrival gives a
+/// round-trip latency measurement spanning network + the whole server
+/// pipeline, without needing synchronized clocks.
+export const STREAM_FRAME_HEADER_BYTES = 14;
 
 export interface StreamFrameHeader {
   isKeyframe: boolean;
   frameId: number;
+  pingEchoClientTs: number | null;
 }
 
 export function parseStreamFrameHeader(buf: ArrayBuffer): StreamFrameHeader {
   const view = new DataView(buf);
+  const hasPingEcho = view.getUint8(5) === 1;
   return {
     isKeyframe: view.getUint8(0) === 1,
     frameId: view.getUint32(1, false),
+    pingEchoClientTs: hasPingEcho ? view.getFloat64(6, false) : null,
   };
 }
 

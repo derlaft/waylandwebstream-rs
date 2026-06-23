@@ -7,6 +7,9 @@ use tracing::{error, info, warn};
 #[derive(Clone)]
 pub struct RawFrame {
     pub data: Vec<u8>,
+    /// When the render loop captured this frame -- the start of the
+    /// server-side latency pipeline (see `capture_to_encode_ms` below).
+    pub capture_instant: std::time::Instant,
 }
 
 /// Encoded video packet (H.264 NAL units)
@@ -20,6 +23,19 @@ pub struct EncodedPacket {
     /// Monotonic packet id (wraps), used by consumers to detect drops/gaps
     /// without depending on RTP sequencing.
     pub frame_id: u32,
+    /// Time the raw frame spent queued before the encoder thread picked it
+    /// up, i.e. `encode_start - RawFrame::capture_instant`.
+    pub capture_to_encode_ms: f64,
+    /// Time libx264 spent actually encoding this frame.
+    pub encoding_ms: f64,
+    /// When encoding finished. Used by the packet-forwarding loop (not sent
+    /// over the wire) to measure encode→send/broadcast queueing time.
+    pub encode_complete: std::time::Instant,
+    /// Echoes a client's `ping` (`SignalingMessage::Ping` in src/server.rs)
+    /// back on the next frame to leave the encoder, so the client can
+    /// measure full round-trip latency (network + server pipeline) without
+    /// needing synchronized clocks -- see src/server.rs's `encode_video_frame`.
+    pub ping_echo_client_ts: Option<f64>,
 }
 
 /// Resolution change event
@@ -266,6 +282,9 @@ fn encoder_thread(
             force_keyframe = false;
         }
 
+        let capture_to_encode_ms = raw_frame.capture_instant.elapsed().as_secs_f64() * 1000.0;
+        let encode_start = std::time::Instant::now();
+
         // Encode the frame
         let encode_result = encode_frame(
             &mut encoder,
@@ -276,7 +295,11 @@ fn encoder_thread(
             frame_count,
             &mut next_frame_id,
             force_this_frame,
+            capture_to_encode_ms,
         );
+
+        let encoding_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
+        let encode_complete = std::time::Instant::now();
 
         // The encoder has already copied everything it needs out of
         // raw_frame.data (encode_frame only borrows it) -- hand the buffer
@@ -287,7 +310,11 @@ fn encoder_thread(
         let _ = buffer_return_tx.send(raw_frame.data);
 
         match encode_result {
-            Ok(packets) => {
+            Ok(mut packets) => {
+                for packet in &mut packets {
+                    packet.encoding_ms = encoding_ms;
+                    packet.encode_complete = encode_complete;
+                }
                 for packet in packets {
                     if packet_tx.blocking_send(packet).is_err() {
                         warn!("Failed to send encoded packet (channel closed)");
@@ -410,6 +437,7 @@ fn encode_frame(
     frame_number: i64,
     next_frame_id: &mut u32,
     force_keyframe: bool,
+    capture_to_encode_ms: f64,
 ) -> Result<Vec<EncodedPacket>> {
     // Point the input frame straight at the render buffer instead of
     // copying into an owned one -- swscale only reads through this
@@ -473,6 +501,12 @@ fn encode_frame(
                     data,
                     is_keyframe,
                     frame_id,
+                    capture_to_encode_ms,
+                    // Overwritten by the caller right after this returns,
+                    // once the actual encode duration is known.
+                    encoding_ms: 0.0,
+                    encode_complete: std::time::Instant::now(),
+                    ping_echo_client_ts: None,
                 });
             }
             Err(ffmpeg::Error::Other { errno: ffmpeg::error::EAGAIN }) => {
@@ -493,6 +527,7 @@ mod tests {
     fn make_raw_frame(width: u32, height: u32) -> RawFrame {
         RawFrame {
             data: vec![0u8; (width * height * 4) as usize],
+            capture_instant: std::time::Instant::now(),
         }
     }
 

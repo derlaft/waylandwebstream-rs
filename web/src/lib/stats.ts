@@ -6,7 +6,10 @@ export type ConnectionState = 'connecting' | 'open' | 'closed' | 'error';
 
 export interface StreamStats {
   connectionState: ConnectionState;
-  decodeLatencyMs: number;
+  /// Glass-to-glass: ping round-trip (network + whole server pipeline,
+  /// measured via the embedded-timestamp ping/echo in stream.ts) plus this
+  /// client's own decode time. See `VideoStream.flushDiagnostics`.
+  endToEndLatencyMs: number;
   resolution: { width: number; height: number } | null;
   arrivalGapAvgMs: number;
   arrivalGapP95Ms: number;
@@ -14,11 +17,14 @@ export interface StreamStats {
   burstCount: number;
   maxDecodeQueue: number;
   maxFrameBytes: number;
+  /// Current encoder target bitrate reported by the server over `/ws`. 0
+  /// means "not yet known" or "not applicable" (constant-quality/CRF mode).
+  bitrateBps: number;
 }
 
 const initialStats: StreamStats = {
   connectionState: 'connecting',
-  decodeLatencyMs: 0,
+  endToEndLatencyMs: 0,
   resolution: null,
   arrivalGapAvgMs: 0,
   arrivalGapP95Ms: 0,
@@ -26,6 +32,7 @@ const initialStats: StreamStats = {
   burstCount: 0,
   maxDecodeQueue: 0,
   maxFrameBytes: 0,
+  bitrateBps: 0,
 };
 
 export const streamStats = writable<StreamStats>(initialStats);
@@ -38,8 +45,12 @@ export function setResolution(width: number, height: number): void {
   streamStats.update((s) => ({ ...s, resolution: { width, height } }));
 }
 
-export function reportDecodeLatency(ms: number): void {
-  streamStats.update((s) => ({ ...s, decodeLatencyMs: ms }));
+export function reportEndToEndLatency(ms: number): void {
+  streamStats.update((s) => ({ ...s, endToEndLatencyMs: ms }));
+}
+
+export function setBitrate(bps: number): void {
+  streamStats.update((s) => ({ ...s, bitrateBps: bps }));
 }
 
 export function reportArrivalStats(stats: {

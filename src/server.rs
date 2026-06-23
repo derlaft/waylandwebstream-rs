@@ -13,7 +13,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
@@ -63,6 +63,20 @@ pub enum SignalingMessage {
         decoding_ms: Option<f64>,
         total_ms: f64,
     },
+    /// Round-trip latency probe: echoed back on whichever `/stream` frame
+    /// next leaves the encoder (see `encode_video_frame`'s `ping_echo_*`
+    /// handling), so the client can measure full pipeline latency using
+    /// only its own clock.
+    #[serde(rename = "ping")]
+    Ping { client_ts: f64 },
+}
+
+/// Messages the server pushes to the client over `/ws`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ServerMessage {
+    #[serde(rename = "bitrate")]
+    Bitrate { bps: usize },
 }
 
 /// Shared state for the server
@@ -94,6 +108,16 @@ pub struct SignalingState {
     /// newly connected client to ride on, rather than waiting on damage or
     /// the periodic keyframe cadence.
     force_render: Arc<AtomicBool>,
+    /// Forwards a client's `ping` to the encoder packet-forwarding loop in
+    /// main.rs, which stamps it onto the next outgoing `EncodedPacket` as
+    /// `ping_echo_client_ts`. Small queue: pings arrive far slower than
+    /// frames are forwarded, so this never needs to hold more than one.
+    pending_ping_tx: mpsc::Sender<f64>,
+    /// Current encoder target bitrate, updated by the adaptive bitrate
+    /// controller (or fixed forever in constant-bitrate/CRF mode). Each
+    /// `/ws` connection gets its own clone to push `ServerMessage::Bitrate`
+    /// updates to that client.
+    bitrate_rx: watch::Receiver<usize>,
 }
 
 impl SignalingState {
@@ -105,6 +129,8 @@ impl SignalingState {
         bitrate_event_tx: Option<mpsc::Sender<BitrateEvent>>,
         encoder_control_tx: mpsc::Sender<EncoderControl>,
         force_render: Arc<AtomicBool>,
+        pending_ping_tx: mpsc::Sender<f64>,
+        bitrate_rx: watch::Receiver<usize>,
     ) -> Self {
         let (video_tx, _) = broadcast::channel(3);
         Self {
@@ -116,6 +142,8 @@ impl SignalingState {
             video_tx,
             encoder_control_tx,
             force_render,
+            pending_ping_tx,
+            bitrate_rx,
         }
     }
 
@@ -168,12 +196,24 @@ async fn handle_websocket(
 }
 
 async fn websocket_handler(socket: WebSocket, state: SignalingState) {
-    let (_sender, mut receiver) = socket.split();
+    let (mut sender, mut receiver) = socket.split();
+    let mut bitrate_rx = state.bitrate_rx.clone();
 
-    while let Some(Ok(msg)) = receiver.next().await {
-        if let Message::Text(text) = msg {
-            if let Ok(msg) = serde_json::from_str::<SignalingMessage>(&text) {
-                match msg {
+    // Push the current bitrate right away -- otherwise a client connecting
+    // between adaptive-bitrate adjustments would see nothing until the next
+    // change, which on a settled stream might be a long time off.
+    let initial_bitrate = *bitrate_rx.borrow();
+    if send_server_message(&mut sender, &ServerMessage::Bitrate { bps: initial_bitrate }).await.is_err() {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            incoming = receiver.next() => {
+                let Some(Ok(msg)) = incoming else { break; };
+                let Message::Text(text) = msg else { continue; };
+                let Ok(signal) = serde_json::from_str::<SignalingMessage>(&text) else { continue; };
+                match signal {
                     SignalingMessage::Ready => {
                         info!("Client is ready");
                     }
@@ -203,10 +243,21 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                             let _ = bitrate_event_tx.send(BitrateEvent::KeyframeRequested).await;
                         }
                     }
+                    SignalingMessage::Ping { client_ts } => {
+                        // Best-effort: if the queue is briefly full, the next
+                        // ping a couple seconds later picks it up instead.
+                        let _ = state.pending_ping_tx.try_send(client_ts);
+                    }
                     SignalingMessage::Latency { encoding_ms, network_ms, jitter_buffer_ms, decoding_ms, total_ms } => {
-                        info!("Received latency message from client: {:.1}ms total", total_ms);
-                        if let Some(ref bitrate_event_tx) = state.bitrate_event_tx {
-                            let _ = bitrate_event_tx.send(BitrateEvent::Latency(total_ms)).await;
+                        info!(
+                            "Received latency report from client: network {:.1}ms decode {:.1}ms total {:.1}ms",
+                            network_ms.unwrap_or(0.0), decoding_ms.unwrap_or(0.0), total_ms
+                        );
+                        // Only decode latency throttles bitrate growth here --
+                        // network/RTT delays aren't evidence the encoder's
+                        // rate is too high (see adaptive_bitrate.rs).
+                        if let (Some(ref bitrate_event_tx), Some(ms)) = (&state.bitrate_event_tx, decoding_ms) {
+                            let _ = bitrate_event_tx.send(BitrateEvent::Latency(ms)).await;
                         }
                         if let Some(ref latency_tx) = state.latency_tx {
                             let mut report = LatencyReport::new();
@@ -218,17 +269,32 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
 
                             if let Err(e) = latency_tx.send(report).await {
                                 warn!("Failed to send latency report: {}", e);
-                            } else {
-                                info!("Latency report forwarded to handler");
                             }
-                        } else {
-                            warn!("Received latency report but latency_tx is None");
                         }
                     }
                 }
             }
+            changed = bitrate_rx.changed() => {
+                if changed.is_err() {
+                    // Sender side dropped; bitrate just won't update further.
+                    continue;
+                }
+                let bps = *bitrate_rx.borrow();
+                if send_server_message(&mut sender, &ServerMessage::Bitrate { bps }).await.is_err() {
+                    break;
+                }
+            }
         }
     }
+}
+
+async fn send_server_message(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    msg: &ServerMessage,
+) -> Result<(), axum::Error> {
+    sender
+        .send(Message::Text(serde_json::to_string(msg).expect("ServerMessage always serializes")))
+        .await
 }
 
 /// Handle the binary video WebSocket (`/stream`). Each connected client gets
@@ -244,14 +310,32 @@ async fn handle_video_stream(
 
 /// Wire format for each binary frame sent to the client:
 /// ```text
-/// byte 0    : frame_type (0 = delta, 1 = key)
-/// bytes 1-4 : frame_id (u32, big-endian)
-/// bytes 5.. : raw Annex-B H.264 for the whole frame
+/// byte 0     : frame_type (0 = delta, 1 = key)
+/// bytes 1-4  : frame_id (u32, big-endian)
+/// byte 5     : has_ping_echo (0 or 1)
+/// bytes 6-13 : ping_echo_client_ts (f64, big-endian; valid only if byte 5 == 1)
+/// bytes 14.. : raw Annex-B H.264 for the whole frame
 /// ```
+/// The ping echo round-trips a client's `ping` (`SignalingMessage::Ping`)
+/// back on whichever frame next leaves the encoder, so the client can
+/// measure full pipeline latency (its own clock only, no sync needed) --
+/// see `VideoStream` in web/src/lib/stream.ts.
+const STREAM_FRAME_HEADER_BYTES: usize = 14;
+
 fn encode_video_frame(packet: &EncodedPacket) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(5 + packet.data.len());
+    let mut buf = Vec::with_capacity(STREAM_FRAME_HEADER_BYTES + packet.data.len());
     buf.push(packet.is_keyframe as u8);
     buf.extend_from_slice(&packet.frame_id.to_be_bytes());
+    match packet.ping_echo_client_ts {
+        Some(ts) => {
+            buf.push(1);
+            buf.extend_from_slice(&ts.to_be_bytes());
+        }
+        None => {
+            buf.push(0);
+            buf.extend_from_slice(&0f64.to_be_bytes());
+        }
+    }
     buf.extend_from_slice(&packet.data);
     buf
 }
@@ -351,6 +435,8 @@ mod tests {
         let (touch_tx, _touch_rx) = mpsc::channel(4);
         let (mouse_tx, _mouse_rx) = mpsc::channel(4);
         let (encoder_control_tx, mut encoder_control_rx) = mpsc::channel(4);
+        let (pending_ping_tx, _pending_ping_rx) = mpsc::channel(4);
+        let (_bitrate_tx, bitrate_rx) = watch::channel(2_000_000usize);
         let force_render = Arc::new(AtomicBool::new(false));
 
         let state = SignalingState::new(
@@ -361,6 +447,8 @@ mod tests {
             None,
             encoder_control_tx,
             force_render.clone(),
+            pending_ping_tx,
+            bitrate_rx,
         );
         let video_tx = state.get_video_sender();
         let server = SignalingServer::new(state);
@@ -383,29 +471,30 @@ mod tests {
             Ok(EncoderControl::ForceKeyframe)
         ), "connecting should request a fresh keyframe");
 
-        assert!(video_tx
-            .send(EncodedPacket {
-                data: vec![0xAA, 0xBB, 0xCC],
-                is_keyframe: true,
-                frame_id: 42,
-            })
-            .is_ok());
-        assert!(video_tx
-            .send(EncodedPacket {
-                data: vec![0xDD],
-                is_keyframe: false,
-                frame_id: 43,
-            })
-            .is_ok());
+        fn test_packet(data: Vec<u8>, is_keyframe: bool, frame_id: u32) -> EncodedPacket {
+            EncodedPacket {
+                data,
+                is_keyframe,
+                frame_id,
+                capture_to_encode_ms: 0.0,
+                encoding_ms: 0.0,
+                encode_complete: std::time::Instant::now(),
+                ping_echo_client_ts: None,
+            }
+        }
+
+        assert!(video_tx.send(test_packet(vec![0xAA, 0xBB, 0xCC], true, 42)).is_ok());
+        assert!(video_tx.send(test_packet(vec![0xDD], false, 43)).is_ok());
 
         let frame1 = read_ws_binary_frame(&mut stream).await;
         assert_eq!(frame1[0], 1, "expected keyframe flag");
         assert_eq!(u32::from_be_bytes([frame1[1], frame1[2], frame1[3], frame1[4]]), 42);
-        assert_eq!(&frame1[5..], &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(frame1[5], 0, "expected no ping echo on this frame");
+        assert_eq!(&frame1[STREAM_FRAME_HEADER_BYTES..], &[0xAA, 0xBB, 0xCC]);
 
         let frame2 = read_ws_binary_frame(&mut stream).await;
         assert_eq!(frame2[0], 0, "expected delta flag");
         assert_eq!(u32::from_be_bytes([frame2[1], frame2[2], frame2[3], frame2[4]]), 43);
-        assert_eq!(&frame2[5..], &[0xDD]);
+        assert_eq!(&frame2[STREAM_FRAME_HEADER_BYTES..], &[0xDD]);
     }
 }
