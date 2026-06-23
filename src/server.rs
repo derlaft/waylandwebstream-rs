@@ -20,6 +20,7 @@ use tracing::{info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::adaptive_bitrate::BitrateEvent;
 use crate::encoder::{EncodedPacket, EncoderControl};
 use crate::input::mouse::MouseEvent;
 use crate::input::touch::TouchEvent;
@@ -75,6 +76,10 @@ pub struct SignalingState {
     mouse_tx: mpsc::Sender<MouseEvent>,
     /// Channel to send latency reports from clients
     latency_tx: Option<mpsc::Sender<LatencyReport>>,
+    /// Feeds keyframe-request and latency signals to the adaptive bitrate
+    /// controller. `None` when adaptive bitrate is disabled (fixed bitrate
+    /// or constant-quality mode).
+    bitrate_event_tx: Option<mpsc::Sender<BitrateEvent>>,
     /// Broadcasts encoded video packets to `/stream` WebSocket clients. Small
     /// capacity is deliberate: a slow client should skip forward to a recent
     /// frame rather than build up a backlog, since H.264 P-frames in the
@@ -97,6 +102,7 @@ impl SignalingState {
         touch_tx: mpsc::Sender<TouchEvent>,
         mouse_tx: mpsc::Sender<MouseEvent>,
         latency_tx: Option<mpsc::Sender<LatencyReport>>,
+        bitrate_event_tx: Option<mpsc::Sender<BitrateEvent>>,
         encoder_control_tx: mpsc::Sender<EncoderControl>,
         force_render: Arc<AtomicBool>,
     ) -> Self {
@@ -106,6 +112,7 @@ impl SignalingState {
             touch_tx,
             mouse_tx,
             latency_tx,
+            bitrate_event_tx,
             video_tx,
             encoder_control_tx,
             force_render,
@@ -196,9 +203,15 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                         if let Err(e) = state.encoder_control_tx.send(EncoderControl::ForceKeyframe).await {
                             warn!("Failed to request keyframe resync: {}", e);
                         }
+                        if let Some(ref bitrate_event_tx) = state.bitrate_event_tx {
+                            let _ = bitrate_event_tx.send(BitrateEvent::KeyframeRequested).await;
+                        }
                     }
                     SignalingMessage::Latency { encoding_ms, network_ms, jitter_buffer_ms, decoding_ms, total_ms } => {
                         info!("Received latency message from client: {:.1}ms total", total_ms);
+                        if let Some(ref bitrate_event_tx) = state.bitrate_event_tx {
+                            let _ = bitrate_event_tx.send(BitrateEvent::Latency(total_ms)).await;
+                        }
                         if let Some(ref latency_tx) = state.latency_tx {
                             let mut report = LatencyReport::new();
                             report.encoding_ms = encoding_ms;
@@ -348,6 +361,7 @@ mod tests {
             resize_tx,
             touch_tx,
             mouse_tx,
+            None,
             None,
             encoder_control_tx,
             force_render.clone(),

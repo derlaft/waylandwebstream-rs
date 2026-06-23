@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
+mod adaptive_bitrate;
 mod compositor;
 mod config;
 mod encoder;
@@ -18,6 +19,7 @@ mod latency;
 mod server;
 mod web;
 
+use adaptive_bitrate::{AdaptiveBitrateConfig, AdaptiveBitrateController, BitrateEvent};
 use compositor::CompositorState;
 use encoder::{EncoderConfig, RateControl, spawn_encoder};
 use input::mouse::MouseHandler;
@@ -85,6 +87,19 @@ async fn main() -> Result<()> {
         Some(crf) => RateControl::Quality(crf),
         None => RateControl::Bitrate(config.bitrate),
     };
+    // Adaptive bitrate only makes sense in bitrate mode -- CRF mode has no
+    // bitrate target to adapt.
+    let adaptive_bitrate_enabled = !config.no_adaptive_bitrate && config.crf.is_none();
+    if config.no_adaptive_bitrate && config.crf.is_some() {
+        warn!("--no-adaptive-bitrate has no effect with --crf (constant quality mode never adapts bitrate)");
+    }
+    if config.min_bitrate >= config.max_bitrate {
+        anyhow::bail!(
+            "--min-bitrate ({}) must be less than --max-bitrate ({})",
+            config.min_bitrate,
+            config.max_bitrate
+        );
+    }
     let encoder_config = EncoderConfig {
         width,
         height,
@@ -116,7 +131,11 @@ async fn main() -> Result<()> {
     info!("║  Server Configuration:                                       ║");
     info!("║  - Resolution: {}x{} @ {}fps                       ║", width, height, config.framerate);
     match rate_control {
-        RateControl::Bitrate(bps) => info!("║  - Bitrate: {} bps                                          ║", bps),
+        RateControl::Bitrate(bps) if adaptive_bitrate_enabled => info!(
+            "║  - Bitrate: adaptive, {} bps initial ({}-{} bps)        ║",
+            bps, config.min_bitrate, config.max_bitrate
+        ),
+        RateControl::Bitrate(bps) => info!("║  - Bitrate: {} bps (fixed)                                  ║", bps),
         RateControl::Quality(crf) => info!("║  - Quality: CRF {}                                            ║", crf),
     }
     info!("║  - Keyframe interval: {} frames                              ║", keyframe_interval);
@@ -181,6 +200,30 @@ async fn main() -> Result<()> {
         Some(latency_tx)
     };
 
+    // Adaptive bitrate: feeds off client keyframe-resync requests (primary,
+    // loss-equivalent congestion signal) and decode latency reports
+    // (secondary, holds off growth) to steer the encoder's bitrate between
+    // --min-bitrate and --max-bitrate. See src/adaptive_bitrate.rs.
+    let bitrate_event_tx = if adaptive_bitrate_enabled {
+        let (bitrate_event_tx, bitrate_event_rx) = mpsc::channel::<BitrateEvent>(32);
+        let adaptive_config = AdaptiveBitrateConfig {
+            min_bitrate: config.min_bitrate,
+            max_bitrate: config.max_bitrate,
+            initial_bitrate: config.bitrate,
+            ..Default::default()
+        };
+        let controller = AdaptiveBitrateController::new(
+            adaptive_config,
+            encoder_control.clone(),
+            bitrate_event_rx,
+        );
+        tokio::spawn(controller.run());
+        Some(bitrate_event_tx)
+    } else {
+        info!("Adaptive bitrate disabled, using fixed rate control: {:?}", rate_control);
+        None
+    };
+
     // Set by the session manager (and the `/stream` handler) when a new
     // client connects, so the capture loop renders+sends a frame right away
     // even if the screen hasn't changed -- otherwise a newly connected
@@ -194,6 +237,7 @@ async fn main() -> Result<()> {
         touch_tx,
         mouse_tx,
         latency_tx,
+        bitrate_event_tx,
         encoder_control,
         force_render.clone(),
     );

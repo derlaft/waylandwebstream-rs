@@ -1,268 +1,146 @@
-use tokio::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-// Import from the main crate
-use waylandwebstream::adaptive_bitrate::{
-    AdaptiveBitrateConfig, AdaptiveBitrateController, NetworkMetrics,
-};
-use waylandwebstream::encoder::EncoderControl;
+use waylandwebstream::adaptive_bitrate::{AdaptiveBitrateConfig, BitrateAlgorithm};
 
-#[tokio::test]
-async fn test_bitrate_decreases_on_high_latency() {
-    // Create channels
-    let (encoder_tx, mut encoder_rx) = mpsc::channel(16);
-    let (metrics_tx, metrics_rx) = mpsc::channel(16);
+// All tests drive `BitrateAlgorithm` with synthetic `Instant`s computed from
+// a fixed base time rather than real sleeps, so they're deterministic and
+// fast -- the old RTCP-based controller's tests relied on real
+// `tokio::time::sleep` calls and were correspondingly slow and flaky.
 
-    // Configure controller with low thresholds for testing
-    let config = AdaptiveBitrateConfig {
+fn config() -> AdaptiveBitrateConfig {
+    AdaptiveBitrateConfig {
         min_bitrate: 500_000,
-        max_bitrate: 10_000_000,
+        max_bitrate: 12_000_000,
         initial_bitrate: 2_000_000,
-        target_latency_ms: 50,  // Low target for testing
-        latency_threshold_factor: 1.5,
-        increase_rate: 100_000,
-        decrease_factor: 0.7,
-        adjustment_interval: Duration::from_millis(100), // Fast for testing
-    };
-
-    let controller = AdaptiveBitrateController::new(
-        config.clone(),
-        encoder_tx,
-        metrics_rx,
-    );
-
-    // Spawn the controller
-    let controller_handle = tokio::spawn(async move {
-        controller.run().await
-    });
-
-    // Give it time to start
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Send high latency metrics (150ms > threshold of 75ms)
-    let high_latency = NetworkMetrics {
-        encoder_queue_depth: 0,
-        rtt_ms: Some(150),
-        packet_loss_percent: None,
-        jitter_ms: None,
-        dropped_frames: 0,
-    };
-
-    metrics_tx.send(high_latency).await.unwrap();
-
-    // Wait for adjustment interval
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Should receive a bitrate change command
-    let control_msg = tokio::time::timeout(
-        Duration::from_millis(500),
-        encoder_rx.recv()
-    ).await;
-
-    assert!(control_msg.is_ok(), "Should receive encoder control message");
-    
-    if let Ok(Some(EncoderControl::ChangeBitrate(new_bitrate))) = control_msg {
-        // Should decrease to ~70% of 2_000_000 = 1_400_000
-        assert!(new_bitrate < 2_000_000, "Bitrate should decrease from 2Mbps, got {}", new_bitrate);
-        assert!(new_bitrate >= 1_300_000 && new_bitrate <= 1_500_000, 
-                "Bitrate should be around 1.4Mbps (70% of 2Mbps), got {}", new_bitrate);
-        println!("✓ Bitrate decreased to {} bps on high latency", new_bitrate);
-    } else {
-        panic!("Expected ChangeBitrate message");
+        decrease_factor: 0.75,
+        decrease_cooldown: Duration::from_secs(2),
+        slow_start_factor: 1.4,
+        additive_increase: 150_000,
+        adjustment_interval: Duration::from_secs(1),
+        latency_ceiling_ms: 150.0,
     }
-
-    controller_handle.abort();
 }
 
-#[tokio::test]
-async fn test_bitrate_increases_on_low_latency() {
-    // Create channels
-    let (encoder_tx, mut encoder_rx) = mpsc::channel(16);
-    let (metrics_tx, metrics_rx) = mpsc::channel(16);
+#[test]
+fn slow_start_grows_multiplicatively_until_the_ceiling() {
+    let mut algo = BitrateAlgorithm::new(config());
+    let t0 = Instant::now();
 
-    // Configure controller
-    let config = AdaptiveBitrateConfig {
-        min_bitrate: 500_000,
-        max_bitrate: 10_000_000,
-        initial_bitrate: 2_000_000,
-        target_latency_ms: 100,
-        latency_threshold_factor: 1.5,
-        increase_rate: 200_000,  // Faster increase for testing
-        decrease_factor: 0.7,
-        adjustment_interval: Duration::from_millis(100),
-    };
+    let before = algo.current_bitrate();
+    let after = algo.tick(t0 + Duration::from_secs(1)).expect("should grow");
+    assert_eq!(after, (before as f64 * 1.4) as usize);
 
-    let controller = AdaptiveBitrateController::new(
-        config.clone(),
-        encoder_tx,
-        metrics_rx,
-    );
-
-    // Spawn the controller
-    let controller_handle = tokio::spawn(async move {
-        controller.run().await
-    });
-
-    // Give it time to start
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Send low latency metrics repeatedly (30ms < 100ms target)
-    let low_latency = NetworkMetrics {
-        encoder_queue_depth: 0,
-        rtt_ms: Some(30),
-        packet_loss_percent: None,
-        jitter_ms: None,
-        dropped_frames: 0,
-    };
-
-    // Send metrics multiple times to trigger increase
-    for _ in 0..5 {
-        metrics_tx.send(low_latency.clone()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
-    }
-
-    // Wait for adjustment
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-
-    // Should receive at least one bitrate increase
-    let mut received_increase = false;
-    let mut latest_bitrate = 2_000_000;
-
-    while let Ok(msg) = encoder_rx.try_recv() {
-        if let EncoderControl::ChangeBitrate(new_bitrate) = msg {
-            if new_bitrate > latest_bitrate {
-                received_increase = true;
-            }
-            latest_bitrate = new_bitrate;
+    // Keep ticking until growth stops -- should clamp at max_bitrate, not
+    // overshoot it.
+    let mut now = t0 + Duration::from_secs(1);
+    for _ in 0..50 {
+        now += Duration::from_secs(1);
+        if algo.tick(now).is_none() {
+            break;
         }
     }
-
-    assert!(received_increase, "Bitrate should increase on low latency");
-    assert!(latest_bitrate > 2_000_000, "Final bitrate {} should be higher than initial 2Mbps", latest_bitrate);
-    println!("✓ Bitrate increased to {} bps on low latency", latest_bitrate);
-
-    controller_handle.abort();
+    assert_eq!(algo.current_bitrate(), 12_000_000);
 }
 
-#[tokio::test]
-async fn test_bitrate_respects_min_max_bounds() {
-    // Create channels
-    let (encoder_tx, mut encoder_rx) = mpsc::channel(16);
-    let (metrics_tx, metrics_rx) = mpsc::channel(16);
+#[test]
+fn keyframe_request_cuts_bitrate_multiplicatively() {
+    let mut algo = BitrateAlgorithm::new(config());
+    let t0 = Instant::now();
 
-    // Configure controller with tight bounds
-    let config = AdaptiveBitrateConfig {
-        min_bitrate: 1_000_000,
-        max_bitrate: 3_000_000,
-        initial_bitrate: 2_000_000,
-        target_latency_ms: 50,
-        latency_threshold_factor: 1.5,
-        increase_rate: 500_000,  // Large increase
-        decrease_factor: 0.5,    // Large decrease
-        adjustment_interval: Duration::from_millis(100),
-    };
-
-    let controller = AdaptiveBitrateController::new(
-        config.clone(),
-        encoder_tx,
-        metrics_rx,
-    );
-
-    // Spawn the controller
-    let controller_handle = tokio::spawn(async move {
-        controller.run().await
-    });
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Send very high latency to try to push below min
-    let very_high_latency = NetworkMetrics {
-        encoder_queue_depth: 4,
-        rtt_ms: Some(500),
-        packet_loss_percent: Some(10.0),
-        jitter_ms: Some(100),
-        dropped_frames: 10,
-    };
-
-    // Send multiple times to trigger multiple decreases
-    for _ in 0..5 {
-        metrics_tx.send(very_high_latency.clone()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
-    }
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Collect all bitrate changes
-    let mut min_seen = u64::MAX;
-    while let Ok(msg) = encoder_rx.try_recv() {
-        if let EncoderControl::ChangeBitrate(bitrate) = msg {
-            min_seen = min_seen.min(bitrate as u64);
-        }
-    }
-
-    assert!(min_seen >= config.min_bitrate as u64, 
-            "Bitrate {} should not go below min {}", min_seen, config.min_bitrate);
-    println!("✓ Bitrate respected minimum bound: {} >= {}", min_seen, config.min_bitrate);
-
-    controller_handle.abort();
+    let new_rate = algo.on_keyframe_requested(t0).expect("should cut");
+    assert_eq!(new_rate, (2_000_000.0 * 0.75) as usize);
+    assert_eq!(algo.current_bitrate(), new_rate);
 }
 
-#[tokio::test]
-async fn test_congestion_detection() {
-    // Create channels
-    let (encoder_tx, mut encoder_rx) = mpsc::channel(16);
-    let (metrics_tx, metrics_rx) = mpsc::channel(16);
+#[test]
+fn repeated_keyframe_requests_within_cooldown_are_coalesced() {
+    let mut algo = BitrateAlgorithm::new(config());
+    let t0 = Instant::now();
 
-    let config = AdaptiveBitrateConfig {
+    let first_cut = algo.on_keyframe_requested(t0).expect("should cut");
+
+    // A second request 500ms later (well inside the 2s cooldown) is the
+    // same underlying drop event, not a fresh one -- shouldn't cut again.
+    let second = algo.on_keyframe_requested(t0 + Duration::from_millis(500));
+    assert_eq!(second, None);
+    assert_eq!(algo.current_bitrate(), first_cut);
+}
+
+#[test]
+fn keyframe_request_after_cooldown_cuts_again() {
+    let mut algo = BitrateAlgorithm::new(config());
+    let t0 = Instant::now();
+
+    let first_cut = algo.on_keyframe_requested(t0).expect("should cut");
+    let second_cut = algo
+        .on_keyframe_requested(t0 + Duration::from_secs(3))
+        .expect("cooldown elapsed, should cut again");
+
+    assert_eq!(second_cut, (first_cut as f64 * 0.75) as usize);
+}
+
+#[test]
+fn growth_holds_during_post_cut_cooldown() {
+    let mut algo = BitrateAlgorithm::new(config());
+    let t0 = Instant::now();
+
+    algo.on_keyframe_requested(t0).expect("should cut");
+    let cut_rate = algo.current_bitrate();
+
+    // A tick 1s later is still inside the 2s cooldown -- bitrate should
+    // hold, not grow, while the cut settles.
+    assert_eq!(algo.tick(t0 + Duration::from_secs(1)), None);
+    assert_eq!(algo.current_bitrate(), cut_rate);
+
+    // Once the cooldown has elapsed, growth resumes.
+    assert!(algo.tick(t0 + Duration::from_secs(3)).is_some());
+}
+
+#[test]
+fn growth_holds_while_latency_is_elevated() {
+    let mut algo = BitrateAlgorithm::new(config());
+    let t0 = Instant::now();
+
+    algo.on_latency_report(300.0); // above the 150ms ceiling
+    assert_eq!(algo.tick(t0 + Duration::from_secs(1)), None);
+
+    algo.on_latency_report(50.0); // back under the ceiling
+    assert!(algo.tick(t0 + Duration::from_secs(2)).is_some());
+}
+
+#[test]
+fn keyframe_request_floors_at_min_bitrate() {
+    let mut algo = BitrateAlgorithm::new(AdaptiveBitrateConfig {
+        initial_bitrate: 600_000,
         min_bitrate: 500_000,
-        max_bitrate: 10_000_000,
-        initial_bitrate: 2_000_000,
-        target_latency_ms: 100,
-        latency_threshold_factor: 1.5,
-        increase_rate: 100_000,
-        decrease_factor: 0.7,
-        adjustment_interval: Duration::from_millis(100),
-    };
-
-    let controller = AdaptiveBitrateController::new(
-        config.clone(),
-        encoder_tx,
-        metrics_rx,
-    );
-
-    let controller_handle = tokio::spawn(async move {
-        controller.run().await
+        decrease_cooldown: Duration::from_millis(0),
+        ..config()
     });
+    let mut now = Instant::now();
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Send metrics with low latency but high packet loss (congestion)
-    let congestion_metrics = NetworkMetrics {
-        encoder_queue_depth: 0,
-        rtt_ms: Some(50),  // Low latency
-        packet_loss_percent: Some(5.0),  // High packet loss
-        jitter_ms: None,
-        dropped_frames: 0,
-    };
-
-    metrics_tx.send(congestion_metrics).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Should still decrease bitrate due to congestion
-    let control_msg = tokio::time::timeout(
-        Duration::from_millis(500),
-        encoder_rx.recv()
-    ).await;
-
-    assert!(control_msg.is_ok(), "Should receive encoder control message");
-    
-    if let Ok(Some(EncoderControl::ChangeBitrate(new_bitrate))) = control_msg {
-        assert!(new_bitrate < 2_000_000, 
-                "Bitrate should decrease due to congestion despite low latency, got {}", new_bitrate);
-        println!("✓ Bitrate decreased to {} bps on congestion", new_bitrate);
-    } else {
-        panic!("Expected ChangeBitrate message");
+    // Repeated cuts should floor at min_bitrate, never go below it.
+    for _ in 0..10 {
+        algo.on_keyframe_requested(now);
+        now += Duration::from_secs(10);
     }
+    assert_eq!(algo.current_bitrate(), 500_000);
+}
 
-    controller_handle.abort();
+#[test]
+fn switches_to_additive_increase_after_a_cut() {
+    let mut algo = BitrateAlgorithm::new(config());
+    let t0 = Instant::now();
+
+    // Grow a bit in slow start first so the cut has somewhere to fall from.
+    algo.tick(t0 + Duration::from_secs(1));
+    algo.tick(t0 + Duration::from_secs(2));
+
+    algo.on_keyframe_requested(t0 + Duration::from_secs(2));
+    let post_cut = algo.current_bitrate();
+
+    // Past the cooldown, growth should now be the fixed additive step
+    // (congestion avoidance), not another multiplicative jump (slow start).
+    let now = t0 + Duration::from_secs(5);
+    let grown = algo.tick(now).expect("should grow");
+    assert_eq!(grown, post_cut + 150_000);
 }

@@ -27,17 +27,36 @@ pub struct Config {
     #[arg(long, default_value = "60")]
     pub framerate: u32,
 
-    /// Video bitrate in bits per second (constant bitrate mode). Ignored if
-    /// --crf is set.
+    /// Video bitrate in bits per second. In adaptive mode (the default,
+    /// unless --crf is set) this is the starting point the controller probes
+    /// up or down from; with --no-adaptive-bitrate it's used as a fixed
+    /// constant bitrate instead.
     #[arg(long, default_value = "2000000")]
     pub bitrate: usize,
 
     /// Enable constant quality mode using this x264 CRF value (0-51, lower
     /// is higher quality/larger frames; 18-28 is a typical range) instead of
-    /// targeting a constant bitrate. Frame size will vary with scene
-    /// complexity since there is no bitrate cap in this mode.
+    /// targeting a bitrate at all. Frame size will vary with scene
+    /// complexity since there is no bitrate cap in this mode. Disables
+    /// adaptive bitrate (there is no bitrate to adapt).
     #[arg(long, value_parser = clap::value_parser!(u8).range(0..=51))]
     pub crf: Option<u8>,
+
+    /// Disable adaptive bitrate control, which is otherwise on by default:
+    /// it adjusts the encoder's bitrate between --min-bitrate and
+    /// --max-bitrate based on client keyframe-resync requests (the signal
+    /// that a client's decoder is falling behind) and reported decode
+    /// latency. Has no effect when --crf is set.
+    #[arg(long)]
+    pub no_adaptive_bitrate: bool,
+
+    /// Lower bound for adaptive bitrate.
+    #[arg(long, default_value = "500000")]
+    pub min_bitrate: usize,
+
+    /// Upper bound for adaptive bitrate.
+    #[arg(long, default_value = "12000000")]
+    pub max_bitrate: usize,
 
     /// Keyframe interval in frames (GOP size). Lower values mean smaller,
     /// more frequent keyframes instead of large periodic bursts, which

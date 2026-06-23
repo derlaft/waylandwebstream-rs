@@ -1,264 +1,262 @@
-use anyhow::Result;
+//! Adaptive CBR control.
+//!
+//! Modeled on TCP Reno: slow start probes upward fast until the first
+//! congestion signal, then switches to additive-increase / multiplicative-
+//! decrease (AIMD) congestion avoidance, remembering the post-cut rate as a
+//! `ssthresh` ceiling so future growth stops there before probing further.
+//!
+//! The congestion signal is the client's keyframe-request message
+//! (`SignalingMessage::RequestKeyframe` in `src/server.rs`) -- sent only
+//! when its WebCodecs decode queue has actually backed up, never on a
+//! routine new-client connect (that path forces a keyframe directly without
+//! going through this message). That makes it a loss-equivalent signal:
+//! unambiguous evidence the current rate is too high for this client, in
+//! the same way a dropped TCP segment is evidence a window was too large.
+//!
+//! Client-reported decode latency is a secondary, softer signal: it can't
+//! trigger a cut on its own (a single slow decode doesn't mean the rate is
+//! wrong), but it holds off growth while elevated so the controller doesn't
+//! keep climbing into a backlog that just hasn't produced a keyframe
+//! request yet.
+//!
+//! All decisions live in `BitrateAlgorithm`, which takes plain `Instant`s
+//! and returns the new target without touching any channel -- this keeps
+//! the AIMD logic deterministically testable without real sleeps.
+//! `AdaptiveBitrateController` is the thin async wrapper that drives it from
+//! real time and an encoder control channel.
+//!
+//! Note: one encoder feeds every connected `/stream` client (see
+//! `SignalingState::video_tx` in `src/server.rs`), so a cut triggered by one
+//! struggling client lowers the rate for all of them. That's an existing
+//! property of the single shared-encoder broadcast design, not something
+//! this controller can address per-client.
+
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::encoder::EncoderControl;
 
-/// Configuration for adaptive bitrate control
+/// Signal fed into the controller from the server's signaling handlers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BitrateEvent {
+    /// A client's decoder fell behind and asked for a keyframe resync.
+    KeyframeRequested,
+    /// A client's self-reported average decode latency (ms) over its most
+    /// recent reporting window.
+    Latency(f64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    SlowStart,
+    CongestionAvoidance,
+}
+
 #[derive(Clone, Debug)]
 pub struct AdaptiveBitrateConfig {
-    /// Minimum bitrate in bits per second
     pub min_bitrate: usize,
-    /// Maximum bitrate in bits per second
     pub max_bitrate: usize,
-    /// Initial bitrate in bits per second
     pub initial_bitrate: usize,
-    /// Target latency in milliseconds
-    pub target_latency_ms: u64,
-    /// Latency threshold above which bitrate should drop (as multiple of target)
-    pub latency_threshold_factor: f64,
-    /// Rate at which to increase bitrate when latency is good (bps per second)
-    pub increase_rate: usize,
-    /// Factor by which to decrease bitrate when latency is bad (0.0-1.0)
+    /// Multiplicative cut applied to the current bitrate on a keyframe
+    /// request. TCP Reno halves cwnd (0.5); video is less elastic and
+    /// x264's VBV cap already bounds the worst-case frame size, so this
+    /// defaults to a gentler cut.
     pub decrease_factor: f64,
-    /// How often to check and adjust bitrate
+    /// Minimum spacing between cuts -- coalesces a burst of keyframe
+    /// requests from the same underlying drop into a single cut, and gives
+    /// the new rate a moment to settle before growth resumes.
+    pub decrease_cooldown: Duration,
+    /// Per-tick multiplicative growth while in slow start.
+    pub slow_start_factor: f64,
+    /// Per-tick additive growth (bps) once in congestion avoidance.
+    pub additive_increase: usize,
+    /// How often `tick()` is driven.
     pub adjustment_interval: Duration,
+    /// Reported decode latency (ms) above which growth is held off even
+    /// without a keyframe request.
+    pub latency_ceiling_ms: f64,
 }
 
 impl Default for AdaptiveBitrateConfig {
     fn default() -> Self {
         Self {
-            min_bitrate: 500_000,        // 500 Kbps minimum
-            max_bitrate: 10_000_000,     // 10 Mbps maximum
-            initial_bitrate: 2_000_000,  // 2 Mbps starting point
-            target_latency_ms: 100,      // Target 100ms latency
-            latency_threshold_factor: 1.5, // Drop bitrate if latency > 150ms
-            increase_rate: 100_000,      // Increase by 100 Kbps per second when stable
-            decrease_factor: 0.7,        // Drop to 70% when latency is bad
-            adjustment_interval: Duration::from_millis(500), // Check every 500ms
+            min_bitrate: 500_000,
+            max_bitrate: 12_000_000,
+            initial_bitrate: 2_000_000,
+            decrease_factor: 0.75,
+            decrease_cooldown: Duration::from_secs(2),
+            slow_start_factor: 1.4,
+            additive_increase: 150_000,
+            adjustment_interval: Duration::from_secs(1),
+            latency_ceiling_ms: 150.0,
         }
     }
 }
 
-/// Metrics for tracking network and encoder performance
-#[derive(Clone, Debug, Default)]
-pub struct NetworkMetrics {
-    /// Encoder queue depth (number of frames waiting to be encoded)
-    pub encoder_queue_depth: usize,
-    /// Round-trip time in milliseconds (from RTCP if available)
-    pub rtt_ms: Option<u64>,
-    /// Packet loss percentage (from RTCP if available)
-    pub packet_loss_percent: Option<f64>,
-    /// Jitter in milliseconds (from RTCP if available)
-    pub jitter_ms: Option<u64>,
-    /// Number of frames dropped by encoder
-    pub dropped_frames: u64,
-}
-
-impl NetworkMetrics {
-    /// Estimate current latency based on available metrics
-    pub fn estimated_latency_ms(&self) -> u64 {
-        // Start with encoder queue depth estimate
-        // Assume each frame in queue adds ~16ms at 60fps
-        let queue_latency = (self.encoder_queue_depth as u64) * 16;
-        
-        // Add RTT if available
-        let rtt_latency = self.rtt_ms.unwrap_or(0);
-        
-        // Add jitter if available
-        let jitter_latency = self.jitter_ms.unwrap_or(0);
-        
-        queue_latency + rtt_latency + jitter_latency
-    }
-    
-    /// Check if we have signs of network congestion
-    pub fn has_congestion(&self) -> bool {
-        // High packet loss indicates congestion
-        if let Some(loss) = self.packet_loss_percent {
-            if loss > 2.0 {
-                return true;
-            }
-        }
-        
-        // Large encoder queue indicates we can't keep up
-        if self.encoder_queue_depth > 2 {
-            return true;
-        }
-        
-        // Dropped frames indicate encoder overload
-        if self.dropped_frames > 0 {
-            return true;
-        }
-        
-        false
-    }
-}
-
-/// Adaptive bitrate controller
-pub struct AdaptiveBitrateController {
+/// Pure AIMD decision logic, separated from the async plumbing so it can be
+/// driven with synthetic `Instant`s in tests instead of real sleeps.
+pub struct BitrateAlgorithm {
     config: AdaptiveBitrateConfig,
     current_bitrate: usize,
-    encoder_control_tx: mpsc::Sender<EncoderControl>,
-    metrics_rx: mpsc::Receiver<NetworkMetrics>,
-    last_adjustment: Instant,
-    last_increase: Instant,
+    /// Ceiling slow start grows toward before switching to congestion
+    /// avoidance. Starts at `max_bitrate` (i.e. "unknown" -- probe as far
+    /// as allowed) and gets pulled down to the post-cut rate on the first
+    /// congestion signal, exactly like TCP's ssthresh.
+    ssthresh: usize,
+    phase: Phase,
+    last_decrease: Option<Instant>,
+    last_latency_ms: Option<f64>,
 }
 
-impl AdaptiveBitrateController {
-    /// Create a new adaptive bitrate controller
-    pub fn new(
-        config: AdaptiveBitrateConfig,
-        encoder_control_tx: mpsc::Sender<EncoderControl>,
-        metrics_rx: mpsc::Receiver<NetworkMetrics>,
-    ) -> Self {
+impl BitrateAlgorithm {
+    pub fn new(config: AdaptiveBitrateConfig) -> Self {
         let current_bitrate = config.initial_bitrate;
-        let now = Instant::now();
-        
+        let ssthresh = config.max_bitrate;
         Self {
             config,
             current_bitrate,
-            encoder_control_tx,
-            metrics_rx,
-            last_adjustment: now,
-            last_increase: now,
+            ssthresh,
+            phase: Phase::SlowStart,
+            last_decrease: None,
+            last_latency_ms: None,
         }
     }
-    
-    /// Run the adaptive bitrate control loop
-    pub async fn run(mut self) -> Result<()> {
-        info!("Adaptive bitrate controller started");
-        info!("  Bitrate range: {} - {} bps", self.config.min_bitrate, self.config.max_bitrate);
-        info!("  Target latency: {} ms", self.config.target_latency_ms);
-        info!("  Initial bitrate: {} bps", self.current_bitrate);
-        info!("  Waiting for metrics...");
-        
-        let mut interval = tokio::time::interval(self.config.adjustment_interval);
-        let mut last_metrics: Option<NetworkMetrics> = None;
-        let mut tick_count = 0u32;
-        
+
+    pub fn current_bitrate(&self) -> usize {
+        self.current_bitrate
+    }
+
+    fn in_cooldown(&self, now: Instant) -> bool {
+        self.last_decrease
+            .is_some_and(|last| now.duration_since(last) < self.config.decrease_cooldown)
+    }
+
+    /// Apply a keyframe-request (congestion) signal. Returns the new target
+    /// bitrate if it changed, or `None` if this was coalesced into an
+    /// already-active cooldown or the rate was already at the floor.
+    pub fn on_keyframe_requested(&mut self, now: Instant) -> Option<usize> {
+        if self.in_cooldown(now) {
+            return None;
+        }
+
+        let cut = (self.current_bitrate as f64 * self.config.decrease_factor) as usize;
+        let new_rate = cut.max(self.config.min_bitrate);
+
+        self.ssthresh = new_rate;
+        self.phase = Phase::CongestionAvoidance;
+        self.last_decrease = Some(now);
+
+        if new_rate != self.current_bitrate {
+            self.current_bitrate = new_rate;
+            Some(new_rate)
+        } else {
+            None
+        }
+    }
+
+    /// Record a client's self-reported decode latency.
+    pub fn on_latency_report(&mut self, latency_ms: f64) {
+        self.last_latency_ms = Some(latency_ms);
+    }
+
+    /// Periodic growth check. Returns the new target bitrate if it changed.
+    pub fn tick(&mut self, now: Instant) -> Option<usize> {
+        if self.in_cooldown(now) {
+            return None;
+        }
+        if self
+            .last_latency_ms
+            .is_some_and(|ms| ms > self.config.latency_ceiling_ms)
+        {
+            return None;
+        }
+
+        let proposed = match self.phase {
+            Phase::SlowStart => {
+                let grown = (self.current_bitrate as f64 * self.config.slow_start_factor) as usize;
+                grown.min(self.ssthresh)
+            }
+            Phase::CongestionAvoidance => self.current_bitrate + self.config.additive_increase,
+        };
+        let new_rate = proposed.min(self.config.max_bitrate);
+
+        if self.phase == Phase::SlowStart && new_rate >= self.ssthresh {
+            self.phase = Phase::CongestionAvoidance;
+        }
+
+        if new_rate != self.current_bitrate {
+            self.current_bitrate = new_rate;
+            Some(new_rate)
+        } else {
+            None
+        }
+    }
+}
+
+/// Async driver: owns the encoder control channel and the event channel fed
+/// by the signaling server, and turns `BitrateAlgorithm` decisions into
+/// `EncoderControl::ChangeBitrate` messages.
+pub struct AdaptiveBitrateController {
+    algo: BitrateAlgorithm,
+    adjustment_interval: Duration,
+    encoder_control_tx: mpsc::Sender<EncoderControl>,
+    event_rx: mpsc::Receiver<BitrateEvent>,
+}
+
+impl AdaptiveBitrateController {
+    pub fn new(
+        config: AdaptiveBitrateConfig,
+        encoder_control_tx: mpsc::Sender<EncoderControl>,
+        event_rx: mpsc::Receiver<BitrateEvent>,
+    ) -> Self {
+        let adjustment_interval = config.adjustment_interval;
+        Self {
+            algo: BitrateAlgorithm::new(config),
+            adjustment_interval,
+            encoder_control_tx,
+            event_rx,
+        }
+    }
+
+    pub async fn run(mut self) {
+        info!(
+            "Adaptive bitrate controller started: {}-{} bps, initial {} bps",
+            self.algo.config.min_bitrate, self.algo.config.max_bitrate, self.algo.current_bitrate
+        );
+
+        let mut interval = tokio::time::interval(self.adjustment_interval);
+
         loop {
             tokio::select! {
-                // Receive updated metrics
-                Some(metrics) = self.metrics_rx.recv() => {
-                    debug!("Received metrics: latency={} ms, queue_depth={}, dropped={}",
-                           metrics.estimated_latency_ms(), 
-                           metrics.encoder_queue_depth,
-                           metrics.dropped_frames);
-                    last_metrics = Some(metrics);
-                }
-                
-                // Periodic adjustment check
-                _ = interval.tick() => {
-                    tick_count += 1;
-                    if let Some(ref metrics) = last_metrics {
-                        if let Err(e) = self.adjust_bitrate(metrics).await {
-                            warn!("Failed to adjust bitrate: {}", e);
+                event = self.event_rx.recv() => {
+                    match event {
+                        Some(BitrateEvent::KeyframeRequested) => {
+                            if let Some(new_rate) = self.algo.on_keyframe_requested(Instant::now()) {
+                                self.apply(new_rate).await;
+                            }
                         }
-                    } else if tick_count % 10 == 0 {
-                        debug!("No metrics received yet (tick {})", tick_count);
+                        Some(BitrateEvent::Latency(ms)) => self.algo.on_latency_report(ms),
+                        None => break,
                     }
                 }
-                
-                else => break,
-            }
-        }
-        
-        info!("Adaptive bitrate controller stopped");
-        Ok(())
-    }
-    
-    /// Adjust bitrate based on current metrics
-    async fn adjust_bitrate(&mut self, metrics: &NetworkMetrics) -> Result<()> {
-        let now = Instant::now();
-        let time_since_adjustment = now.duration_since(self.last_adjustment);
-        
-        // Don't adjust too frequently
-        if time_since_adjustment < self.config.adjustment_interval {
-            return Ok(());
-        }
-        
-        let latency_ms = metrics.estimated_latency_ms();
-        let target_ms = self.config.target_latency_ms;
-        let threshold_ms = (target_ms as f64 * self.config.latency_threshold_factor) as u64;
-        
-        debug!("Bitrate check: current={} bps, latency={} ms (target={} ms, threshold={} ms)",
-               self.current_bitrate, latency_ms, target_ms, threshold_ms);
-        
-        let new_bitrate = if latency_ms > threshold_ms || metrics.has_congestion() {
-            // Latency is too high or we have congestion - decrease bitrate quickly
-            let decreased = (self.current_bitrate as f64 * self.config.decrease_factor) as usize;
-            let new_rate = decreased.max(self.config.min_bitrate);
-            
-            if new_rate < self.current_bitrate {
-                warn!("High latency detected ({} ms > {} ms) or congestion, dropping bitrate from {} to {} bps",
-                      latency_ms, threshold_ms, self.current_bitrate, new_rate);
-            }
-            
-            new_rate
-        } else if latency_ms < target_ms {
-            // Latency is good - slowly increase bitrate
-            let time_since_increase = now.duration_since(self.last_increase).as_secs_f64();
-            
-            // Only increase if we've been stable for a bit
-            if time_since_increase >= 1.0 {
-                let increase = (self.config.increase_rate as f64 * time_since_increase) as usize;
-                let increased = self.current_bitrate + increase;
-                let new_rate = increased.min(self.config.max_bitrate);
-                
-                if new_rate > self.current_bitrate {
-                    info!("Latency stable ({} ms < {} ms), increasing bitrate from {} to {} bps",
-                          latency_ms, target_ms, self.current_bitrate, new_rate);
-                    self.last_increase = now;
+                _ = interval.tick() => {
+                    match self.algo.tick(Instant::now()) {
+                        Some(new_rate) => self.apply(new_rate).await,
+                        None => debug!("Adaptive bitrate: holding at {} bps", self.algo.current_bitrate()),
+                    }
                 }
-                
-                new_rate
-            } else {
-                self.current_bitrate
             }
-        } else {
-            // Latency is between target and threshold - maintain current bitrate
-            self.current_bitrate
-        };
-        
-        // Apply bitrate change if needed
-        if new_bitrate != self.current_bitrate {
-            self.encoder_control_tx
-                .send(EncoderControl::ChangeBitrate(new_bitrate))
-                .await?;
-            
-            self.current_bitrate = new_bitrate;
-            self.last_adjustment = now;
         }
-        
-        Ok(())
-    }
-}
 
-/// Metrics collector that monitors encoder and network state
-#[derive(Clone)]
-pub struct MetricsCollector {
-    metrics_tx: mpsc::Sender<NetworkMetrics>,
-    update_interval: Duration,
-}
+        info!("Adaptive bitrate controller stopped");
+    }
 
-impl MetricsCollector {
-    /// Create a new metrics collector
-    pub fn new(metrics_tx: mpsc::Sender<NetworkMetrics>, update_interval: Duration) -> Self {
-        Self {
-            metrics_tx,
-            update_interval,
-        }
-    }
-    
-    /// Report current metrics
-    pub async fn report_metrics(&self, metrics: NetworkMetrics) -> Result<()> {
-        self.metrics_tx.send(metrics).await?;
-        Ok(())
-    }
-    
-    /// Get the update interval
-    pub fn update_interval(&self) -> Duration {
-        self.update_interval
+    async fn apply(&self, new_rate: usize) {
+        info!("Adaptive bitrate: -> {} bps", new_rate);
+        let _ = self
+            .encoder_control_tx
+            .send(EncoderControl::ChangeBitrate(new_rate))
+            .await;
     }
 }
