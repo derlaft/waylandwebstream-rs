@@ -60,6 +60,10 @@ export type ClientMessage =
       jitter_buffer_ms?: number;
       decoding_ms?: number;
       total_ms: number;
+      // Count of /stream frame arrivals within ~3ms of the previous one
+      // this window -- see VideoStream.flushDiagnostics and the server's
+      // SignalingMessage::Latency::burst_count doc.
+      burst_count?: number;
     };
 
 /// Messages the server pushes to the client over `/ws`.

@@ -85,6 +85,18 @@ export class VideoStream {
   // Sticky across reporting windows so a quiet window (no ping happened to
   // land) still shows the last real measurement instead of dropping to 0.
   private lastRttMs = 0;
+  // Sticky for the same reason as lastRttMs -- reported to the server
+  // alongside decode latency so it can detect network-level bufferbloat
+  // (bursty arrival with a shallow decode queue) that the decode-queue
+  // depth check above can't see on its own. Burst count, not arrival-gap
+  // p95: on an idle screen the server only sends a frame every
+  // `keyframe_interval` ticks (no damage to capture), so a long gap there
+  // is expected silence, not a stall -- p95 would false-positive on every
+  // idle period. A burst (several frames landing within ~3ms of each
+  // other) can only happen if frames actually piled up somewhere and got
+  // released together, which idle periods can't produce since there's
+  // nothing queued to release.
+  private lastBurstCount = 0;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(opts: VideoStreamOptions) {
@@ -264,6 +276,7 @@ export class VideoStream {
       // other -- much tighter than one frame interval, so it means a batch
       // was released all at once rather than delivered at a steady cadence.
       const burstCount = this.arrivalGapSamples.filter((g) => g < 3).length;
+      this.lastBurstCount = burstCount;
 
       reportArrivalStats({
         avgMs,
@@ -299,6 +312,7 @@ export class VideoStream {
       network_ms: this.lastRttMs,
       decoding_ms: decodeAvgMs,
       total_ms: totalMs,
+      burst_count: this.lastBurstCount,
     });
   }
 }

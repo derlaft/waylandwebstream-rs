@@ -42,6 +42,16 @@ use crate::encoder::EncoderControl;
 pub enum BitrateEvent {
     /// A client's decoder fell behind and asked for a keyframe resync.
     KeyframeRequested,
+    /// The client reported several frames landing within milliseconds of
+    /// each other (see `SignalingMessage::Latency::burst_count` in
+    /// src/server.rs) even though its decode queue never backs up. That
+    /// combination means the congestion is in the network path -- packets
+    /// queuing up somewhere between server and client and releasing all at
+    /// once -- not in the decoder, so `KeyframeRequested` (driven by
+    /// decode-queue depth) never fires for it. Cut exactly like a keyframe
+    /// request: from the algorithm's perspective both just mean "this rate
+    /// doesn't fit the path right now."
+    ArrivalStall,
     /// A client's self-reported average decode latency (ms) over its most
     /// recent reporting window.
     Latency(f64),
@@ -236,7 +246,7 @@ impl AdaptiveBitrateController {
             tokio::select! {
                 event = self.event_rx.recv() => {
                     match event {
-                        Some(BitrateEvent::KeyframeRequested) => {
+                        Some(BitrateEvent::KeyframeRequested) | Some(BitrateEvent::ArrivalStall) => {
                             if let Some(new_rate) = self.algo.on_keyframe_requested(Instant::now()) {
                                 self.apply(new_rate).await;
                             }

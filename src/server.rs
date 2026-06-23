@@ -28,6 +28,19 @@ use crate::input::touch::TouchEvent;
 use crate::latency::LatencyReport;
 use crate::web::{serve_asset, serve_index};
 
+/// Number of within-~3ms frame arrivals (see
+/// `SignalingMessage::Latency::burst_count`) in a single 5s reporting
+/// window above which we treat the stream as network-congested. Burst
+/// count, not arrival-gap latency, specifically because an idle screen only
+/// produces a frame every `keyframe_interval` ticks (nothing to capture
+/// otherwise) -- a long gap there is expected silence, not a stall, so a
+/// gap-based threshold false-positives on every idle period. A burst can
+/// only happen if frames actually piled up somewhere in transit and were
+/// released together; idle periods have nothing queued to release, so this
+/// is robust to them. A handful of incidental near-simultaneous arrivals
+/// can happen by chance, hence a small floor rather than firing on >=1.
+const ARRIVAL_STALL_BURST_THRESHOLD: u32 = 5;
+
 /// Signaling messages between client and server
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -68,6 +81,16 @@ pub enum SignalingMessage {
         #[serde(default)]
         decoding_ms: Option<f64>,
         total_ms: f64,
+        /// Count of `/stream` frame arrivals within ~3ms of the previous
+        /// one this window (see `VideoStream.flushDiagnostics` in
+        /// web/src/lib/stream.ts) -- several frames landing almost
+        /// simultaneously, which only happens if they piled up somewhere in
+        /// transit and got released together. Network-level congestion the
+        /// decode-queue-depth signal (`RequestKeyframe`, below) can't see,
+        /// since the decoder drains a burst faster than its queue can back
+        /// up.
+        #[serde(default)]
+        burst_count: u32,
     },
     /// Round-trip latency probe: echoed back on whichever `/stream` frame
     /// next leaves the encoder (see `encode_video_frame`'s `ping_echo_*`
@@ -306,7 +329,7 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                         // ping a couple seconds later picks it up instead.
                         let _ = state.pending_ping_tx.try_send(client_ts);
                     }
-                    SignalingMessage::Latency { encoding_ms, network_ms, jitter_buffer_ms, decoding_ms, total_ms } => {
+                    SignalingMessage::Latency { encoding_ms, network_ms, jitter_buffer_ms, decoding_ms, total_ms, burst_count } => {
                         info!(
                             "Received latency report from client: network {:.1}ms decode {:.1}ms total {:.1}ms",
                             network_ms.unwrap_or(0.0), decoding_ms.unwrap_or(0.0), total_ms
@@ -316,6 +339,19 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                         // rate is too high (see adaptive_bitrate.rs).
                         if let (Some(ref bitrate_event_tx), Some(ms)) = (&state.bitrate_event_tx, decoding_ms) {
                             let _ = bitrate_event_tx.send(BitrateEvent::Latency(ms)).await;
+                        }
+                        // Bursty arrival with a shallow decode queue is
+                        // network-level congestion the keyframe-request
+                        // signal can't see -- cut on it directly. See
+                        // `BitrateEvent::ArrivalStall`.
+                        if burst_count >= ARRIVAL_STALL_BURST_THRESHOLD {
+                            warn!(
+                                "Client reported {} bursty frame arrivals (>= {}) with no decode backlog -- treating as network congestion",
+                                burst_count, ARRIVAL_STALL_BURST_THRESHOLD
+                            );
+                            if let Some(ref bitrate_event_tx) = state.bitrate_event_tx {
+                                let _ = bitrate_event_tx.send(BitrateEvent::ArrivalStall).await;
+                            }
                         }
                         if let Some(ref latency_tx) = state.latency_tx {
                             let mut report = LatencyReport::new();
