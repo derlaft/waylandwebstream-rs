@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use waylandwebstream::adaptive_bitrate::{growth_should_apply, AdaptiveBitrateConfig, BitrateAlgorithm};
+use waylandwebstream::adaptive_bitrate::{AdaptiveBitrateConfig, BitrateAlgorithm};
 
 // All tests drive `BitrateAlgorithm` with synthetic `Instant`s computed from
 // a fixed base time rather than real sleeps, so they're deterministic and
@@ -18,7 +18,6 @@ fn config() -> AdaptiveBitrateConfig {
         additive_increase: 150_000,
         adjustment_interval: Duration::from_secs(1),
         latency_ceiling_ms: 150.0,
-        growth_apply_threshold_frac: 0.15,
     }
 }
 
@@ -125,29 +124,6 @@ fn keyframe_request_floors_at_min_bitrate() {
         now += Duration::from_secs(10);
     }
     assert_eq!(algo.current_bitrate(), 500_000);
-}
-
-#[test]
-fn growth_defers_encoder_push_below_threshold() {
-    // A single +150_000 additive step on top of a 2_000_000 last-applied
-    // rate is only 7.5% growth -- below the default 15% threshold, so it
-    // shouldn't be worth tearing down the encoder for yet.
-    assert!(!growth_should_apply(2_000_000, 2_150_000, 0.15, 12_000_000));
-}
-
-#[test]
-fn growth_applies_once_accumulated_past_threshold() {
-    // Same last-applied rate, but the internal target has now drifted far
-    // enough (>=15%) that it's worth the encoder reinit.
-    assert!(growth_should_apply(2_000_000, 2_310_000, 0.15, 12_000_000));
-}
-
-#[test]
-fn growth_always_applies_at_the_ceiling() {
-    // Even a tiny remaining step should still land once it reaches
-    // max_bitrate, so the encoder doesn't get stuck just under the ceiling
-    // forever waiting for one more threshold-sized step.
-    assert!(growth_should_apply(11_900_000, 12_000_000, 0.15, 12_000_000));
 }
 
 #[test]

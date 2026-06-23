@@ -76,18 +76,6 @@ pub struct AdaptiveBitrateConfig {
     /// Reported decode latency (ms) above which growth is held off even
     /// without a keyframe request.
     pub latency_ceiling_ms: f64,
-    /// Minimum fractional growth (relative to the last rate actually pushed
-    /// to the encoder) needed before a tick's growth is applied. Pushing a
-    /// bitrate change to the encoder means tearing down and recreating the
-    /// libx264 context (see `EncoderControl::ChangeBitrate` handling in
-    /// `src/encoder/mod.rs`), which forces a full-size I-frame -- fine for a
-    /// real congestion cut, but applying every single tick's small additive
-    /// step during growth means injecting an oversized I-frame roughly once
-    /// a second even when nothing is wrong. This batches growth so the
-    /// encoder is only touched once accumulated growth is big enough to be
-    /// worth the I-frame cost. Cuts (`on_keyframe_requested`) always apply
-    /// immediately regardless of this -- only growth is debounced.
-    pub growth_apply_threshold_frac: f64,
 }
 
 impl Default for AdaptiveBitrateConfig {
@@ -102,7 +90,6 @@ impl Default for AdaptiveBitrateConfig {
             additive_increase: 150_000,
             adjustment_interval: Duration::from_secs(1),
             latency_ceiling_ms: 150.0,
-            growth_apply_threshold_frac: 0.15,
         }
     }
 }
@@ -207,22 +194,6 @@ impl BitrateAlgorithm {
     }
 }
 
-/// Decides whether an accumulated growth step is big enough to push to the
-/// encoder yet, given the rate last actually applied there. Split out as a
-/// pure function (rather than inlined in the async `maybe_apply_growth`) so
-/// it's deterministically testable, same reasoning as `BitrateAlgorithm`
-/// above.
-pub fn growth_should_apply(
-    last_applied_bitrate: usize,
-    new_rate: usize,
-    threshold_frac: f64,
-    max_bitrate: usize,
-) -> bool {
-    let threshold = last_applied_bitrate as f64 * threshold_frac;
-    let delta = new_rate.saturating_sub(last_applied_bitrate) as f64;
-    delta >= threshold || new_rate >= max_bitrate
-}
-
 /// Async driver: owns the encoder control channel and the event channel fed
 /// by the signaling server, and turns `BitrateAlgorithm` decisions into
 /// `EncoderControl::ChangeBitrate` messages.
@@ -234,10 +205,6 @@ pub struct AdaptiveBitrateController {
     /// Surfaces the current target bitrate to `/ws` clients (see
     /// `SignalingState::bitrate_rx` in src/server.rs).
     bitrate_tx: watch::Sender<usize>,
-    /// Last rate actually pushed to the encoder. `algo.current_bitrate()`
-    /// can run ahead of this during growth -- see
-    /// `growth_apply_threshold_frac`.
-    last_applied_bitrate: usize,
 }
 
 impl AdaptiveBitrateController {
@@ -248,15 +215,12 @@ impl AdaptiveBitrateController {
         bitrate_tx: watch::Sender<usize>,
     ) -> Self {
         let adjustment_interval = config.adjustment_interval;
-        let algo = BitrateAlgorithm::new(config);
-        let last_applied_bitrate = algo.current_bitrate();
         Self {
-            algo,
+            algo: BitrateAlgorithm::new(config),
             adjustment_interval,
             encoder_control_tx,
             event_rx,
             bitrate_tx,
-            last_applied_bitrate,
         }
     }
 
@@ -273,11 +237,8 @@ impl AdaptiveBitrateController {
                 event = self.event_rx.recv() => {
                     match event {
                         Some(BitrateEvent::KeyframeRequested) => {
-                            // A real congestion signal -- always push to the
-                            // encoder immediately, no debouncing.
                             if let Some(new_rate) = self.algo.on_keyframe_requested(Instant::now()) {
                                 self.apply(new_rate).await;
-                                self.last_applied_bitrate = new_rate;
                             }
                         }
                         Some(BitrateEvent::Latency(ms)) => self.algo.on_latency_report(ms),
@@ -286,7 +247,7 @@ impl AdaptiveBitrateController {
                 }
                 _ = interval.tick() => {
                     match self.algo.tick(Instant::now()) {
-                        Some(new_rate) => self.maybe_apply_growth(new_rate).await,
+                        Some(new_rate) => self.apply(new_rate).await,
                         None => debug!("Adaptive bitrate: holding at {} bps", self.algo.current_bitrate()),
                     }
                 }
@@ -294,28 +255,6 @@ impl AdaptiveBitrateController {
         }
 
         info!("Adaptive bitrate controller stopped");
-    }
-
-    /// Applies a growth step only once it's accumulated enough to be worth
-    /// the encoder reinit it costs -- see `growth_apply_threshold_frac`.
-    /// Cuts bypass this entirely and call `apply` directly.
-    async fn maybe_apply_growth(&mut self, new_rate: usize) {
-        if growth_should_apply(
-            self.last_applied_bitrate,
-            new_rate,
-            self.algo.config.growth_apply_threshold_frac,
-            self.algo.config.max_bitrate,
-        ) {
-            self.apply(new_rate).await;
-            self.last_applied_bitrate = new_rate;
-        } else {
-            debug!(
-                "Adaptive bitrate: internal target now {} bps, deferring encoder update (+{} bps since last applied {} bps)",
-                new_rate,
-                new_rate.saturating_sub(self.last_applied_bitrate),
-                self.last_applied_bitrate
-            );
-        }
     }
 
     async fn apply(&self, new_rate: usize) {
