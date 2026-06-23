@@ -1,15 +1,16 @@
-// Computes the server-side render resolution from the viewport and DPR,
-// and keeps the canvas's CSS size in sync -- 1:1 device pixels, top-left
-// aligned, never CSS-upscaled/blurred. This is the fix for the old bug:
-// the previous client resized in CSS px with no DPR awareness, so the
-// canvas's CSS size ended up equal to its buffer size and got
-// flex-centered, creating edge dead zones and a blurry sub-DPR image.
+// Computes the server-side render resolution from the viewport, and keeps
+// the canvas's CSS size in sync, top-left aligned. Render resolution is in
+// CSS px, *not* multiplied by devicePixelRatio: capture/encode cost scales
+// with pixel count, and on a DPR=2 display matching device pixels would
+// mean encoding 4x the pixels for a sharpness gain that isn't worth the
+// CPU (a softer-than-native image on HiDPI is the accepted trade-off).
 import { writable } from 'svelte/store';
 import type { ClientMessage } from './protocol';
 
-/// Default `1`; a future `2` halves render resolution for hidpi perf (the
-/// deferred 2x client-side scale button). Exposed as a store so that
-/// button can flip it later without any other module changing.
+/// Default `1`; a future `2` halves render resolution further for
+/// low-power links (the deferred 2x client-side scale button). Exposed as
+/// a store so that button can flip it later without any other module
+/// changing.
 export const scaleFactor = writable(1);
 
 // Mirrors the CLI default in src/config.rs (`--max-resolution`, default
@@ -44,11 +45,10 @@ function getViewportCssSize(): { width: number; height: number } {
 }
 
 export function computeRenderResolution(scale: number): RenderResolution {
-  const dpr = window.devicePixelRatio || 1;
   const { width, height } = getViewportCssSize();
   return {
-    width: Math.min(floorToAlignment((width * dpr) / scale), MAX_RENDER_WIDTH),
-    height: Math.min(floorToAlignment((height * dpr) / scale), MAX_RENDER_HEIGHT),
+    width: Math.min(floorToAlignment(width / scale), MAX_RENDER_WIDTH),
+    height: Math.min(floorToAlignment(height / scale), MAX_RENDER_HEIGHT),
   };
 }
 
@@ -108,15 +108,14 @@ export class Viewport {
   };
 
   private update(): void {
-    const dpr = window.devicePixelRatio || 1;
     const render = computeRenderResolution(this.currentScale);
 
-    // Canvas CSS size = render * scaleFactor / dpr -- approximately the
-    // full viewport minus the sub-16px flooring remainder. Top-left
-    // alignment within the black full-viewport container is plain static
-    // CSS on Stage.svelte; this only ever sets width/height.
-    this.canvas.style.width = `${(render.width * this.currentScale) / dpr}px`;
-    this.canvas.style.height = `${(render.height * this.currentScale) / dpr}px`;
+    // Canvas CSS size = render * scaleFactor -- approximately the full
+    // viewport minus the sub-16px flooring remainder. Top-left alignment
+    // within the black full-viewport container is plain static CSS on
+    // Stage.svelte; this only ever sets width/height.
+    this.canvas.style.width = `${render.width * this.currentScale}px`;
+    this.canvas.style.height = `${render.height * this.currentScale}px`;
 
     if (this.lastSent && this.lastSent.width === render.width && this.lastSent.height === render.height) {
       return;
