@@ -7,7 +7,7 @@ use smithay::reexports::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{info, warn, Level};
+use tracing::{info, warn, debug, Level};
 use tracing_subscriber::FmtSubscriber;
 
 mod adaptive_bitrate;
@@ -278,7 +278,7 @@ async fn main() -> Result<()> {
         let mut stage_totals_ms = (0.0f64, 0.0f64, 0.0f64); // (capture_to_encode, encoding, encode_to_send)
         let mut stage_count = 0u32;
         let mut last_stage_log = std::time::Instant::now();
-        const STAGE_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        const STAGE_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
         while let Some(mut packet) = encoder_handle.recv_packet().await {
             // Drain to the *latest* pending ping, not just the next one in
@@ -302,7 +302,7 @@ async fn main() -> Result<()> {
             stage_count += 1;
 
             if last_stage_log.elapsed() >= STAGE_LOG_INTERVAL {
-                info!(
+                debug!(
                     "Server pipeline (avg over {} frames): capture→encode {:.1}ms, encoding {:.1}ms, encode→send {:.1}ms",
                     stage_count,
                     stage_totals_ms.0 / stage_count as f64,

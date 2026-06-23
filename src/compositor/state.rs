@@ -286,7 +286,7 @@ impl WaylandWebStreamState {
                             let buffer_offset = buffer_data.offset as isize;
                             
                             if frame_counter % 120 == 0 {
-                                info!("Rendering buffer: {}x{}", buffer_width, buffer_height);
+                                trace!("Rendering buffer: {}x{}", buffer_width, buffer_height);
                             }
 
                             // Access pixel data safely
