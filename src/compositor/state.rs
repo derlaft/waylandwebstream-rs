@@ -23,7 +23,7 @@ use smithay::{
             Display,
         },
     },
-    utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER},
+    utils::{Clock, Logical, Monotonic, Point, Rectangle, Transform, SERIAL_COUNTER},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -58,11 +58,12 @@ pub struct WaylandWebStreamState {
     // Clock for timing
     pub clock: Clock<Monotonic>,
 
-    // Set whenever something that affects the rendered picture changes
-    // (a surface commit, a window being mapped/unmapped, or a resize) and
-    // cleared by `take_dirty()`. Lets the main loop skip render()+encode()
-    // on frames where the screen provably hasn't changed.
-    dirty: bool,
+    // Accumulated logical-space damage since the last `take_dirty()`, unioned
+    // across every surface commit, window map/unmap, and resize that may
+    // have changed the rendered picture. `None` means provably nothing
+    // changed. Lets the main loop skip render()+encode() on frames where the
+    // screen provably hasn't changed.
+    damage: Option<Rectangle<i32, Logical>>,
 
     // Counts calls to `render()`, used to throttle its debug/trace logging.
     frame_counter: u32,
@@ -131,18 +132,75 @@ impl WaylandWebStreamState {
             width,
             height,
             clock: Clock::new(),
-            dirty: true,
+            damage: Some(Rectangle::new((0, 0).into(), (width as i32, height as i32).into())),
             frame_counter: 0,
         }
     }
 
     /// Returns whether the rendered picture may have changed since the last
-    /// call, and clears the flag. Conservative: a commit that re-attaches
-    /// pixel-identical content still counts as dirty, since detecting that
-    /// would require comparing buffer contents (the cost this is meant to
-    /// avoid).
+    /// call, and clears the accumulated damage. Conservative where real
+    /// per-surface damage can't be determined (e.g. a surface commit that
+    /// doesn't map to a positioned window): such commits mark the whole
+    /// output damaged rather than risk missing a real change.
     pub fn take_dirty(&mut self) -> bool {
-        std::mem::replace(&mut self.dirty, false)
+        self.damage.take().is_some()
+    }
+
+    /// Unions `rect` into the accumulated damage for the current frame.
+    fn add_damage(&mut self, rect: Rectangle<i32, Logical>) {
+        self.damage = Some(match self.damage {
+            Some(existing) => existing.merge(rect),
+            None => rect,
+        });
+    }
+
+    /// Returns the rectangle covering the entire output, in logical space.
+    fn full_output_damage(&self) -> Rectangle<i32, Logical> {
+        Rectangle::new((0, 0).into(), (self.width as i32, self.height as i32).into())
+    }
+
+    /// Computes the logical-space rectangle damaged by `surface`'s most
+    /// recent buffer commit, if it carried any new damage, and advances the
+    /// per-surface damage cursor so the same damage isn't reported twice.
+    /// `location` is the surface's position in output space. Returns `None`
+    /// if the commit carried no buffer (yet) or no new damage -- including a
+    /// commit that detaches a previously-attached buffer without destroying
+    /// the surface. That's indistinguishable here from "nothing to report"
+    /// and isn't a pattern any client this project targets uses; `toplevel_destroyed`
+    /// covers the actual window-going-away case with full-output damage.
+    fn surface_damage(
+        surface: &WlSurface,
+        location: Point<i32, Logical>,
+    ) -> Option<Rectangle<i32, Logical>> {
+        use smithay::backend::renderer::utils::{CommitCounter, RendererSurfaceStateUserData};
+        use smithay::wayland::compositor::with_states;
+        use std::cell::Cell;
+
+        with_states(surface, |states| {
+            let rstate = states.data_map.get::<RendererSurfaceStateUserData>()?.lock().unwrap();
+            let buffer_size = rstate.buffer_size()?;
+
+            let counter_cell = states.data_map.get_or_insert(Cell::<CommitCounter>::default);
+            let last_seen = counter_cell.get();
+            let buffer_damage = rstate.damage_since(Some(last_seen));
+            counter_cell.set(rstate.current_commit());
+
+            if buffer_damage.is_empty() {
+                return None;
+            }
+
+            if rstate.buffer_scale() == 1 && rstate.buffer_transform() == Transform::Normal {
+                let union = buffer_damage.iter().copied().reduce(|a, b| a.merge(b))?;
+                let buffer_dims = buffer_size.to_buffer(1, Transform::Normal);
+                let logical = union.to_logical(1, Transform::Normal, &buffer_dims);
+                Some(Rectangle::new(logical.loc + location, logical.size))
+            } else {
+                // Scaled/transformed buffers don't occur in practice in this
+                // headless compositor; fall back to the whole surface rather
+                // than risk getting the scale/transform math wrong.
+                Some(Rectangle::new(location, buffer_size))
+            }
+        })
     }
 
     pub fn resize_output(&mut self, width: u32, height: u32) {
@@ -157,7 +215,8 @@ impl WaylandWebStreamState {
         self.output.set_preferred(mode);
         self.width = width;
         self.height = height;
-        self.dirty = true;
+        let full_damage = self.full_output_damage();
+        self.add_damage(full_damage);
 
         // Tell every mapped client window about the new viewport size so it
         // redraws to fill the screen instead of staying at its old size.
@@ -534,7 +593,8 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
         #[allow(deprecated)]
         let window = Window::new(surface);
         self.space.map_element(window, (0, 0), false);
-        self.dirty = true;
+        let full_damage = self.full_output_damage();
+        self.add_damage(full_damage);
 
         info!("Window mapped to space. Total windows: {}", self.space.elements().count());
     }
@@ -550,7 +610,8 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
 
         if let Some(window) = window {
             self.space.unmap_elem(&window);
-            self.dirty = true;
+            let full_damage = self.full_output_damage();
+            self.add_damage(full_damage);
         }
 
         info!("Window unmapped from space. Total windows: {}", self.space.elements().count());
@@ -580,21 +641,35 @@ impl smithay::wayland::compositor::CompositorHandler for WaylandWebStreamState {
         use smithay::backend::renderer::utils::on_commit_buffer_handler;
         on_commit_buffer_handler::<Self>(surface);
 
-        // A commit may have attached new pixel content -- conservatively
-        // assume it did rather than comparing buffers, which would cost
-        // more than the render this is meant to let us skip.
-        self.dirty = true;
-
         // `Window::bbox()` is a cache that only `Window::on_commit()` refreshes;
         // without this, it stays at its initial (0,0) forever and `surface_at`'s
         // `.max(1)` fallback collapses every touch/pointer hit-test target to a
         // 1x1 box, regardless of where the client's buffer actually is.
-        if let Some(window) = self
+        let window = self
             .space
             .elements()
             .find(|w| w.wl_surface().map(|s| &*s == surface).unwrap_or(false))
-            .cloned()
-        {
+            .cloned();
+
+        match &window {
+            // Known, positioned window: compute the real damage this commit
+            // carried and union just that into the accumulator.
+            Some(window) => {
+                let location = self.space.element_location(window).unwrap_or((0, 0).into());
+                if let Some(rect) = Self::surface_damage(surface, location) {
+                    self.add_damage(rect);
+                }
+            }
+            // A surface we don't have a position for (e.g. not yet mapped) --
+            // conservatively mark the whole output dirty rather than risk
+            // missing a real change.
+            None => {
+                let full_damage = self.full_output_damage();
+                self.add_damage(full_damage);
+            }
+        }
+
+        if let Some(window) = window {
             window.on_commit();
             trace!("Window surface committed");
         }
