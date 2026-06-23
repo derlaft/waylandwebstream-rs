@@ -53,6 +53,16 @@
         let keyframeSeen = false;
         let canvasSized = false;
 
+        const DECODER_CONFIG = { codec: 'avc1.42E01F', optimizeForLatency: true };
+
+        // VideoDecoder's internal decode queue has no cap of its own: if
+        // frames arrive faster than they can be decoded (bursty/slow remote
+        // network, decode contention), decode() backlog grows without bound
+        // and every queued frame's reported latency climbs forever. Mirror
+        // the server's "skip to newest, resync on next keyframe" policy
+        // (src/webrtc/signaling.rs) on the client side too.
+        const MAX_DECODE_QUEUE = 2;
+
         function setStatus(text, className) {
             status.textContent = text;
             status.className = className;
@@ -71,10 +81,7 @@
             // Annex-B with SPS/PPS repeated inline on every keyframe
             // (`repeat_headers=1`). Default hardwareAcceleration (not
             // "prefer-software") since baseline 4:2:0 decodes fine on phones.
-            decoder.configure({
-                codec: 'avc1.42E01F',
-                optimizeForLatency: true,
-            });
+            decoder.configure(DECODER_CONFIG);
         }
 
         function handleFrame(frame) {
@@ -96,6 +103,22 @@
             const buf = event.data;
             const view = new DataView(buf);
             const isKey = view.getUint8(0) === 1;
+
+            if (decoder.decodeQueueSize > MAX_DECODE_QUEUE) {
+                if (!isKey) {
+                    // Already backlogged -- drop this delta rather than add
+                    // to the queue, and wait for the next keyframe to resync.
+                    keyframeSeen = false;
+                    return;
+                }
+                // A keyframe arrived while backlogged: stale frames already
+                // queued would otherwise still be decoded first, so flush
+                // the decoder to catch up immediately instead of working
+                // through them.
+                decoder.reset();
+                decoder.configure(DECODER_CONFIG);
+            }
+
             const data = new Uint8Array(buf, 5);
 
             // A delta frame decoded without a preceding keyframe has no
