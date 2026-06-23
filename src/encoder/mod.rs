@@ -126,10 +126,15 @@ impl EncoderHandle {
 /// codec string (see `h264_codec_string`) whenever a resolution change makes
 /// the encoder pick a different H.264 level, so callers can forward it to
 /// connected clients.
+///
+/// The returned `JoinHandle` lets a caller wait for the thread to actually
+/// exit during shutdown (it terminates once every `RawFrame` sender --
+/// `EncoderHandle::frame_tx` and any clones -- has been dropped) instead of
+/// leaving it to be torn down whenever the process happens to exit.
 pub fn spawn_encoder(
     config: EncoderConfig,
     codec_tx: watch::Sender<String>,
-) -> Result<(EncoderHandle, BufferReturnReceiver)> {
+) -> Result<(EncoderHandle, BufferReturnReceiver, std::thread::JoinHandle<()>)> {
     // Initialize FFmpeg
     ffmpeg::init().context("Failed to initialize FFmpeg")?;
 
@@ -140,7 +145,7 @@ pub fn spawn_encoder(
     let (buffer_return_tx, buffer_return_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
     // Spawn encoder thread
-    std::thread::spawn(move || {
+    let join_handle = std::thread::spawn(move || {
         if let Err(e) = encoder_thread(config, frame_rx, packet_tx, resize_rx, control_rx, buffer_return_tx, codec_tx) {
             error!("Encoder thread failed: {}", e);
         }
@@ -154,6 +159,7 @@ pub fn spawn_encoder(
             control_tx,
         },
         buffer_return_rx,
+        join_handle,
     ))
 }
 
@@ -639,7 +645,7 @@ mod tests {
             keyframe_interval: 1000,
         };
         let (codec_tx, _codec_rx) = watch::channel(String::new());
-        let (mut handle, _buffer_return_rx) =
+        let (mut handle, _buffer_return_rx, _join_handle) =
             spawn_encoder(config.clone(), codec_tx).expect("failed to spawn encoder");
 
         let frame_tx = handle.get_frame_sender();

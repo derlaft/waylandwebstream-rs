@@ -95,7 +95,14 @@ fn main() {
     // that budget and made the integration test flaky under load.
     let start = std::time::Instant::now();
     while state.running && start.elapsed().as_secs() < 30 {
-        event_queue.blocking_dispatch(&mut state).unwrap();
+        // A graceful compositor shutdown closes our connection cleanly --
+        // treat that the same as `running` going false rather than
+        // panicking, so stopping the compositor while this client is
+        // attached doesn't look like a test client crash.
+        if let Err(e) = event_queue.blocking_dispatch(&mut state) {
+            println!("Wayland connection closed ({e}), exiting");
+            break;
+        }
     }
     
     println!("Test client exiting");

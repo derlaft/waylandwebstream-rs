@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade},
         State,
     },
     response::Response,
@@ -128,6 +128,12 @@ pub struct SignalingState {
     /// resolution change picks a different H.264 level. Each `/ws`
     /// connection gets its own clone to push `ServerMessage::Codec` updates.
     codec_rx: watch::Receiver<String>,
+    /// Flips to `true` when the process is shutting down. Each connection
+    /// handler clones this and races it against its normal work so it can
+    /// send a proper WebSocket close frame and return -- letting
+    /// `axum::serve`'s graceful shutdown actually complete -- instead of
+    /// only ending when the client happens to disconnect on its own.
+    shutdown_rx: watch::Receiver<bool>,
 }
 
 impl SignalingState {
@@ -142,6 +148,7 @@ impl SignalingState {
         pending_ping_tx: mpsc::Sender<f64>,
         bitrate_rx: watch::Receiver<usize>,
         codec_rx: watch::Receiver<String>,
+        shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
         let (video_tx, _) = broadcast::channel(3);
         Self {
@@ -156,6 +163,7 @@ impl SignalingState {
             pending_ping_tx,
             bitrate_rx,
             codec_rx,
+            shutdown_rx,
         }
     }
 
@@ -184,7 +192,18 @@ impl SignalingServer {
         Self { router }
     }
 
-    pub async fn serve(self, listen_addr: &str, port: u16) -> Result<()> {
+    /// Serves until `shutdown` resolves, at which point the listener stops
+    /// accepting new connections and this only returns once every
+    /// in-flight handler has returned -- each of which races its own work
+    /// against the same shutdown signal (via `SignalingState::shutdown_rx`)
+    /// so that actually happens promptly instead of waiting on clients to
+    /// disconnect on their own.
+    pub async fn serve(
+        self,
+        listen_addr: &str,
+        port: u16,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
         let addr = format!("{}:{}", listen_addr, port);
         info!("Starting signaling server on {}", addr);
 
@@ -193,6 +212,7 @@ impl SignalingServer {
             .context("Failed to bind signaling server")?;
 
         axum::serve(listener, self.router)
+            .with_graceful_shutdown(shutdown)
             .await
             .context("Signaling server error")
     }
@@ -211,6 +231,7 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
     let (mut sender, mut receiver) = socket.split();
     let mut bitrate_rx = state.bitrate_rx.clone();
     let mut codec_rx = state.codec_rx.clone();
+    let mut shutdown_rx = state.shutdown_rx.clone();
 
     // Push the current bitrate right away -- otherwise a client connecting
     // between adaptive-bitrate adjustments would see nothing until the next
@@ -316,6 +337,13 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                     break;
                 }
             }
+            _ = shutdown_rx.changed() => {
+                let _ = sender.send(Message::Close(Some(CloseFrame {
+                    code: close_code::AWAY,
+                    reason: "server shutting down".into(),
+                }))).await;
+                break;
+            }
         }
     }
 }
@@ -376,6 +404,7 @@ async fn video_stream_handler(socket: WebSocket, state: SignalingState) {
     info!("Video stream client connected");
     let (mut sender, _receiver) = socket.split();
     let mut video_rx = state.get_video_sender().subscribe();
+    let mut shutdown_rx = state.shutdown_rx.clone();
 
     // Request a fresh keyframe and force a render right away -- otherwise
     // this client has no decodable frame to start from until the screen
@@ -386,18 +415,29 @@ async fn video_stream_handler(socket: WebSocket, state: SignalingState) {
     }
 
     loop {
-        let packet = match video_rx.recv().await {
-            Ok(packet) => packet,
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                warn!("Video stream client lagging, skipped {} frame(s)", skipped);
-                continue;
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
-        };
+        tokio::select! {
+            packet = video_rx.recv() => {
+                let packet = match packet {
+                    Ok(packet) => packet,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!("Video stream client lagging, skipped {} frame(s)", skipped);
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
 
-        let frame = encode_video_frame(&packet);
-        if sender.send(Message::Binary(frame)).await.is_err() {
-            break;
+                let frame = encode_video_frame(&packet);
+                if sender.send(Message::Binary(frame)).await.is_err() {
+                    break;
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                let _ = sender.send(Message::Close(Some(CloseFrame {
+                    code: close_code::AWAY,
+                    reason: "server shutting down".into(),
+                }))).await;
+                break;
+            }
         }
     }
 
@@ -470,6 +510,7 @@ mod tests {
         let (pending_ping_tx, _pending_ping_rx) = mpsc::channel(4);
         let (_bitrate_tx, bitrate_rx) = watch::channel(2_000_000usize);
         let (_codec_tx, codec_rx) = watch::channel(String::new());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let force_render = Arc::new(AtomicBool::new(false));
 
         let state = SignalingState::new(
@@ -483,13 +524,14 @@ mod tests {
             pending_ping_tx,
             bitrate_rx,
             codec_rx,
+            shutdown_rx,
         );
         let video_tx = state.get_video_sender();
         let server = SignalingServer::new(state);
 
         let addr = "127.0.0.1:27345";
         tokio::spawn(async move {
-            server.serve("127.0.0.1", 27345).await.unwrap();
+            server.serve("127.0.0.1", 27345, std::future::pending()).await.unwrap();
         });
 
         // Give the server a moment to start accepting connections, and the

@@ -39,6 +39,36 @@ async fn main() -> Result<()> {
     info!("Starting WaylandWebStream");
     info!("Configuration: {:?}", config);
 
+    // Flips to `true` on Ctrl+C/SIGTERM. Polled (lock-free, via `borrow()`)
+    // at the top of the synchronous render loop below, and cloned into
+    // every async consumer that needs to race its own work against
+    // shutdown -- the WS/video connection handlers (so they send a clean
+    // close frame instead of just vanishing) and the packet-forwarding
+    // task (so it releases its `EncoderHandle` instead of running forever).
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let ctrl_c = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl+C handler");
+        };
+        #[cfg(unix)]
+        let terminate = async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler")
+                .recv()
+                .await;
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => info!("Received Ctrl+C, shutting down gracefully..."),
+            _ = terminate => info!("Received SIGTERM, shutting down gracefully..."),
+        }
+        let _ = shutdown_tx.send(true);
+    });
+
     // Parse initial resolution
     let (width, height) = config.get_initial_resolution()?;
     info!("Initial resolution: {}x{}", width, height);
@@ -113,7 +143,7 @@ async fn main() -> Result<()> {
     // see `encoder::h264_codec_string`.
     let (codec_tx, codec_rx) = tokio::sync::watch::channel(encoder::h264_codec_string(width, height, config.framerate));
 
-    let (encoder, buffer_return_rx) = spawn_encoder(encoder_config, codec_tx)?;
+    let (encoder, buffer_return_rx, encoder_join_handle) = spawn_encoder(encoder_config, codec_tx)?;
 
     // Create channels for the server
     let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32)>(4);
@@ -259,15 +289,24 @@ async fn main() -> Result<()> {
         pending_ping_tx,
         bitrate_rx,
         codec_rx,
+        shutdown_rx.clone(),
     );
     let video_tx = signaling_state.get_video_sender();
     let signaling_server = SignalingServer::new(signaling_state);
 
-    // Spawn the signaling server
+    // Spawn the signaling server. Its graceful-shutdown future resolves as
+    // soon as `shutdown_rx` flips, which stops `axum::serve` from accepting
+    // new connections; the join handle is awaited during the shutdown
+    // sequence below so this task is known to have actually finished
+    // (every handler returned) before the process exits.
     let listen_addr = config.listen_addr.clone();
     let port = config.port;
-    tokio::spawn(async move {
-        if let Err(e) = signaling_server.serve(&listen_addr, port).await {
+    let mut server_shutdown_rx = shutdown_rx.clone();
+    let server_join_handle = tokio::spawn(async move {
+        let shutdown = async move {
+            let _ = server_shutdown_rx.changed().await;
+        };
+        if let Err(e) = signaling_server.serve(&listen_addr, port, shutdown).await {
             tracing::error!("Signaling server error: {}", e);
         }
     });
@@ -279,14 +318,26 @@ async fn main() -> Result<()> {
     // legs of the latency pipeline (capture→encode, encoding, encode→send)
     // get aggregated and logged -- these don't need synchronized clocks
     // since they're plain `Instant` deltas on this side only.
-    tokio::spawn(async move {
+    let mut forward_shutdown_rx = shutdown_rx.clone();
+    let forward_join_handle = tokio::spawn(async move {
         let mut encoder_handle = encoder;
         let mut stage_totals_ms = (0.0f64, 0.0f64, 0.0f64); // (capture_to_encode, encoding, encode_to_send)
         let mut stage_count = 0u32;
         let mut last_stage_log = std::time::Instant::now();
         const STAGE_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
-        while let Some(mut packet) = encoder_handle.recv_packet().await {
+        loop {
+            let mut packet = tokio::select! {
+                packet = encoder_handle.recv_packet() => match packet {
+                    Some(packet) => packet,
+                    None => break,
+                },
+                // Drop `encoder_handle` (ending this task's `RawFrame` sender
+                // clone) instead of forwarding forever -- the encoder thread
+                // exits once every clone is gone, which the shutdown
+                // sequence in `main` waits on via `encoder_join_handle`.
+                _ = forward_shutdown_rx.changed() => break,
+            };
             // Drain to the *latest* pending ping, not just the next one in
             // the queue: frames are only forced out every `keyframe_interval`
             // ticks when the screen is idle, so pings (sent every second)
@@ -353,6 +404,11 @@ async fn main() -> Result<()> {
     let mut dropped_frames = 0u64;
 
     loop {
+        if *shutdown_rx.borrow() {
+            info!("Shutdown signal received, stopping compositor render loop");
+            break;
+        }
+
         let loop_start = std::time::Instant::now();
 
         // Check for resize requests (non-blocking)
@@ -474,4 +530,47 @@ async fn main() -> Result<()> {
                 .context("Failed to flush Wayland clients")?;
         }
     }
+
+    // --- Graceful shutdown ---
+    //
+    // Order matters: the render loop above has already stopped producing
+    // new frames and dispatching new Wayland protocol traffic. From here:
+    // let already-connected Wayland clients see a clean disconnect, then
+    // unwind the encoder, then the HTTP/WebSocket server -- each step
+    // bounded by a timeout so one stuck client can't hang shutdown forever.
+    info!("Shutting down...");
+    const SHUTDOWN_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    // Wayland: one last flush so clients get any events already queued for
+    // them, then drop the display and event loop. This closes every client
+    // connection and removes the listening socket + lock file (see
+    // `ListeningSocket`'s `Drop` impl).
+    let _ = display.flush_clients();
+    drop(display);
+    drop(event_loop);
+
+    // Encoder: drop this loop's `RawFrame` sender so that, combined with the
+    // packet-forwarding task below dropping its own clone, the encoder
+    // thread's `frame_rx.blocking_recv()` sees every sender gone and exits.
+    drop(frame_sender);
+
+    if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, forward_join_handle).await.is_err() {
+        warn!("Timed out waiting for the encoder forwarding task to finish");
+    }
+
+    let encoder_thread_done = tokio::task::spawn_blocking(move || encoder_join_handle.join());
+    if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, encoder_thread_done).await.is_err() {
+        warn!("Timed out waiting for the encoder thread to finish");
+    }
+
+    // HTTP/WebSocket server: every connection handler races its own work
+    // against `shutdown_rx` (see src/server.rs), so this resolves once
+    // they've all sent a close frame and returned, rather than waiting on
+    // clients to disconnect on their own.
+    if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, server_join_handle).await.is_err() {
+        warn!("Timed out waiting for the signaling server to finish");
+    }
+
+    info!("Graceful shutdown complete");
+    Ok(())
 }
