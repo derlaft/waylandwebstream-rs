@@ -1,20 +1,22 @@
 // Owns the `/ws` control channel: connect, queue sends until OPEN, send
-// `{type:"ready"}` on open. Pulled forward from its nominal Phase 5 slot
-// because Stage.svelte (Phase 4) needs a `sendControl` to hand to
-// stream.ts/viewport.ts/input.ts -- the rest of Phase 5 (pushing connection
-// state into stats.ts, auto-reconnect) is still deferred.
+// `{type:"ready"}` on open, and reflect connection state into stats.ts for
+// StatsPanel.svelte. Auto-reconnect is still deferred -- a `closed`/`error`
+// state here is terminal until the page is reloaded.
 import type { ClientMessage } from './protocol';
+import { setConnectionState } from './stats';
 
 export class ControlChannel {
   private ws: WebSocket | null = null;
   private sendQueue: string[] = [];
 
   connect(): void {
+    setConnectionState('connecting');
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${wsProtocol}//${window.location.host}/ws`;
 
     const ws = new WebSocket(url);
     ws.onopen = () => {
+      setConnectionState('open');
       this.send({ type: 'ready' });
       const queued = this.sendQueue;
       this.sendQueue = [];
@@ -22,7 +24,11 @@ export class ControlChannel {
         ws.send(json);
       }
     };
-    ws.onerror = (e) => console.error('Control WebSocket error:', e);
+    ws.onerror = (e) => {
+      setConnectionState('error');
+      console.error('Control WebSocket error:', e);
+    };
+    ws.onclose = () => setConnectionState('closed');
     this.ws = ws;
   }
 

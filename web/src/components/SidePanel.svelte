@@ -1,0 +1,112 @@
+<script lang="ts">
+  import { onMount } from 'svelte';
+  import FullscreenButton from './FullscreenButton.svelte';
+  import StatsPanel from './StatsPanel.svelte';
+
+  interface Props {
+    fullscreenTarget: () => HTMLElement | null;
+  }
+  let { fullscreenTarget }: Props = $props();
+
+  let open = $state(false);
+  let panelEl: HTMLDivElement | undefined = $state();
+  let tabEl: HTMLButtonElement | undefined = $state();
+
+  function close(): void {
+    if (!open) return;
+    open = false;
+    tabEl?.focus();
+  }
+
+  function toggle(): void {
+    open = !open;
+  }
+
+  // Capture-phase so this runs before canvas input handlers (input.ts) --
+  // an outside tap while the panel is open should only dismiss the panel,
+  // not also act as a real pointer input forwarded to the remote desktop.
+  function onPointerDownCapture(e: PointerEvent): void {
+    if (open && panelEl && !panelEl.contains(e.target as Node)) {
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+    }
+  }
+
+  function onKeydown(e: KeyboardEvent): void {
+    if (e.key === 'Escape') close();
+  }
+
+  onMount(() => {
+    window.addEventListener('pointerdown', onPointerDownCapture, true);
+    window.addEventListener('keydown', onKeydown);
+    return () => {
+      window.removeEventListener('pointerdown', onPointerDownCapture, true);
+      window.removeEventListener('keydown', onKeydown);
+    };
+  });
+</script>
+
+<div class="panel" class:open bind:this={panelEl}>
+  <button
+    class="tab"
+    type="button"
+    bind:this={tabEl}
+    aria-expanded={open}
+    aria-controls="side-panel-content"
+    aria-label={open ? 'Close settings panel' : 'Open settings panel'}
+    onclick={toggle}
+  >
+    {open ? '›' : '‹'}
+  </button>
+  <div class="content" id="side-panel-content" inert={!open}>
+    <FullscreenButton {fullscreenTarget} />
+    <StatsPanel />
+  </div>
+</div>
+
+<style>
+  .panel {
+    position: fixed;
+    top: 0;
+    right: 0;
+    height: 100%;
+    width: 280px;
+    z-index: 10;
+    display: flex;
+    align-items: flex-start;
+    transform: translateX(calc(100% - 32px));
+    transition: transform 0.2s ease-out;
+  }
+
+  .panel.open {
+    transform: translateX(0);
+  }
+
+  .tab {
+    flex: 0 0 32px;
+    width: 32px;
+    height: 48px;
+    margin-top: 16px;
+    border: none;
+    border-radius: 6px 0 0 6px;
+    background: rgba(0, 0, 0, 0.6);
+    color: #fff;
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .content {
+    flex: 1 1 auto;
+    height: 100%;
+    box-sizing: border-box;
+    padding: 16px 12px;
+    background: rgba(20, 20, 20, 0.92);
+    color: #fff;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+</style>

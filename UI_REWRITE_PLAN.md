@@ -240,19 +240,19 @@ Carry over current handlers; normalize against the **live** canvas
   parallelism can spuriously fail them (pre-existing, unrelated to this
   phase).
 
-## 8. Phase 5 — Control channel, side panel, fullscreen, stats
+## 8. Phase 5 — Control channel, side panel, fullscreen, stats ✅ done
 
-- [ ] `lib/control.ts`: `/ws` connect, send-queue buffering until OPEN (carry over),
+- [x] `lib/control.ts`: `/ws` connect, send-queue buffering until OPEN (carry over),
       `{type:"ready"}` on open, push connection state into `stats.ts`. Keep
       teardown on `beforeunload`. (Auto-reconnect is **future** — leave a clean seam.)
-- [ ] `SidePanel.svelte`: collapsed by default, edge tab handle (noVNC style), slides
+- [x] `SidePanel.svelte`: collapsed by default, edge tab handle (noVNC style), slides
       in as an overlay on mobile (doesn't reflow/resize the canvas → no input shift),
       closes on outside tap / Esc. Accessible (button roles, focus, aria-expanded).
-- [ ] `FullscreenButton.svelte`: Fullscreen API on the app container; reflect state.
+- [x] `FullscreenButton.svelte`: Fullscreen API on the app container; reflect state.
       **Document the iOS caveat**: iPhone Safari has no element Fullscreen API — the
       button is best-effort there; mitigate via a web app manifest
       (`display: standalone`) for add-to-home-screen. iPad/Android/desktop work.
-- [ ] `StatsPanel.svelte`: render from the `stats.ts` store — connection state,
+- [x] `StatsPanel.svelte`: render from the `stats.ts` store — connection state,
       decode latency (ms), current render resolution, arrival-gap p95/max + burst
       count, max decode queue. Cheap, updates on the existing 5s cadence.
 
