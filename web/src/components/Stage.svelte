@@ -29,7 +29,7 @@
   }
 
   onMount(() => {
-    control = new ControlChannel();
+    control = new ControlChannel({ onCodec: (codec) => stream?.setCodec(codec) });
     control.connect();
 
     stream = new VideoStream({ canvas, sendControl });

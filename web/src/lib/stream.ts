@@ -60,6 +60,9 @@ export class VideoStream {
 
   private ws: WebSocket | null = null;
   private decoder: VideoDecoder | null = null;
+  // Updated via `setCodec` when the server reports a new H.264 level (e.g.
+  // after a resolution change); DECODER_CONFIG is just the startup default.
+  private codecConfig: VideoDecoderConfig = DECODER_CONFIG;
 
   // Drop deltas until the first keyframe is fed: a delta decoded without a
   // preceding keyframe has no reference picture to diff against.
@@ -121,9 +124,41 @@ export class VideoStream {
   private setupDecoder(): void {
     this.decoder = new VideoDecoder({
       output: (frame) => this.handleFrame(frame),
-      error: (e) => console.error('Decoder error:', e),
+      error: (e) => {
+        console.error('Decoder error:', e);
+        this.recoverDecoder();
+      },
     });
-    this.decoder.configure(DECODER_CONFIG);
+    this.decoder.configure(this.codecConfig);
+  }
+
+  /// Per the WebCodecs spec, a decoder that reports an error transitions to
+  /// 'closed' permanently -- reset()/configure() on it would throw. The only
+  /// way back is a brand-new VideoDecoder instance, then resync from the
+  /// next keyframe since whatever reference state the old one had is gone.
+  private recoverDecoder(): void {
+    this.setupDecoder();
+    this.keyframeSeen = false;
+    this.requestKeyframe();
+  }
+
+  /// Called when the server reports a new WebCodecs codec string (see
+  /// ServerMessage), e.g. because a resolution change picked a different
+  /// H.264 level. Unlike `recoverDecoder`, the decoder here is still healthy,
+  /// so reset()+configure() (the same pattern already used below for
+  /// backlog flushes) is enough -- no need to replace the instance.
+  setCodec(codec: string): void {
+    if (this.codecConfig.codec === codec) return;
+    this.codecConfig = { ...this.codecConfig, codec };
+    if (this.decoder && this.decoder.state !== 'closed') {
+      this.decoder.reset();
+      this.decoder.configure(this.codecConfig);
+    }
+    // The server emits a fresh IDR with the new SPS right after switching
+    // levels, but `/ws` (this message) and `/stream` (the frame) are
+    // independent sockets -- request one explicitly rather than racing it.
+    this.keyframeSeen = false;
+    this.requestKeyframe();
   }
 
   private handleFrame(frame: VideoFrame): void {
@@ -189,7 +224,7 @@ export class VideoStream {
       // catches up immediately instead of working through stale frames
       // already queued.
       decoder.reset();
-      decoder.configure(DECODER_CONFIG);
+      decoder.configure(this.codecConfig);
     }
 
     const data = new Uint8Array(buf, STREAM_FRAME_HEADER_BYTES);
@@ -214,6 +249,7 @@ export class VideoStream {
       decoder.decode(chunk);
     } catch (e) {
       console.error('Decode error:', e);
+      this.recoverDecoder();
     }
   }
 

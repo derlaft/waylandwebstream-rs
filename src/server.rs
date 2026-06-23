@@ -77,6 +77,12 @@ pub enum SignalingMessage {
 pub enum ServerMessage {
     #[serde(rename = "bitrate")]
     Bitrate { bps: usize },
+    /// WebCodecs codec string (profile/level) for the client's
+    /// `VideoDecoder.configure()`. Pushed on connect and again whenever a
+    /// resolution change makes the encoder pick a different H.264 level --
+    /// see `encoder::h264_codec_string`.
+    #[serde(rename = "codec")]
+    Codec { codec: String },
 }
 
 /// Shared state for the server
@@ -118,6 +124,10 @@ pub struct SignalingState {
     /// `/ws` connection gets its own clone to push `ServerMessage::Bitrate`
     /// updates to that client.
     bitrate_rx: watch::Receiver<usize>,
+    /// Current WebCodecs codec string, updated by the encoder thread when a
+    /// resolution change picks a different H.264 level. Each `/ws`
+    /// connection gets its own clone to push `ServerMessage::Codec` updates.
+    codec_rx: watch::Receiver<String>,
 }
 
 impl SignalingState {
@@ -131,6 +141,7 @@ impl SignalingState {
         force_render: Arc<AtomicBool>,
         pending_ping_tx: mpsc::Sender<f64>,
         bitrate_rx: watch::Receiver<usize>,
+        codec_rx: watch::Receiver<String>,
     ) -> Self {
         let (video_tx, _) = broadcast::channel(3);
         Self {
@@ -144,6 +155,7 @@ impl SignalingState {
             force_render,
             pending_ping_tx,
             bitrate_rx,
+            codec_rx,
         }
     }
 
@@ -198,12 +210,22 @@ async fn handle_websocket(
 async fn websocket_handler(socket: WebSocket, state: SignalingState) {
     let (mut sender, mut receiver) = socket.split();
     let mut bitrate_rx = state.bitrate_rx.clone();
+    let mut codec_rx = state.codec_rx.clone();
 
     // Push the current bitrate right away -- otherwise a client connecting
     // between adaptive-bitrate adjustments would see nothing until the next
     // change, which on a settled stream might be a long time off.
     let initial_bitrate = *bitrate_rx.borrow();
     if send_server_message(&mut sender, &ServerMessage::Bitrate { bps: initial_bitrate }).await.is_err() {
+        return;
+    }
+
+    // Same idea for the codec string: a client connecting after the
+    // encoder has already settled on a non-default level (e.g. after a
+    // resolution change before this client connected) needs that level up
+    // front, not just on the next change.
+    let initial_codec = codec_rx.borrow().clone();
+    if send_server_message(&mut sender, &ServerMessage::Codec { codec: initial_codec }).await.is_err() {
         return;
     }
 
@@ -281,6 +303,16 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                 }
                 let bps = *bitrate_rx.borrow();
                 if send_server_message(&mut sender, &ServerMessage::Bitrate { bps }).await.is_err() {
+                    break;
+                }
+            }
+            changed = codec_rx.changed() => {
+                if changed.is_err() {
+                    // Sender side (encoder thread) dropped; codec just won't update further.
+                    continue;
+                }
+                let codec = codec_rx.borrow().clone();
+                if send_server_message(&mut sender, &ServerMessage::Codec { codec }).await.is_err() {
                     break;
                 }
             }
@@ -437,6 +469,7 @@ mod tests {
         let (encoder_control_tx, mut encoder_control_rx) = mpsc::channel(4);
         let (pending_ping_tx, _pending_ping_rx) = mpsc::channel(4);
         let (_bitrate_tx, bitrate_rx) = watch::channel(2_000_000usize);
+        let (_codec_tx, codec_rx) = watch::channel(String::new());
         let force_render = Arc::new(AtomicBool::new(false));
 
         let state = SignalingState::new(
@@ -449,6 +482,7 @@ mod tests {
             force_render.clone(),
             pending_ping_tx,
             bitrate_rx,
+            codec_rx,
         );
         let video_tx = state.get_video_sender();
         let server = SignalingServer::new(state);

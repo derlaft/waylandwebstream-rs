@@ -122,8 +122,14 @@ impl EncoderHandle {
     }
 }
 
-/// Spawn the encoder thread
-pub fn spawn_encoder(config: EncoderConfig) -> Result<(EncoderHandle, BufferReturnReceiver)> {
+/// Spawn the encoder thread. `codec_tx` is updated with a fresh WebCodecs
+/// codec string (see `h264_codec_string`) whenever a resolution change makes
+/// the encoder pick a different H.264 level, so callers can forward it to
+/// connected clients.
+pub fn spawn_encoder(
+    config: EncoderConfig,
+    codec_tx: watch::Sender<String>,
+) -> Result<(EncoderHandle, BufferReturnReceiver)> {
     // Initialize FFmpeg
     ffmpeg::init().context("Failed to initialize FFmpeg")?;
 
@@ -135,7 +141,7 @@ pub fn spawn_encoder(config: EncoderConfig) -> Result<(EncoderHandle, BufferRetu
 
     // Spawn encoder thread
     std::thread::spawn(move || {
-        if let Err(e) = encoder_thread(config, frame_rx, packet_tx, resize_rx, control_rx, buffer_return_tx) {
+        if let Err(e) = encoder_thread(config, frame_rx, packet_tx, resize_rx, control_rx, buffer_return_tx, codec_tx) {
             error!("Encoder thread failed: {}", e);
         }
     });
@@ -203,6 +209,7 @@ fn encoder_thread(
     mut resize_rx: watch::Receiver<Option<ResolutionChange>>,
     mut control_rx: mpsc::Receiver<EncoderControl>,
     buffer_return_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    codec_tx: watch::Sender<String>,
 ) -> Result<()> {
     info!("Encoder thread started with config: {:?}", config);
 
@@ -228,7 +235,17 @@ fn encoder_thread(
             let resize = resize_rx.borrow_and_update().clone();
             if let Some(resize) = resize {
                 info!("Encoder resizing to {}x{}", resize.width, resize.height);
-                
+
+                // Drain any frames already sitting in frame_rx: the render
+                // loop (src/main.rs) only switches its own buffer size to
+                // match a resize *after* sending this `ResolutionChange`, so
+                // anything queued here was captured at the old resolution.
+                // Without this, the next `blocking_recv` below could hand
+                // the freshly-resized encoder an undersized buffer.
+                while let Ok(stale_frame) = frame_rx.try_recv() {
+                    let _ = buffer_return_tx.send(stale_frame.data);
+                }
+
                 // Update config
                 config.width = resize.width;
                 config.height = resize.height;
@@ -241,6 +258,7 @@ fn encoder_thread(
                         input_frame = create_input_frame(config.width, config.height);
                         yuv_frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, config.width, config.height);
                         frame_count = 0; // Reset frame count to force IDR
+                        let _ = codec_tx.send(h264_codec_string(config.width, config.height, config.framerate));
                         info!("Encoder reinitialized successfully");
                     }
                     (Err(e), _) | (_, Err(e)) => {
@@ -332,6 +350,70 @@ fn encoder_thread(
     Ok(())
 }
 
+/// H.264 level table (ITU-T H.264 Table A-1): level_idc (level * 10, except
+/// the unused "1b" tier), MaxMBPS (macroblocks/sec), MaxFS (macroblocks/frame).
+/// Used to pick the lowest level that actually covers a given
+/// resolution/framerate, since hardcoding one level breaks the moment
+/// resolution or framerate changes -- see `select_h264_level`.
+const H264_LEVELS: &[(u8, u32, u32)] = &[
+    (10, 1_485, 99),
+    (11, 3_000, 396),
+    (12, 6_000, 396),
+    (13, 11_880, 396),
+    (20, 11_880, 396),
+    (21, 19_800, 792),
+    (22, 20_250, 1_620),
+    (30, 40_500, 1_620),
+    (31, 108_000, 3_600),
+    (32, 216_000, 5_120),
+    (40, 245_760, 8_192),
+    (41, 245_760, 8_192),
+    (42, 522_240, 8_704),
+    (50, 589_824, 22_080),
+    (51, 983_040, 36_864),
+    (52, 2_073_600, 36_864),
+];
+
+/// Picks the lowest H.264 level whose macroblock-rate and frame-size limits
+/// cover this resolution/framerate, returning its level_idc (e.g. 31 for
+/// level 3.1). Falls back to the highest known level if even that's exceeded
+/// (e.g. resolutions well past 4K@60) rather than silently encoding a level
+/// the stream can't possibly conform to.
+fn select_h264_level(width: u32, height: u32, framerate: u32) -> u8 {
+    let mbs_per_frame = width.div_ceil(16) * height.div_ceil(16);
+    let mbps = mbs_per_frame * framerate;
+    H264_LEVELS
+        .iter()
+        .find(|&&(_, max_mbps, max_fs)| mbps <= max_mbps && mbs_per_frame <= max_fs)
+        .map(|&(idc, _, _)| idc)
+        .unwrap_or_else(|| {
+            warn!(
+                "{}x{}@{}fps exceeds even H.264 level 5.2's limits; using 5.2 anyway",
+                width, height, framerate
+            );
+            H264_LEVELS.last().unwrap().0
+        })
+}
+
+/// Formats a level_idc as the dotted string x264's `level` option expects,
+/// e.g. 31 -> "3.1", 40 -> "4".
+fn h264_level_option(level_idc: u8) -> String {
+    if level_idc % 10 == 0 {
+        (level_idc / 10).to_string()
+    } else {
+        format!("{}.{}", level_idc / 10, level_idc % 10)
+    }
+}
+
+/// Codec string for WebCodecs' `VideoDecoderConfig.codec`, e.g.
+/// "avc1.42E01F" for Baseline profile (0x42), constrained-baseline
+/// constraint flags (0xE0), level 3.1 (0x1F) -- see `select_h264_level` for
+/// how the level is chosen. Kept in sync with the `profile`/`level` options
+/// `create_encoder` passes to x264.
+pub fn h264_codec_string(width: u32, height: u32, framerate: u32) -> String {
+    format!("avc1.42E0{:02X}", select_h264_level(width, height, framerate))
+}
+
 /// Create FFmpeg encoder context
 fn create_encoder(config: &EncoderConfig) -> Result<ffmpeg::encoder::Video> {
     let codec = ffmpeg::encoder::find(ffmpeg::codec::Id::H264)
@@ -352,7 +434,7 @@ fn create_encoder(config: &EncoderConfig) -> Result<ffmpeg::encoder::Video> {
     opts.set("preset", "ultrafast");
     opts.set("tune", "zerolatency");
     opts.set("profile", "baseline");
-    opts.set("level", "3.1");
+    opts.set("level", &h264_level_option(select_h264_level(config.width, config.height, config.framerate)));
     opts.set("bframes", "0"); // No B-frames for low latency
     opts.set("g", &config.keyframe_interval.to_string()); // GOP size
     opts.set("keyint_min", &config.keyframe_interval.to_string());
@@ -556,8 +638,9 @@ mod tests {
             // must come from an explicit ForceKeyframe.
             keyframe_interval: 1000,
         };
+        let (codec_tx, _codec_rx) = watch::channel(String::new());
         let (mut handle, _buffer_return_rx) =
-            spawn_encoder(config.clone()).expect("failed to spawn encoder");
+            spawn_encoder(config.clone(), codec_tx).expect("failed to spawn encoder");
 
         let frame_tx = handle.get_frame_sender();
         let control_tx = handle.get_control_sender();

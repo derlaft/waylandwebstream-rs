@@ -5,9 +5,21 @@
 import type { ClientMessage, ServerMessage } from './protocol';
 import { setBitrate, setConnectionState } from './stats';
 
+export interface ControlChannelOptions {
+  /// Called whenever the server pushes a new WebCodecs codec string (see
+  /// ServerMessage), e.g. because a resolution change picked a different
+  /// H.264 level. Lets the caller reconfigure its VideoDecoder to match.
+  onCodec?: (codec: string) => void;
+}
+
 export class ControlChannel {
   private ws: WebSocket | null = null;
   private sendQueue: string[] = [];
+  private readonly onCodec?: (codec: string) => void;
+
+  constructor(opts: ControlChannelOptions = {}) {
+    this.onCodec = opts.onCodec;
+  }
 
   connect(): void {
     setConnectionState('connecting');
@@ -57,6 +69,8 @@ export class ControlChannel {
     }
     if (msg.type === 'bitrate') {
       setBitrate(msg.bps);
+    } else if (msg.type === 'codec') {
+      this.onCodec?.(msg.codec);
     }
   }
 }

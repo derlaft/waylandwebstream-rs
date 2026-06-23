@@ -52,7 +52,9 @@ export type ClientMessage =
     };
 
 /// Messages the server pushes to the client over `/ws`.
-export type ServerMessage = { type: 'bitrate'; bps: number };
+export type ServerMessage =
+  | { type: 'bitrate'; bps: number }
+  | { type: 'codec'; codec: string };
 
 /// `/stream` binary frame format, one WebSocket message per H.264 frame:
 ///   byte 0     : frame_type (0 = delta, 1 = key)
@@ -84,9 +86,12 @@ export function parseStreamFrameHeader(buf: ArrayBuffer): StreamFrameHeader {
   };
 }
 
-/// Baseline 3.1, Annex-B, SPS/PPS repeated inline on keyframes -- matches
-/// the x264 `profile=baseline level=3.1` settings in src/encoder/mod.rs, so
-/// no out-of-band `description` is needed.
+/// Baseline profile, Annex-B, SPS/PPS repeated inline on keyframes -- no
+/// out-of-band `description` is needed. This is just a startup default for
+/// before the server's first `codec` message arrives (see ServerMessage):
+/// the server picks the actual H.264 level from resolution/framerate (see
+/// `select_h264_level` in src/encoder/mod.rs) and can change it later if the
+/// resolution changes, which VideoStream applies via `setCodec`.
 export const DECODER_CONFIG: VideoDecoderConfig = {
   codec: 'avc1.42E01F',
   optimizeForLatency: true,

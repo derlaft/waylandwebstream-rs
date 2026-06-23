@@ -108,7 +108,12 @@ async fn main() -> Result<()> {
         keyframe_interval,
     };
     
-    let (encoder, buffer_return_rx) = spawn_encoder(encoder_config)?;
+    // Current WebCodecs codec string (profile/level), surfaced to clients
+    // over `/ws` so a resolution-driven level change reaches the decoder --
+    // see `encoder::h264_codec_string`.
+    let (codec_tx, codec_rx) = tokio::sync::watch::channel(encoder::h264_codec_string(width, height, config.framerate));
+
+    let (encoder, buffer_return_rx) = spawn_encoder(encoder_config, codec_tx)?;
 
     // Create channels for the server
     let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32)>(4);
@@ -253,6 +258,7 @@ async fn main() -> Result<()> {
         force_render.clone(),
         pending_ping_tx,
         bitrate_rx,
+        codec_rx,
     );
     let video_tx = signaling_state.get_video_sender();
     let signaling_server = SignalingServer::new(signaling_state);
