@@ -16,9 +16,8 @@
             width: 100vw;
             font-family: sans-serif;
         }
-        #video {
+        #canvas {
             display: block;
-            object-fit: none;
             touch-action: none;
         }
         #status {
@@ -39,259 +38,139 @@
 </head>
 <body>
     <div id="status" class="status-connecting">Connecting...</div>
-    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas"></canvas>
 
     <script>
         console.log('WaylandWebStream client starting...');
 
         const status = document.getElementById('status');
-        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
 
-        let pc = null;
-        let ws = null;
+        let ws = null;       // control channel: touch/pointer/resize/latency
+        let videoWs = null;  // binary H.264 frame stream
+        let decoder = null;
+        let keyframeSeen = false;
+        let canvasSized = false;
 
         function setStatus(text, className) {
             status.textContent = text;
             status.className = className;
         }
 
-        async function start() {
+        // ---- WebCodecs decode + paint ----
+
+        function setupDecoder() {
+            decoder = new VideoDecoder({
+                output: handleFrame,
+                error: (e) => console.error('Decoder error:', e),
+            });
+            // Baseline profile (0x42), constraint flags E0, level 3.1 (0x1F) --
+            // matches the x264 `profile=baseline level=3.1` settings in
+            // src/encoder/mod.rs. No `description` needed: the stream is
+            // Annex-B with SPS/PPS repeated inline on every keyframe
+            // (`repeat_headers=1`). Default hardwareAcceleration (not
+            // "prefer-software") since baseline 4:2:0 decodes fine on phones.
+            decoder.configure({
+                codec: 'avc1.42E01F',
+                optimizeForLatency: true,
+            });
+        }
+
+        function handleFrame(frame) {
+            if (!canvasSized) {
+                canvas.width = frame.displayWidth;
+                canvas.height = frame.displayHeight;
+                canvasSized = true;
+            }
+            ctx.drawImage(frame, 0, 0);
+            recordDecodeLatency(performance.now() - frame.timestamp / 1000);
+            frame.close();
+        }
+
+        // Wire format from /stream, one binary WebSocket message per frame:
+        //   byte 0    : frame_type (0 = delta, 1 = key)
+        //   bytes 1-4 : frame_id (u32, big-endian) -- unused client-side for now
+        //   bytes 5.. : raw Annex-B H.264 for the whole frame
+        function onStreamMessage(event) {
+            const buf = event.data;
+            const view = new DataView(buf);
+            const isKey = view.getUint8(0) === 1;
+            const data = new Uint8Array(buf, 5);
+
+            // A delta frame decoded without a preceding keyframe has no
+            // reference picture to diff against, so drop deltas until the
+            // first key chunk has been fed to the decoder.
+            if (!isKey && !keyframeSeen) {
+                return;
+            }
+            if (isKey) keyframeSeen = true;
+
+            const chunk = new EncodedVideoChunk({
+                type: isKey ? 'key' : 'delta',
+                // EncodedVideoChunk timestamps just need to be monotonic
+                // microseconds; there's no presentation clock to sync to
+                // here, so arrival time doubles as a decode-latency stamp.
+                timestamp: Math.round(performance.now() * 1000),
+                data,
+            });
+
             try {
-                setStatus('Fetching ICE config...', 'status-connecting');
-
-                // Fetch the STUN/TURN server list from the server (it embeds
-                // its own TURN relay, with credentials generated at startup).
-                const iceConfigResponse = await fetch('/ice-config');
-                if (!iceConfigResponse.ok) {
-                    throw new Error('Failed to fetch ICE config: ' + iceConfigResponse.statusText);
-                }
-                const { iceServers } = await iceConfigResponse.json();
-
-                setStatus('Creating peer connection...', 'status-connecting');
-
-                // Create RTCPeerConnection with STUN + the embedded TURN relay
-                pc = new RTCPeerConnection({ iceServers });
-
-                // Handle incoming tracks
-                pc.ontrack = (event) => {
-                    console.log('Received track:', event.track.kind);
-                    if (event.track.kind === 'video') {
-                        video.srcObject = event.streams[0];
-                        setStatus('Connected - Streaming', 'status-connected');
-
-                        // A zero playout buffer turns every capture/send timing
-                        // irregularity into an audible/visible stall instead of
-                        // smoothing over it, which made things look worse, not
-                        // better. Use a small target buffer instead. Both names
-                        // exist in the wild (jitterBufferTarget is the newer
-                        // replacement for the older playoutDelayHint); set both
-                        // since support is inconsistent across browsers.
-                        const receiver = event.receiver;
-                        try { receiver.jitterBufferTarget = 0.05; } catch (e) {}
-                        try { receiver.playoutDelayHint = 0.05; } catch (e) {}
-                    }
-                };
-
-                // Start measuring and reporting latency via WebSocket
-                let lastFrameTime = null;
-                
-                // Monitor video playback to measure latency
-                video.addEventListener('timeupdate', () => {
-                    const now = performance.now();
-                    if (lastFrameTime) {
-                        // Estimate latency from frame rate irregularities
-                        // For now, use a simple heuristic based on stats
-                        // We'll report this periodically via WebSocket
-                    }
-                    lastFrameTime = now;
-                });
-                
-                // Periodically report detailed latency stats via WebSocket.
-                // jitterBufferDelay/EmittedCount and totalDecodeTime/framesDecoded
-                // are lifetime cumulative counters per the WebRTC stats spec, not
-                // instantaneous values - dividing the raw totals gives the
-                // all-time average since the connection started. A single
-                // congestion spike then permanently drags that average up
-                // because the denominator grows too slowly to dilute it back
-                // down. Track deltas between polls instead, as startStatsLogging
-                // already does below, so the report reflects the last second.
-                let lastReportStats = null;
-                setInterval(() => {
-                    if (pc && pc.connectionState === 'connected') {
-                        pc.getStats().then(stats => {
-                            let rtt = null;
-                            let jitterBufferDelay = 0;
-                            let jitterBufferEmittedCount = 0;
-                            let framesDecoded = 0;
-                            let totalDecodeTime = 0;
-
-                            stats.forEach(report => {
-                                // Get RTT from candidate pair
-                                if (report.type === 'candidate-pair') {
-                                    if (report.state === 'succeeded' || report.nominated) {
-                                        if (report.currentRoundTripTime !== undefined && report.currentRoundTripTime > 0) {
-                                            rtt = report.currentRoundTripTime * 1000; // Convert to ms
-                                        }
-                                    }
-                                }
-
-                                // Get remote candidate RTT if available
-                                if (report.type === 'remote-candidate' && report.roundTripTime) {
-                                    if (rtt === null) {
-                                        rtt = report.roundTripTime;
-                                    }
-                                }
-
-                                // Get jitter buffer and decode stats from inbound-rtp
-                                if (report.type === 'inbound-rtp' && report.kind === 'video') {
-                                    if (report.jitterBufferDelay !== undefined && report.jitterBufferEmittedCount !== undefined) {
-                                        jitterBufferDelay = report.jitterBufferDelay;
-                                        jitterBufferEmittedCount = report.jitterBufferEmittedCount;
-                                    }
-                                    if (report.framesDecoded !== undefined && report.totalDecodeTime !== undefined) {
-                                        framesDecoded = report.framesDecoded;
-                                        totalDecodeTime = report.totalDecodeTime;
-                                    }
-                                }
-                            });
-
-                            // If we still don't have RTT, estimate from localhost
-                            if (rtt === null || rtt === 0) {
-                                const isLocalhost = window.location.hostname === 'localhost' ||
-                                                   window.location.hostname === '127.0.0.1';
-                                rtt = isLocalhost ? 1 : 50; // 1ms for localhost, 50ms default fallback
-                            }
-
-                            // Calculate jitter buffer delay and decode time
-                            // per frame over just the window since the last
-                            // poll, using the cumulative counters as deltas.
-                            let avgJitterMs = 0;
-                            let avgDecodeMs = 0;
-                            if (lastReportStats) {
-                                const deltaJitterCount = jitterBufferEmittedCount - lastReportStats.jitterBufferEmittedCount;
-                                if (deltaJitterCount > 0) {
-                                    const deltaJitterDelay = jitterBufferDelay - lastReportStats.jitterBufferDelay;
-                                    avgJitterMs = (deltaJitterDelay / deltaJitterCount) * 1000;
-                                }
-                                const deltaFramesDecoded = framesDecoded - lastReportStats.framesDecoded;
-                                if (deltaFramesDecoded > 0) {
-                                    const deltaDecodeTime = totalDecodeTime - lastReportStats.totalDecodeTime;
-                                    avgDecodeMs = (deltaDecodeTime / deltaFramesDecoded) * 1000;
-                                }
-                            }
-                            lastReportStats = { jitterBufferDelay, jitterBufferEmittedCount, framesDecoded, totalDecodeTime };
-
-                            // Build detailed latency report
-                            const networkMs = rtt / 2; // One-way network delay
-                            const encodingEstimate = 16.7; // ~1 frame at 60fps
-                            const totalLatency = networkMs + avgJitterMs + avgDecodeMs + encodingEstimate;
-                            
-                            // Log to console
-                            console.log(`[latency] Total: ${totalLatency.toFixed(1)}ms (network: ${networkMs.toFixed(1)}ms, jitter: ${avgJitterMs.toFixed(1)}ms, decode: ${avgDecodeMs.toFixed(1)}ms, encode: ${encodingEstimate.toFixed(1)}ms)`);
-                            
-                            // Send detailed report via WebSocket
-                            try {
-                                wsSend({
-                                    type: 'latency',
-                                    encoding_ms: encodingEstimate,
-                                    network_ms: networkMs,
-                                    jitter_buffer_ms: avgJitterMs,
-                                    decoding_ms: avgDecodeMs,
-                                    total_ms: totalLatency
-                                });
-                                console.log('[latency] Report sent via WebSocket');
-                            } catch (e) {
-                                console.error('[latency] Failed to send report:', e);
-                            }
-                        });
-                    }
-                }, 30000); // Report every 30 seconds
-
-                // Handle ICE connection state changes
-                pc.oniceconnectionstatechange = () => {
-                    console.log('ICE connection state:', pc.iceConnectionState);
-                    if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
-                        setStatus('Connection lost', 'status-error');
-                    } else if (pc.iceConnectionState === 'connected') {
-                        setStatus('Connected - Streaming', 'status-connected');
-                    }
-                };
-
-                // Handle connection state changes
-                pc.onconnectionstatechange = () => {
-                    console.log('Connection state:', pc.connectionState);
-                    if (pc.connectionState === 'failed') {
-                        setStatus('Connection failed', 'status-error');
-                    }
-                };
-
-                // Attach the ICE candidate handler now, before any network
-                // round trip. Gathering starts as soon as setLocalDescription
-                // is called below, and candidates fired before a listener is
-                // attached are lost forever (events aren't replayed) - so
-                // this must happen before createOffer/setLocalDescription,
-                // not after the offer/answer exchange completes.
-                pc.onicecandidate = (event) => {
-                    if (event.candidate) {
-                        wsSend({
-                            type: 'ice',
-                            candidate: {
-                                candidate: event.candidate.candidate,
-                                sdpMLineIndex: event.candidate.sdpMLineIndex,
-                                sdpMid: event.candidate.sdpMid
-                            }
-                        });
-                    }
-                };
-
-                // Add transceiver for receiving video
-                pc.addTransceiver('video', { direction: 'recvonly' });
-
-                // Create offer
-                setStatus('Creating offer...', 'status-connecting');
-                const offer = await pc.createOffer();
-                await pc.setLocalDescription(offer);
-
-                console.log('Sending offer to server...');
-
-                // Send offer to server
-                const response = await fetch('/offer', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        type: offer.type,
-                        sdp: offer.sdp
-                    })
-                });
-
-                if (!response.ok) {
-                    throw new Error('Failed to send offer: ' + response.statusText);
-                }
-
-                const answer = await response.json();
-                console.log('Received answer from server');
-
-                // Set remote description
-                await pc.setRemoteDescription(new RTCSessionDescription(answer));
-
-                setStatus('Waiting for video...', 'status-connecting');
-
-                // Connect to WebSocket for ICE candidate exchange
-                connectWebSocket();
-
-                startStatsLogging();
-
-            } catch (error) {
-                console.error('Error:', error);
-                setStatus('Error: ' + error.message, 'status-error');
+                decoder.decode(chunk);
+            } catch (e) {
+                console.error('Decode error:', e);
             }
         }
 
-        // ICE gathering produces candidates well before the WebSocket opens
-        // (it isn't connected until after the SDP offer/answer round trip).
-        // Queue anything sent before `ws.onopen` instead of throwing.
+        function connectVideoStream() {
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const url = `${wsProtocol}//${window.location.host}/stream`;
+
+            console.log('Connecting to video stream:', url);
+            videoWs = new WebSocket(url);
+            videoWs.binaryType = 'arraybuffer';
+
+            videoWs.onopen = () => {
+                console.log('Video stream connected');
+                setStatus('Connected - Streaming', 'status-connected');
+            };
+
+            videoWs.onmessage = onStreamMessage;
+
+            videoWs.onerror = (error) => {
+                console.error('Video stream error:', error);
+            };
+
+            videoWs.onclose = () => {
+                console.log('Video stream closed');
+                setStatus('Connection lost', 'status-error');
+            };
+        }
+
+        // ---- Latency reporting (decode-side only; we don't have the
+        // server's capture timestamp on the wire, so this reports decode
+        // latency rather than full glass-to-glass) ----
+
+        let decodeLatencySamples = [];
+        function recordDecodeLatency(ms) {
+            decodeLatencySamples.push(ms);
+        }
+
+        setInterval(() => {
+            if (decodeLatencySamples.length === 0) return;
+            const avgMs = decodeLatencySamples.reduce((a, b) => a + b, 0) / decodeLatencySamples.length;
+            decodeLatencySamples = [];
+
+            console.log(`[latency] decode: ${avgMs.toFixed(1)}ms`);
+            wsSend({
+                type: 'latency',
+                decoding_ms: avgMs,
+                total_ms: avgMs,
+            });
+        }, 5000);
+
+        // ---- Control channel (touch/pointer/resize/latency) ----
+
         let wsQueue = [];
         function wsSend(message) {
             const json = JSON.stringify(message);
@@ -306,11 +185,11 @@
             const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
 
-            console.log('Connecting to WebSocket:', wsUrl);
+            console.log('Connecting to control WebSocket:', wsUrl);
             ws = new WebSocket(wsUrl);
 
             ws.onopen = () => {
-                console.log('WebSocket connected');
+                console.log('Control WebSocket connected');
                 ws.send(JSON.stringify({ type: 'ready' }));
                 for (const json of wsQueue) {
                     ws.send(json);
@@ -318,75 +197,20 @@
                 wsQueue = [];
             };
 
-            ws.onmessage = async (event) => {
-                try {
-                    const msg = JSON.parse(event.data);
-                    
-                    if (msg.type === 'ice') {
-                        await pc.addIceCandidate(new RTCIceCandidate({
-                            candidate: msg.candidate.candidate,
-                            sdpMLineIndex: msg.candidate.sdpMLineIndex,
-                            sdpMid: msg.candidate.sdpMid
-                        }));
-                    }
-                } catch (error) {
-                    console.error('Error handling WebSocket message:', error);
-                }
-            };
-
             ws.onerror = (error) => {
-                console.error('WebSocket error:', error);
+                console.error('Control WebSocket error:', error);
             };
 
             ws.onclose = () => {
-                console.log('WebSocket closed');
+                console.log('Control WebSocket closed');
             };
         }
 
-        // Log the actual end-to-end delay contributors once a second, so
-        // changes to buffering/playout settings can be verified rather than
-        // assumed: jitter buffer delay (receive-side queuing) and round-trip
-        // time (network) are the two that browser-side tweaks can affect.
-        let lastJitterStats = null;
-        function startStatsLogging() {
-            setInterval(async () => {
-                if (!pc || pc.connectionState !== 'connected') return;
-                const stats = await pc.getStats();
-                let jitterBufferDelay, jitterBufferEmittedCount, rttMs;
-                stats.forEach((report) => {
-                    if (report.type === 'inbound-rtp' && report.kind === 'video') {
-                        jitterBufferDelay = report.jitterBufferDelay;
-                        jitterBufferEmittedCount = report.jitterBufferEmittedCount;
-                    }
-                    if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.currentRoundTripTime !== undefined) {
-                        rttMs = report.currentRoundTripTime * 1000;
-                    }
-                });
-
-                if (lastJitterStats && jitterBufferEmittedCount > lastJitterStats.count) {
-                    const deltaDelay = jitterBufferDelay - lastJitterStats.delay;
-                    const deltaCount = jitterBufferEmittedCount - lastJitterStats.count;
-                    const avgBufferMs = (deltaDelay / deltaCount) * 1000;
-                    console.log(`[stats] jitter buffer: ${avgBufferMs.toFixed(1)}ms, rtt: ${rttMs !== undefined ? rttMs.toFixed(1) + 'ms' : 'n/a'}`);
-                }
-                lastJitterStats = { delay: jitterBufferDelay, count: jitterBufferEmittedCount };
-            }, 1000);
+        function start() {
+            setupDecoder();
+            connectWebSocket();
+            connectVideoStream();
         }
-
-        // Handle autoplay policy
-        video.onloadedmetadata = () => {
-            video.play().catch(() => {
-                // Create play button if autoplay is blocked
-                const playButton = document.createElement('button');
-                playButton.textContent = 'Click to Play';
-                playButton.style.cssText = 'position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); padding: 20px 40px; font-size: 20px; cursor: pointer; z-index: 1001;';
-                playButton.onclick = () => {
-                    video.play();
-                    playButton.remove();
-                };
-                document.body.appendChild(playButton);
-            });
-        };
 
         // Handle window resize
         let resizeTimeout;
@@ -394,16 +218,18 @@
             // Round to dimensions divisible by 16 for optimal H.264 encoding
             const width = Math.floor(window.innerWidth / 16) * 16;
             const height = Math.floor(window.innerHeight / 16) * 16;
-            
+
             console.log('Requesting resolution:', width, 'x', height);
-            
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    type: 'resize',
-                    width: width,
-                    height: height
-                }));
-            }
+
+            wsSend({
+                type: 'resize',
+                width: width,
+                height: height
+            });
+
+            // The next frame will be a different size; let the first
+            // decoded frame after this re-measure the canvas.
+            canvasSized = false;
         }
 
         window.addEventListener('resize', () => {
@@ -417,15 +243,15 @@
         });
 
         // Touch input handling
-        function normalizeTouches(touchList, videoRect) {
+        function normalizeTouches(touchList, canvasRect) {
             const touches = [];
             for (let i = 0; i < touchList.length; i++) {
                 const touch = touchList[i];
                 // Convert to normalized coordinates (0.0 to 1.0)
-                const x = (touch.clientX - videoRect.left) / videoRect.width;
-                const y = (touch.clientY - videoRect.top) / videoRect.height;
-                
-                // Only include touches within the video bounds
+                const x = (touch.clientX - canvasRect.left) / canvasRect.width;
+                const y = (touch.clientY - canvasRect.top) / canvasRect.height;
+
+                // Only include touches within the canvas bounds
                 if (x >= 0 && x <= 1 && y >= 0 && y <= 1) {
                     touches.push({
                         identifier: touch.identifier,
@@ -439,38 +265,36 @@
         }
 
         function sendTouchEvent(eventType, touchList) {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            
-            const videoRect = video.getBoundingClientRect();
-            const touches = normalizeTouches(touchList, videoRect);
-            
+            const canvasRect = canvas.getBoundingClientRect();
+            const touches = normalizeTouches(touchList, canvasRect);
+
             if (touches.length > 0) {
-                ws.send(JSON.stringify({
+                wsSend({
                     type: 'touch',
                     eventType: eventType,
                     touches: touches
-                }));
+                });
             }
         }
 
         // Prevent default touch behavior to avoid scrolling/zooming
-        video.addEventListener('touchstart', (e) => {
+        canvas.addEventListener('touchstart', (e) => {
             e.preventDefault();
             sendTouchEvent('touchstart', e.touches);
         }, { passive: false });
 
-        video.addEventListener('touchmove', (e) => {
+        canvas.addEventListener('touchmove', (e) => {
             e.preventDefault();
             sendTouchEvent('touchmove', e.touches);
         }, { passive: false });
 
-        video.addEventListener('touchend', (e) => {
+        canvas.addEventListener('touchend', (e) => {
             e.preventDefault();
             // For touchend, we need to send the changed touches (the ones that ended)
             sendTouchEvent('touchend', e.changedTouches);
         }, { passive: false });
 
-        video.addEventListener('touchcancel', (e) => {
+        canvas.addEventListener('touchcancel', (e) => {
             e.preventDefault();
             sendTouchEvent('touchcancel', e.changedTouches);
         }, { passive: false });
@@ -479,9 +303,9 @@
         // as PointerEvents too (pointerType "touch"), but those are already
         // handled above via the dedicated touch listeners, so they're
         // ignored here to avoid injecting the same physical contact twice.
-        function normalizedPointer(e, videoRect) {
-            const x = (e.clientX - videoRect.left) / videoRect.width;
-            const y = (e.clientY - videoRect.top) / videoRect.height;
+        function normalizedPointer(e, canvasRect) {
+            const x = (e.clientX - canvasRect.left) / canvasRect.width;
+            const y = (e.clientY - canvasRect.top) / canvasRect.height;
             return {
                 x: Math.min(Math.max(x, 0), 1),
                 y: Math.min(Math.max(y, 0), 1),
@@ -492,50 +316,48 @@
         }
 
         function sendPointerEvent(eventType, pointer) {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            ws.send(JSON.stringify({ type: 'pointer', eventType, pointer }));
+            wsSend({ type: 'pointer', eventType, pointer });
         }
 
-        video.addEventListener('pointerdown', (e) => {
+        canvas.addEventListener('pointerdown', (e) => {
             if (e.pointerType === 'touch') return;
             e.preventDefault();
-            video.setPointerCapture(e.pointerId);
-            sendPointerEvent('pointerdown', normalizedPointer(e, video.getBoundingClientRect()));
+            canvas.setPointerCapture(e.pointerId);
+            sendPointerEvent('pointerdown', normalizedPointer(e, canvas.getBoundingClientRect()));
         });
 
-        video.addEventListener('pointermove', (e) => {
+        canvas.addEventListener('pointermove', (e) => {
             if (e.pointerType === 'touch') return;
-            sendPointerEvent('pointermove', normalizedPointer(e, video.getBoundingClientRect()));
+            sendPointerEvent('pointermove', normalizedPointer(e, canvas.getBoundingClientRect()));
         });
 
-        video.addEventListener('pointerup', (e) => {
+        canvas.addEventListener('pointerup', (e) => {
             if (e.pointerType === 'touch') return;
-            video.releasePointerCapture(e.pointerId);
-            sendPointerEvent('pointerup', normalizedPointer(e, video.getBoundingClientRect()));
+            canvas.releasePointerCapture(e.pointerId);
+            sendPointerEvent('pointerup', normalizedPointer(e, canvas.getBoundingClientRect()));
         });
 
-        video.addEventListener('pointercancel', (e) => {
+        canvas.addEventListener('pointercancel', (e) => {
             if (e.pointerType === 'touch') return;
-            sendPointerEvent('pointercancel', normalizedPointer(e, video.getBoundingClientRect()));
+            sendPointerEvent('pointercancel', normalizedPointer(e, canvas.getBoundingClientRect()));
         });
 
         // Disable the native context menu so right-click reaches the remote app
-        video.addEventListener('contextmenu', (e) => e.preventDefault());
+        canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
-        video.addEventListener('wheel', (e) => {
+        canvas.addEventListener('wheel', (e) => {
             e.preventDefault();
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            const videoRect = video.getBoundingClientRect();
-            const x = Math.min(Math.max((e.clientX - videoRect.left) / videoRect.width, 0), 1);
-            const y = Math.min(Math.max((e.clientY - videoRect.top) / videoRect.height, 0), 1);
-            ws.send(JSON.stringify({
+            const canvasRect = canvas.getBoundingClientRect();
+            const x = Math.min(Math.max((e.clientX - canvasRect.left) / canvasRect.width, 0), 1);
+            const y = Math.min(Math.max((e.clientY - canvasRect.top) / canvasRect.height, 0), 1);
+            wsSend({
                 type: 'pointer',
                 eventType: 'wheel',
                 x: x,
                 y: y,
                 deltaX: e.deltaX,
                 deltaY: e.deltaY,
-            }));
+            });
         }, { passive: false });
 
         // Start the connection
@@ -544,7 +366,8 @@
         // Handle page unload
         window.addEventListener('beforeunload', () => {
             if (ws) ws.close();
-            if (pc) pc.close();
+            if (videoWs) videoWs.close();
+            if (decoder && decoder.state !== 'closed') decoder.close();
         });
     </script>
 </body>
