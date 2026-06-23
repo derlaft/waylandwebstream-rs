@@ -87,6 +87,12 @@ pub enum SignalingMessage {
         #[serde(flatten)]
         event: MouseEvent,
     },
+    /// Sent when the client's WebCodecs decoder falls behind and has to drop
+    /// frames -- waiting out the periodic GOP-cycle keyframe (every
+    /// `keyframe_interval`, seconds by default) would freeze the picture for
+    /// multiple seconds, so the client asks for an immediate resync instead.
+    #[serde(rename = "request_keyframe")]
+    RequestKeyframe,
     #[serde(rename = "latency")]
     Latency {
         #[serde(default)]
@@ -339,6 +345,13 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                         // Pointer events can be frequent, so only log at debug level
                         if let Err(e) = state.mouse_tx.send(event).await {
                             warn!("Failed to send pointer event: {}", e);
+                        }
+                    }
+                    SignalingMessage::RequestKeyframe => {
+                        info!("Client requested a keyframe resync (decoder fell behind)");
+                        state.force_render.store(true, Ordering::Relaxed);
+                        if let Err(e) = state.encoder_control_tx.send(EncoderControl::ForceKeyframe).await {
+                            warn!("Failed to request keyframe resync: {}", e);
                         }
                     }
                     SignalingMessage::Latency { encoding_ms, network_ms, jitter_buffer_ms, decoding_ms, total_ms } => {

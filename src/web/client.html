@@ -63,6 +63,18 @@
         // (src/webrtc/signaling.rs) on the client side too.
         const MAX_DECODE_QUEUE = 2;
 
+        // Dropping a delta frame breaks the H.264 reference chain for the
+        // rest of the GOP, so decode can't safely resume until a keyframe.
+        // The periodic keyframe (every `keyframe_interval`, ~2s by default)
+        // is too far away to wait for without a visible freeze, so ask the
+        // server for one right away instead.
+        let keyframeRequestPending = false;
+        function requestKeyframe() {
+            if (keyframeRequestPending) return;
+            keyframeRequestPending = true;
+            wsSend({ type: 'request_keyframe' });
+        }
+
         function setStatus(text, className) {
             status.textContent = text;
             status.className = className;
@@ -107,8 +119,10 @@
             if (decoder.decodeQueueSize > MAX_DECODE_QUEUE) {
                 if (!isKey) {
                     // Already backlogged -- drop this delta rather than add
-                    // to the queue, and wait for the next keyframe to resync.
+                    // to the queue, and ask for a fresh keyframe to resync
+                    // instead of waiting out the rest of the GOP.
                     keyframeSeen = false;
+                    requestKeyframe();
                     return;
                 }
                 // A keyframe arrived while backlogged: stale frames already
@@ -127,7 +141,10 @@
             if (!isKey && !keyframeSeen) {
                 return;
             }
-            if (isKey) keyframeSeen = true;
+            if (isKey) {
+                keyframeSeen = true;
+                keyframeRequestPending = false;
+            }
 
             const chunk = new EncodedVideoChunk({
                 type: isKey ? 'key' : 'delta',
