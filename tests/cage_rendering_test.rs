@@ -17,6 +17,8 @@ use smithay::wayland::socket::ListeningSocketSource;
 
 use waylandwebstream::compositor::state::{ClientState, WaylandWebStreamState};
 
+mod common;
+
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 
@@ -27,7 +29,7 @@ fn cage_window_renders_visible_content_not_black() {
         return;
     }
 
-    let display_name = format!("wayland-cage-regress-{}", std::process::id());
+    let display_name = common::unique_display_name("wayland-cage-regress");
 
     let mut event_loop: EventLoop<WaylandWebStreamState> =
         EventLoop::try_new().expect("failed to create event loop");

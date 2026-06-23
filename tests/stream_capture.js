@@ -6,8 +6,9 @@
 
 import puppeteer from 'puppeteer';
 
-const COMPOSITOR_URL = 'http://localhost:8080';
 const SCREENSHOT_PATH = process.argv[2] || '/tmp/compositor_test_screenshot.png';
+const PORT = process.argv[3] || '8080';
+const COMPOSITOR_URL = `http://localhost:${PORT}`;
 
 async function captureFrame() {
     console.log('Launching browser...');

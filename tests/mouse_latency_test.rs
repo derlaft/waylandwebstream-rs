@@ -3,11 +3,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-/// Distinct from the ports/display names used by the other pipeline tests so
-/// this test can run independently of (or alongside) them without fighting
-/// over the same Wayland socket or HTTP port.
-const PORT: u16 = 8091;
-const DISPLAY_NAME: &str = "wayland-pointer-test-0";
+mod common;
 
 /// Kills (and reaps) its child on drop, including during a panic unwind, so
 /// a failed assertion never leaves the compositor or test client running.
@@ -37,8 +33,11 @@ fn test_mouse_input_flips_compositor_output() {
         .expect("Failed to build workspace");
     assert!(build_status.success(), "Build failed");
 
+    let display_name = common::unique_display_name("wayland-pointer-test");
+    let port = common::unique_port();
+
     println!("Starting compositor...");
-    let mut compositor = ChildGuard(start_compositor());
+    let mut compositor = ChildGuard(start_compositor(&display_name, port));
 
     thread::sleep(Duration::from_secs(3));
     match compositor.0.try_wait() {
@@ -48,13 +47,13 @@ fn test_mouse_input_flips_compositor_output() {
     }
 
     println!("Starting pointer-reactive test client...");
-    let _client = ChildGuard(start_pointer_client());
+    let _client = ChildGuard(start_pointer_client(&display_name));
     thread::sleep(Duration::from_secs(2));
 
     println!("Running browser-driven mouse latency capture...");
     let output = Command::new("node")
         .arg("tests/mouse_latency_capture.js")
-        .arg(PORT.to_string())
+        .arg(port.to_string())
         .stderr(Stdio::inherit())
         .output()
         .expect("Failed to run mouse latency capture script - ensure Node.js and tests/node_modules are installed");
@@ -87,13 +86,13 @@ fn test_mouse_input_flips_compositor_output() {
     println!("Test passed!");
 }
 
-fn start_compositor() -> Child {
+fn start_compositor(display_name: &str, port: u16) -> Child {
     let binary_path = PathBuf::from("./target/release/waylandwebstream");
     Command::new(binary_path)
         .arg("--display-name")
-        .arg(DISPLAY_NAME)
+        .arg(display_name)
         .arg("--port")
-        .arg(PORT.to_string())
+        .arg(port.to_string())
         .env("RUST_LOG", "info")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -101,10 +100,10 @@ fn start_compositor() -> Child {
         .expect("Failed to start compositor")
 }
 
-fn start_pointer_client() -> Child {
+fn start_pointer_client(display_name: &str) -> Child {
     let binary_path = PathBuf::from("./target/release/wayland-pointer-client");
     Command::new(binary_path)
-        .env("WAYLAND_DISPLAY", DISPLAY_NAME)
+        .env("WAYLAND_DISPLAY", display_name)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
