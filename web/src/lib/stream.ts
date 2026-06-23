@@ -19,6 +19,27 @@ const MAX_DECODE_QUEUE = 2;
 
 const DIAGNOSTICS_INTERVAL_MS = 5000;
 
+// Resizing the canvas *bitmap* (not its CSS size) on every frame whose
+// dimensions actually changed -- rather than once, gated by an external
+// "did we just request a resize" signal -- is what makes this self-healing:
+// the /stream and /ws sockets connect independently, so the very first
+// decoded frame can land at the server's old/default resolution before a
+// just-sent resize takes effect. A one-shot flag would latch onto that
+// stale size forever (stretching every later, correctly-sized frame); this
+// instead just keeps comparing against the frame actually in hand.
+export function ensureCanvasSize(
+  canvas: HTMLCanvasElement,
+  width: number,
+  height: number,
+): boolean {
+  if (canvas.width === width && canvas.height === height) {
+    return false;
+  }
+  canvas.width = width;
+  canvas.height = height;
+  return true;
+}
+
 export interface VideoStreamOptions {
   canvas: HTMLCanvasElement;
   /// Used to send `request_keyframe` and periodic `latency` reports over
@@ -40,10 +61,6 @@ export class VideoStream {
   private keyframeSeen = false;
   // Dedupes resync requests; cleared once a keyframe arrives.
   private keyframeRequestPending = false;
-  // Set false to force the next decoded frame to re-measure the canvas
-  // buffer; viewport.ts calls notifyResizeRequested() after sending a
-  // resize so the size picks up the new resolution.
-  private canvasSized = false;
 
   private lastArrivalTime: number | null = null;
   private arrivalGapSamples: number[] = [];
@@ -68,12 +85,6 @@ export class VideoStream {
     this.diagnosticsTimer = setInterval(() => this.flushDiagnostics(), DIAGNOSTICS_INTERVAL_MS);
   }
 
-  /// Seam for viewport.ts: call after sending a `resize` request so the
-  /// next decoded frame (at the new resolution) re-measures the canvas.
-  notifyResizeRequested(): void {
-    this.canvasSized = false;
-  }
-
   close(): void {
     if (this.diagnosticsTimer !== null) {
       clearInterval(this.diagnosticsTimer);
@@ -96,10 +107,7 @@ export class VideoStream {
   }
 
   private handleFrame(frame: VideoFrame): void {
-    if (!this.canvasSized) {
-      this.canvas.width = frame.displayWidth;
-      this.canvas.height = frame.displayHeight;
-      this.canvasSized = true;
+    if (ensureCanvasSize(this.canvas, frame.displayWidth, frame.displayHeight)) {
       setResolution(frame.displayWidth, frame.displayHeight);
     }
     this.ctx.drawImage(frame, 0, 0);

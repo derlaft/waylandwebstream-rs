@@ -35,11 +35,7 @@
     stream = new VideoStream({ canvas, sendControl });
     stream.connect();
 
-    viewport = new Viewport({
-      canvas,
-      sendControl,
-      onResizeSent: () => stream?.notifyResizeRequested(),
-    });
+    viewport = new Viewport({ canvas, sendControl });
     viewport.start();
 
     detachInput = attachInput(canvas, sendControl);

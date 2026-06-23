@@ -13,6 +13,13 @@ npm install
 cd ..
 
 echo ""
+echo "Running web client unit tests..."
+cd web
+npm install
+npm run test
+cd ..
+
+echo ""
 echo "Building compositor and test client..."
 cargo build --release
 

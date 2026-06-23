@@ -55,16 +55,11 @@ export function computeRenderResolution(scale: number): RenderResolution {
 export interface ViewportOptions {
   canvas: HTMLCanvasElement;
   sendControl: (msg: ClientMessage) => void;
-  /// Called whenever a resize request is actually sent, so stream.ts can
-  /// reset its `canvasSized` flag and re-measure the buffer off the next
-  /// decoded frame at the new resolution.
-  onResizeSent: () => void;
 }
 
 export class Viewport {
   private readonly canvas: HTMLCanvasElement;
   private readonly sendControl: (msg: ClientMessage) => void;
-  private readonly onResizeSent: () => void;
 
   private currentScale = 1;
   private lastSent: RenderResolution | null = null;
@@ -74,7 +69,6 @@ export class Viewport {
   constructor(opts: ViewportOptions) {
     this.canvas = opts.canvas;
     this.sendControl = opts.sendControl;
-    this.onResizeSent = opts.onResizeSent;
   }
 
   start(): void {
@@ -129,6 +123,5 @@ export class Viewport {
     }
     this.lastSent = render;
     this.sendControl({ type: 'resize', width: render.width, height: render.height });
-    this.onResizeSent();
   }
 }
