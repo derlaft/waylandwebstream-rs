@@ -75,6 +75,17 @@
             wsSend({ type: 'request_keyframe' });
         }
 
+        // ---- Diagnostics: is delivery steady, or arriving in bursts? ----
+        // Tracks the gap between successive WebSocket message arrivals (not
+        // decode time) to tell apart "decoder is genuinely too slow" from
+        // "frames are arriving in bursts" (e.g. TCP head-of-line blocking
+        // after a stall) -- the latter looks identical from decode latency
+        // alone but has a different fix.
+        let lastMessageArrivalTime = null;
+        let arrivalGapSamples = [];
+        let maxQueueSeenInWindow = 0;
+        let maxFrameBytesInWindow = 0;
+
         function setStatus(text, className) {
             status.textContent = text;
             status.className = className;
@@ -115,6 +126,14 @@
             const buf = event.data;
             const view = new DataView(buf);
             const isKey = view.getUint8(0) === 1;
+
+            const arrivalNow = performance.now();
+            if (lastMessageArrivalTime !== null) {
+                arrivalGapSamples.push(arrivalNow - lastMessageArrivalTime);
+            }
+            lastMessageArrivalTime = arrivalNow;
+            maxQueueSeenInWindow = Math.max(maxQueueSeenInWindow, decoder.decodeQueueSize);
+            maxFrameBytesInWindow = Math.max(maxFrameBytesInWindow, buf.byteLength);
 
             if (decoder.decodeQueueSize > MAX_DECODE_QUEUE) {
                 if (!isKey) {
@@ -197,6 +216,25 @@
         }
 
         setInterval(() => {
+            if (arrivalGapSamples.length > 0) {
+                const sorted = [...arrivalGapSamples].sort((a, b) => a - b);
+                const n = sorted.length;
+                const avgGap = arrivalGapSamples.reduce((a, b) => a + b, 0) / n;
+                const maxGap = sorted[n - 1];
+                const p95Gap = sorted[Math.floor(n * 0.95)];
+                // A "burst" is several messages arriving within a couple ms
+                // of each other -- much tighter than one frame interval, so
+                // it means a batch was released all at once rather than
+                // delivered at a steady per-frame cadence.
+                const burstCount = arrivalGapSamples.filter((g) => g < 3).length;
+                console.log(
+                    `[latency] arrival: n=${n} avgGap=${avgGap.toFixed(1)}ms p95Gap=${p95Gap.toFixed(1)}ms maxGap=${maxGap.toFixed(1)}ms bursts(<3ms)=${burstCount} maxQueue=${maxQueueSeenInWindow} maxFrameBytes=${maxFrameBytesInWindow}`
+                );
+                arrivalGapSamples = [];
+                maxQueueSeenInWindow = 0;
+                maxFrameBytesInWindow = 0;
+            }
+
             if (decodeLatencySamples.length === 0) return;
             const avgMs = decodeLatencySamples.reduce((a, b) => a + b, 0) / decodeLatencySamples.length;
             decodeLatencySamples = [];
