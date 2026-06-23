@@ -2,6 +2,7 @@
 // canvas. Ported behavior-for-behavior from the old src/web/client.html
 // (see git history) into a typed module; see comments below for the policy
 // each piece of logic encodes.
+import { nextBackoffDelayMs } from './backoff';
 import {
   DECODER_CONFIG,
   STREAM_FRAME_HEADER_BYTES,
@@ -99,6 +100,13 @@ export class VideoStream {
   private lastBurstCount = 0;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
 
+  private reconnectAttempt = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // Distinguishes an intentional `close()` (e.g. page teardown) from the
+  // socket closing on its own -- only the latter should trigger a
+  // reconnect.
+  private closedByCaller = false;
+
   constructor(opts: VideoStreamOptions) {
     this.canvas = opts.canvas;
     const ctx = this.canvas.getContext('2d');
@@ -110,6 +118,7 @@ export class VideoStream {
   }
 
   connect(): void {
+    this.closedByCaller = false;
     this.setupDecoder();
     this.connectSocket();
     this.diagnosticsTimer = setInterval(() => this.flushDiagnostics(), DIAGNOSTICS_INTERVAL_MS);
@@ -117,6 +126,11 @@ export class VideoStream {
   }
 
   close(): void {
+    this.closedByCaller = true;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.diagnosticsTimer !== null) {
       clearInterval(this.diagnosticsTimer);
       this.diagnosticsTimer = null;
@@ -198,9 +212,34 @@ export class VideoStream {
 
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
+    ws.onopen = () => {
+      this.reconnectAttempt = 0;
+    };
     ws.onmessage = (event) => this.onStreamMessage(event.data as ArrayBuffer);
     ws.onerror = (e) => console.error('Video stream error:', e);
+    // `onerror` always precedes `onclose` for a failed/dropped connection
+    // (per the WebSocket spec), so reconnect scheduling lives only here --
+    // otherwise a single drop would queue two attempts.
+    ws.onclose = () => this.scheduleReconnect();
     this.ws = ws;
+  }
+
+  private scheduleReconnect(): void {
+    if (this.closedByCaller) return;
+    // A fresh `/stream` connection starts a brand-new frame sequence
+    // server-side (connecting always forces a fresh keyframe -- see
+    // `video_stream_handler` in src/server.rs), so drop everything tracked
+    // about the old one: a stale `keyframeSeen`/pending request would
+    // misroute frames from the new sequence, and the gap left by the outage
+    // itself isn't congestion (`onStreamMessage` would otherwise read it as
+    // exactly that on the first frame back).
+    this.keyframeSeen = false;
+    this.keyframeRequestPending = false;
+    this.lastArrivalTime = null;
+    const delay = nextBackoffDelayMs(this.reconnectAttempt);
+    this.reconnectAttempt += 1;
+    console.info(`Video stream closed, reconnecting in ${Math.round(delay)}ms`);
+    this.reconnectTimer = setTimeout(() => this.connectSocket(), delay);
   }
 
   private onStreamMessage(buf: ArrayBuffer): void {

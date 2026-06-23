@@ -2,7 +2,7 @@
 // control.ts, and rendered by StatsPanel.svelte.
 import { writable } from 'svelte/store';
 
-export type ConnectionState = 'connecting' | 'open' | 'closed' | 'error';
+export type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'closed' | 'error';
 
 export interface StreamStats {
   connectionState: ConnectionState;
