@@ -1,8 +1,8 @@
 # WaylandWebStream
 
 A single-binary service that runs a headless Wayland compositor and streams it
-to a browser via WebRTC with low-latency, adaptive video and remote touch/input
-control.
+to a browser over a binary WebSocket, decoded client-side with WebCodecs, with
+low-latency video and remote touch/input control.
 
 ## Overview
 
@@ -10,10 +10,11 @@ WaylandWebStream creates a full headless Wayland environment (via
 [Smithay](https://github.com/Smithay/smithay)), encodes the compositor
 framebuffer to H.264 in real time (via
 [FFmpeg/rust-ffmpeg](https://github.com/zmwangx/rust-ffmpeg)), and delivers the
-video stream to a browser client over WebRTC (via
-[rtc](https://github.com/webrtc-rs/rtc)). The user controls the remote desktop
-through touch events (and later keyboard/mouse) sent back over a WebRTC data
-channel and injected directly into the compositor's input pipeline.
+video stream to a browser client over a binary WebSocket (`/stream`), where the
+browser's `VideoDecoder` (WebCodecs) decodes each frame straight into a
+`<canvas>`. The user controls the remote desktop through touch/pointer events
+sent back over a second WebSocket (`/ws`) and injected directly into the
+compositor's input pipeline.
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -24,45 +25,47 @@ channel and injected directly into the compositor's input pipeline.
 │  │  Headless    │                 │  H.264 enc    │  │
 │  │  Compositor  │                 └──────┬───────┘  │
 │  └──────┬───────┘                        │          │
-│         │ inject                    RTP packets     │
+│         │ inject                  H.264 packets     │
 │         │ input                          │          │
 │  ┌──────┴───────┐                 ┌──────▼───────┐  │
-│  │   Input      │ <─ data ch ──── │   WebRTC     │  │
-│  │   Handler    │                 │   (rtc-rs)   │  │
+│  │   Input      │ <─── /ws ────── │  /stream      │  │
+│  │   Handler    │                 │  WebSocket    │  │
 │  └──────────────┘                 └──────┬───────┘  │
 │                                          │          │
 │  ┌──────────────┐                        │          │
-│  │  Signaling   │ ◄──── HTTP ────────────┘          │
-│  │  (built-in)  │                                   │
+│  │ HTTP/WS      │ ◄──── /ws ──────────────┘          │
+│  │ server (axum)│                                   │
 │  └──────────────┘                                   │
 └──────────────────────────────────────────────────────┘
           ▲                              │
-          │         Internet             │
+          │           Network            │
           ▼                              ▼
 ┌─────────────────────────────────────────────────────┐
 │                Browser Client                       │
 │  ┌──────────┐  ┌───────────┐  ┌──────────────────┐  │
-│  │ <video>  │  │  WebRTC   │  │  Touch/Input     │  │
-│  │ element  │  │  client   │  │  event capture   │  │
+│  │ <canvas> │  │ WebCodecs │  │  Touch/Input     │  │
+│  │ element  │  │  decoder  │  │  event capture   │  │
 │  └──────────┘  └───────────┘  └──────────────────┘  │
 └─────────────────────────────────────────────────────┘
 ```
 
 ## Key Features
 
-- **Single binary** -- compositor, encoder, WebRTC server, signaling, and web
+- **Single binary** -- compositor, encoder, HTTP/WebSocket server, and web
   client all in one executable
 - **Headless Wayland compositor** -- Smithay-based, no GPU or display required
 - **Low-latency H.264 streaming** -- software encoding via FFmpeg (x264),
   tuned for real-time with `zerolatency` preset
-- **Adaptive bitrate** -- automatically adjusts quality based on network
-  conditions (RTCP feedback, RTT, packet loss)
+- **Client-reported latency feedback** -- the browser reports encode/network/
+  decode timing back over `/ws` so the server can be tuned against real
+  glass-to-glass latency
 - **Touch-first input** -- multi-touch events relayed from the browser and
   injected directly into the compositor (no uinput kernel round-trip)
-- **WebRTC transport** -- using the sans-I/O `rtc` crate for full control over
-  the event loop and timing
-- **Built-in signaling** -- lightweight HTTP/WebSocket endpoint for
-  offer/answer exchange; no external signaling server needed
+- **WebSocket + WebCodecs transport** -- one binary WebSocket per frame, no
+  SDP/ICE negotiation; the browser's native `VideoDecoder` does the decoding
+- **Built-in HTTP/WebSocket server** -- serves the web client, the binary
+  video stream, and the input/control channel from a single built-in server;
+  no external signaling or STUN/TURN infrastructure needed
 - **Dynamic resolution** -- viewport size is negotiated per-client and can be
   changed mid-session; the compositor output, encoder, and stream adapt on
   the fly without reconnecting
@@ -74,10 +77,10 @@ channel and injected directly into the compositor's input pipeline.
 |---|---|---|
 | Compositor | [smithay](https://github.com/Smithay/smithay) | Headless Wayland compositor with software rendering; dynamic output resizing |
 | Video encoding | [ffmpeg-next](https://github.com/zmwangx/rust-ffmpeg) | H.264 encoding from raw framebuffer pixels |
-| WebRTC | [rtc](https://github.com/webrtc-rs/rtc) | Sans-I/O WebRTC peer connection, RTP packetization |
-| Signaling | built-in (hyper/axum) | HTTP + WebSocket for SDP offer/answer exchange |
+| Streaming | built-in (axum WebSocket) | Binary H.264 frame delivery over `/stream`, decoded client-side with WebCodecs |
+| Control channel | built-in (hyper/axum) | HTTP + WebSocket (`/ws`) for input, resize, and latency messages |
 | Input | direct Smithay injection | Touch/keyboard/mouse events injected into SeatState |
-| Web client | embedded static HTML/JS | Minimal `<video>` + touch capture, bundled in binary |
+| Web client | embedded static HTML/JS | `<canvas>` + WebCodecs decode, touch capture, bundled in binary |
 
 ## Requirements
 
@@ -93,7 +96,8 @@ channel and injected directly into the compositor's input pipeline.
 - Linux (Wayland is Linux-only)
 - FFmpeg shared libraries
 - No GPU required (software rendering + software encoding)
-- Public IP or port-forwarded UDP for WebRTC media
+- A reachable TCP port for the HTTP/WebSocket server (no UDP, STUN, or TURN
+  needed -- it's a plain WebSocket connection)
 
 ## Building
 
@@ -111,33 +115,30 @@ cargo build --release
 #   --initial-resolution 1280x720   (default for new clients)
 #   --max-resolution 3840x2160      (upper bound for client-requested resize)
 #   --port 8080
-#   --stun stun:stun.l.google.com:19302
 ```
 
 Then open `http://<server-ip>:8080` in a browser.
 
 ## Deployment Notes
 
-- The server is expected to have a **public IP** with open UDP ports for
-  WebRTC media traffic.
-- Clients may be behind NAT -- ICE with STUN handles this.
-- Adaptive bitrate adjusts for varying client connections (LAN, WiFi, mobile).
-- TURN support is not included initially since the server has a public IP, but
-  can be added later for edge cases.
+- The server just needs its HTTP port reachable from the client -- ordinary
+  WebSocket traffic, no NAT traversal, ICE, STUN, or TURN required.
+- Put it behind a reverse proxy (e.g. for TLS/`wss://` or authentication) the
+  same way you would any other web service.
 
 ## Testing
 
 To run the integration tests:
 
 ```sh
-# Install Node.js test dependencies (puppeteer for WebRTC client testing)
+# Install Node.js test dependencies (puppeteer for browser-driven testing)
 cd tests && npm install && cd ..
 
 # Run the full integration test suite
 ./run_integration_test.sh
 ```
 
-The test suite validates the entire pipeline: compositor startup, Wayland client rendering, WebRTC streaming, and screenshot validation.
+The test suite validates the entire pipeline: compositor startup, Wayland client rendering, WebSocket/WebCodecs streaming, and screenshot validation.
 
 ### Development Guidelines
 

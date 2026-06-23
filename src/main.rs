@@ -15,17 +15,14 @@ mod config;
 mod encoder;
 mod input;
 mod latency;
+mod server;
 mod web;
-mod webrtc;
-
 
 use compositor::CompositorState;
 use encoder::{EncoderConfig, RateControl, spawn_encoder};
 use input::mouse::MouseHandler;
 use input::touch::TouchHandler;
-use webrtc::session::SessionManager;
-use webrtc::signaling::{SignalingServer, SignalingState};
-use webrtc::turn_server::{self, IceServerConfig, TurnCredentials};
+use server::{SignalingServer, SignalingState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -98,40 +95,10 @@ async fn main() -> Result<()> {
     
     let (encoder, buffer_return_rx) = spawn_encoder(encoder_config)?;
 
-    // Create channels for WebRTC
-    let (offer_tx, offer_rx) = mpsc::channel(4);
-    let (packet_tx, packet_rx) = mpsc::channel(16);
-    let (remote_ice_tx, remote_ice_rx) = mpsc::channel(16);
+    // Create channels for the server
     let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32)>(4);
     let (touch_tx, mut touch_rx) = mpsc::channel(32); // Higher capacity for touch events
     let (mouse_tx, mut mouse_rx) = mpsc::channel(64); // Higher capacity for pointer moves
-
-    // Start the embedded TURN relay. Browsers' mDNS-obfuscated host
-    // candidates can't be resolved over networks (like netbird's WireGuard
-    // overlay) that don't carry multicast traffic, so a TURN relay is needed
-    // for ICE to have any usable candidate pair.
-    let turn_relay_ip = if let Some(ip_str) = &config.turn_public_ip {
-        ip_str
-            .parse()
-            .context("Invalid --turn-public-ip address")?
-    } else {
-        turn_server::detect_relay_address()
-            .context("Failed to auto-detect a TURN relay address; pass --turn-public-ip")?
-    };
-    info!("Embedded TURN relay address: {}:{}", turn_relay_ip, config.turn_port);
-
-    let turn_credentials = TurnCredentials::generate();
-    let ice_config = IceServerConfig {
-        stun_url: config.stun.clone(),
-        turn_url: format!("turn:{}:{}", turn_relay_ip, config.turn_port),
-        turn_username: turn_credentials.username.clone(),
-        turn_password: turn_credentials.password.clone(),
-    };
-
-    // Kept alive for the lifetime of the process; the main loop below never returns.
-    let _turn_server = turn_server::spawn_turn_server(config.turn_port, turn_relay_ip, &turn_credentials)
-        .await
-        .context("Failed to start embedded TURN server")?;
 
     // Create touch and pointer handlers
     let mut touch_handler = TouchHandler::new(width, height);
@@ -140,11 +107,9 @@ async fn main() -> Result<()> {
     info!("\n╔══════════════════════════════════════════════════════════════╗");
     info!("║  WaylandWebStream - Latency Reporting Enabled               ║");
     info!("╠══════════════════════════════════════════════════════════════╣");
-    info!("║  ✓ WebRTC peer connection with H.264 support                ║");
-    info!("║  ✓ HTTP/WebSocket signaling server                          ║");
-    info!("║  ✓ RTP packetization (via webrtc-rs)                        ║");
-    info!("║  ✓ Browser client with video playback                       ║");
-    info!("║  ✓ ICE/STUN support for NAT traversal                       ║");
+    info!("║  ✓ H.264 video over a binary WebSocket (/stream)            ║");
+    info!("║  ✓ Browser-side WebCodecs decode into a <canvas>             ║");
+    info!("║  ✓ HTTP/WebSocket control channel                           ║");
     info!("║  ✓ Touch input handling (multi-touch support)               ║");
     info!("║  ✓ Client-to-server latency reporting                       ║");
     info!("╠══════════════════════════════════════════════════════════════╣");
@@ -225,19 +190,15 @@ async fn main() -> Result<()> {
 
     // Create signaling state and server
     let signaling_state = SignalingState::new(
-        offer_tx.clone(),
-        remote_ice_tx.clone(),
         resize_tx,
         touch_tx,
         mouse_tx,
         latency_tx,
-        ice_config.clone(),
-        encoder_control.clone(),
+        encoder_control,
         force_render.clone(),
     );
-    let ice_tx = signaling_state.get_ice_sender();
     let video_tx = signaling_state.get_video_sender();
-    let signaling_server = SignalingServer::new(signaling_state.clone());
+    let signaling_server = SignalingServer::new(signaling_state);
 
     // Spawn the signaling server
     let listen_addr = config.listen_addr.clone();
@@ -248,25 +209,12 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Spawn the session manager
-    let session_manager = SessionManager::new(offer_rx, packet_rx, remote_ice_rx, ice_tx.clone(), encoder_control, ice_config, config.framerate, force_render.clone());
-    tokio::spawn(async move {
-        if let Err(e) = session_manager.run().await {
-            tracing::error!("Session manager error: {}", e);
-        }
-    });
-
     // Spawn the encoder packet forwarding task: every encoded packet goes to
-    // both the WebRTC session manager (legacy path) and the `/stream`
-    // WebSocket broadcast (new WebCodecs path), so the two can be A/B tested
-    // side by side before the WebRTC path is retired.
+    // the `/stream` WebSocket broadcast for WebCodecs clients.
     tokio::spawn(async move {
         let mut encoder_handle = encoder;
         while let Some(packet) = encoder_handle.recv_packet().await {
-            let _ = video_tx.send(packet.clone());
-            if packet_tx.send(packet).await.is_err() {
-                break;
-            }
+            let _ = video_tx.send(packet);
         }
     });
 
@@ -379,7 +327,6 @@ async fn main() -> Result<()> {
                 if let Some(framebuffer) = state.render(spare_buffers.pop()) {
                     let raw_frame = encoder::RawFrame {
                         data: framebuffer,
-                        capture_time: std::time::Instant::now(),
                     };
 
                     // Send frame to encoder (non-blocking)

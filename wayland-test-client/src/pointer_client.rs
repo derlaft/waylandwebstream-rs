@@ -7,8 +7,8 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_ba
 
 /// Pointer-reactive Wayland test client used by the mouse-latency integration
 /// test. Renders solid black while idle and solid white while a pointer
-/// button is held, so a remote observer (the browser, watching the WebRTC
-/// video element) can detect "the compositor received my click" with a
+/// button is held, so a remote observer (the browser, watching the decoded
+/// video on a <canvas>) can detect "the compositor received my click" with a
 /// trivial brightness check that survives H.264 compression.
 const WIDTH: i32 = 64;
 const HEIGHT: i32 = 64;

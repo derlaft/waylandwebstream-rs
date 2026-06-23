@@ -89,8 +89,8 @@ fn main() {
     
     println!("Window created with red content, running for 30 seconds...");
 
-    // The WebRTC capture script (tests/webrtc_capture.js) budgets up to ~10s
-    // for page navigation, 15s waiting for the video to start playing, plus
+    // The stream capture script (tests/stream_capture.js) budgets up to ~10s
+    // for page navigation, 15s waiting for the first decoded frame, plus
     // a 2s settle -- comfortably under 30s, but 5s (the old value) raced
     // that budget and made the integration test flaky under load.
     let start = std::time::Instant::now();

@@ -7,9 +7,9 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_ba
 
 /// Touch-reactive Wayland test client used by the touch-latency integration
 /// test. Renders solid black while idle and solid white while a touch point
-/// is down, so a remote observer (the browser, watching the WebRTC video
-/// element) can detect "the compositor received my touch" with a trivial
-/// brightness check that survives H.264 compression.
+/// is down, so a remote observer (the browser, watching the decoded video
+/// on a <canvas>) can detect "the compositor received my touch" with a
+/// trivial brightness check that survives H.264 compression.
 const WIDTH: i32 = 64;
 const HEIGHT: i32 = 64;
 

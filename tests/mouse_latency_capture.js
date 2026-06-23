@@ -1,13 +1,13 @@
 /**
  * End-to-end mouse input latency test.
  *
- * Drives a real WebRTC session exactly like webrtc_capture.js, then uses
+ * Drives a real stream session exactly like stream_capture.js, then uses
  * Puppeteer's CDP-backed `page.mouse` API to move the OS-level mouse and
- * press/release a real button over the <video> element -- trusted,
+ * press/release a real button over the <canvas> element -- trusted,
  * browser-native input events, not JS-dispatched synthetic ones, so this
  * exercises the same path a real desktop mouse does. Measures, using the
- * browser's own clock via `video.requestVideoFrameCallback`, how long it
- * takes for the decoded frame to flip from black to white. The
+ * browser's own clock via a `requestAnimationFrame` sampling loop, how long
+ * it takes for the decoded frame to flip from black to white. The
  * compositor-side test client (`wayland-pointer-client`) renders solid black
  * while idle and solid white while a pointer button is held, so the flip is
  * unambiguous even after H.264 lossy compression.
@@ -31,8 +31,6 @@ async function run() {
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
-            '--use-fake-ui-for-media-stream',
-            '--use-fake-device-for-media-stream',
         ],
     });
 
@@ -48,10 +46,16 @@ async function run() {
         console.log(`Navigating to ${COMPOSITOR_URL}...`);
         await page.goto(COMPOSITOR_URL, { waitUntil: 'networkidle2', timeout: 10000 });
 
-        console.log('Waiting for video element...');
-        await page.waitForSelector('video', { timeout: 10000 });
+        console.log('Waiting for canvas element...');
+        await page.waitForSelector('canvas', { timeout: 10000 });
+        // The client sizes the canvas to the decoded frame's dimensions on
+        // the first frame it paints, so a non-zero size means at least one
+        // frame has been decoded.
         await page.waitForFunction(
-            () => document.querySelector('video')?.readyState >= 2,
+            () => {
+                const canvas = document.querySelector('canvas');
+                return canvas && canvas.width > 0 && canvas.height > 0;
+            },
             { timeout: 15000 }
         );
 
@@ -63,11 +67,11 @@ async function run() {
 
         console.log('Arming in-page frame sampler...');
         await page.evaluate((whiteThreshold, blackThreshold) => {
-            const video = document.querySelector('video');
-            const canvas = document.createElement('canvas');
-            canvas.width = 8;
-            canvas.height = 8;
-            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+            const canvas = document.querySelector('canvas');
+            const sampleCanvas = document.createElement('canvas');
+            sampleCanvas.width = 8;
+            sampleCanvas.height = 8;
+            const ctx = sampleCanvas.getContext('2d', { willReadFrequently: true });
 
             window.__mouseTest = {
                 pressAt: null,
@@ -78,8 +82,8 @@ async function run() {
             };
 
             function averageBrightness() {
-                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(canvas, 0, 0, sampleCanvas.width, sampleCanvas.height);
+                const { data } = ctx.getImageData(0, 0, sampleCanvas.width, sampleCanvas.height);
                 let sum = 0;
                 let n = 0;
                 for (let i = 0; i < data.length; i += 4) {
@@ -107,26 +111,26 @@ async function run() {
                     state.blackAgainAt = t;
                 }
 
-                video.requestVideoFrameCallback(onFrame);
+                requestAnimationFrame(onFrame);
             }
-            video.requestVideoFrameCallback(onFrame);
+            requestAnimationFrame(onFrame);
         }, BRIGHTNESS_WHITE, BRIGHTNESS_BLACK);
 
-        const videoRect = await page.evaluate(() => {
-            const r = document.querySelector('video').getBoundingClientRect();
+        const canvasRect = await page.evaluate(() => {
+            const r = document.querySelector('canvas').getBoundingClientRect();
             return { left: r.left, top: r.top, width: r.width, height: r.height };
         });
-        const centerX = videoRect.left + videoRect.width / 2;
-        const centerY = videoRect.top + videoRect.height / 2;
+        const centerX = canvasRect.left + canvasRect.width / 2;
+        const centerY = canvasRect.top + canvasRect.height / 2;
 
-        console.log('Moving real OS-level mouse onto <video>...');
+        console.log('Moving real OS-level mouse onto <canvas>...');
         await page.mouse.move(centerX, centerY);
 
         console.log('Pressing real OS-level mouse button...');
         await page.evaluate(() => { window.__mouseTest.pressAt = performance.now(); });
         await page.mouse.down();
 
-        console.log('Waiting for video to flip white...');
+        console.log('Waiting for canvas to flip white...');
         await page.waitForFunction(() => window.__mouseTest.whiteAt !== null, { timeout: DETECT_TIMEOUT_MS });
 
         const { pressAt, whiteAt } = await page.evaluate(() => window.__mouseTest);
@@ -137,7 +141,7 @@ async function run() {
         await page.evaluate(() => { window.__mouseTest.releaseAt = performance.now(); });
         await page.mouse.up();
 
-        console.log('Waiting for video to flip back to black...');
+        console.log('Waiting for canvas to flip back to black...');
         await page.waitForFunction(() => window.__mouseTest.blackAgainAt !== null, { timeout: DETECT_TIMEOUT_MS });
 
         const { releaseAt, blackAgainAt, sampleCount } = await page.evaluate(() => window.__mouseTest);
@@ -148,7 +152,7 @@ async function run() {
         // Drag: press, move through several intermediate points while held,
         // then release. Exercises continuous pointermove-while-captured,
         // which a single click does not.
-        console.log('Dragging across <video> with the button held...');
+        console.log('Dragging across <canvas> with the button held...');
         await page.evaluate(() => { window.__mouseTest.whiteAt = null; });
         await page.mouse.move(centerX - 100, centerY - 50);
         await page.mouse.down();
@@ -161,7 +165,7 @@ async function run() {
 
         // Right click: a second physical button must reach the compositor
         // too, not just the primary (left) one.
-        console.log('Right-clicking on <video>...');
+        console.log('Right-clicking on <canvas>...');
         await page.evaluate(() => { window.__mouseTest.whiteAt = null; window.__mouseTest.blackAgainAt = null; });
         await page.mouse.move(centerX, centerY);
         await page.mouse.down({ button: 'right' });
@@ -172,7 +176,7 @@ async function run() {
 
         // Wheel: must not throw or wedge the pointer pipeline for whatever
         // comes after it.
-        console.log('Scrolling the wheel over <video>...');
+        console.log('Scrolling the wheel over <canvas>...');
         await page.mouse.wheel({ deltaY: 120 });
         console.log('Wheel scroll completed without error.');
 

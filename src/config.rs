@@ -2,7 +2,7 @@ use clap::Parser;
 
 #[derive(Debug, Parser)]
 #[command(name = "waylandwebstream")]
-#[command(about = "A headless Wayland compositor streaming to browsers via WebRTC", long_about = None)]
+#[command(about = "A headless Wayland compositor streaming to browsers over WebSocket/WebCodecs", long_about = None)]
 pub struct Config {
     /// Initial resolution (width x height)
     #[arg(long, default_value = "1280x720")]
@@ -22,19 +22,6 @@ pub struct Config {
     /// the server directly.
     #[arg(long, default_value = "0.0.0.0")]
     pub listen_addr: String,
-
-    /// STUN server URL
-    #[arg(long, default_value = "stun:stun.l.google.com:19302")]
-    pub stun: String,
-
-    /// UDP port for the embedded TURN relay
-    #[arg(long, default_value = "3478")]
-    pub turn_port: u16,
-
-    /// Public IP address clients should use to reach the embedded TURN relay
-    /// (e.g. your netbird IP). Auto-detected if not set.
-    #[arg(long)]
-    pub turn_public_ip: Option<String>,
 
     /// Target framerate
     #[arg(long, default_value = "60")]

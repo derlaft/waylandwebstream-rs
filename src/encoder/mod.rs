@@ -7,14 +7,12 @@ use tracing::{error, info, warn};
 #[derive(Clone)]
 pub struct RawFrame {
     pub data: Vec<u8>,
-    pub capture_time: std::time::Instant,
 }
 
 /// Encoded video packet (H.264 NAL units)
 #[derive(Clone)]
 pub struct EncodedPacket {
     pub data: Vec<u8>,
-    pub capture_time: std::time::Instant,
     /// Whether this packet is an IDR/keyframe, as reported by the encoder.
     /// WebCodecs needs each chunk tagged `key` or `delta` to know which ones
     /// it can start decoding from.
@@ -473,7 +471,6 @@ fn encode_frame(
 
                 packets.push(EncodedPacket {
                     data,
-                    capture_time: raw_frame.capture_time,
                     is_keyframe,
                     frame_id,
                 });
@@ -496,7 +493,6 @@ mod tests {
     fn make_raw_frame(width: u32, height: u32) -> RawFrame {
         RawFrame {
             data: vec![0u8; (width * height * 4) as usize],
-            capture_time: std::time::Instant::now(),
         }
     }
 

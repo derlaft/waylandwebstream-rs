@@ -6,7 +6,7 @@ use std::path::PathBuf;
 /// Integration test that validates the entire compositor pipeline:
 /// 1. Start compositor
 /// 2. Launch a Wayland client
-/// 3. Connect via WebRTC and capture frames
+/// 3. Connect via the WebSocket/WebCodecs stream and capture frames
 /// 4. Validate rendering works correctly
 #[test]
 fn test_compositor_pipeline() {
@@ -42,9 +42,9 @@ fn test_compositor_pipeline() {
         // Give the client time to connect and render
         thread::sleep(Duration::from_secs(2));
         
-        // Connect WebRTC client and capture a frame
-        println!("Connecting WebRTC client...");
-        let screenshot_path = capture_webrtc_frame();
+        // Connect a stream client and capture a frame
+        println!("Connecting stream client...");
+        let screenshot_path = capture_stream_frame();
         
         // Validate the screenshot
         println!("Validating screenshot...");
@@ -103,21 +103,21 @@ fn start_test_client() -> Child {
     }
 }
 
-fn capture_webrtc_frame() -> PathBuf {
+fn capture_stream_frame() -> PathBuf {
     // Use Node.js + Puppeteer to connect and capture a frame
     let screenshot_path = PathBuf::from("/tmp/compositor_test_screenshot.png");
-    
+
     let status = Command::new("node")
-        .arg("tests/webrtc_capture.js")
+        .arg("tests/stream_capture.js")
         .arg(&screenshot_path)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .expect("Failed to run WebRTC capture script - ensure Node.js and dependencies are installed");
-    
-    assert!(status.success(), "WebRTC capture failed");
+        .expect("Failed to run stream capture script - ensure Node.js and dependencies are installed");
+
+    assert!(status.success(), "Stream capture failed");
     assert!(screenshot_path.exists(), "Screenshot was not created");
-    
+
     screenshot_path
 }
 

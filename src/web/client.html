@@ -60,7 +60,7 @@
         // network, decode contention), decode() backlog grows without bound
         // and every queued frame's reported latency climbs forever. Mirror
         // the server's "skip to newest, resync on next keyframe" policy
-        // (src/webrtc/signaling.rs) on the client side too.
+        // (src/server.rs) on the client side too.
         const MAX_DECODE_QUEUE = 2;
 
         // Dropping a delta frame breaks the H.264 reference chain for the

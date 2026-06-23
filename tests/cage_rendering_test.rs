@@ -3,8 +3,8 @@
 //! nested client is actively drawing.
 //!
 //! This drives `WaylandWebStreamState` directly (rather than through the
-//! `waylandwebstream` binary + WebRTC pipeline) so the captured framebuffer
-//! from `render()` can be inspected pixel-by-pixel in-process.
+//! `waylandwebstream` binary + streaming pipeline) so the captured
+//! framebuffer from `render()` can be inspected pixel-by-pixel in-process.
 
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;

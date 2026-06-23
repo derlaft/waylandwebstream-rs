@@ -1,4 +1,5 @@
-// HTTP/WebSocket signaling server (offer/answer/ICE)
+// HTTP/WebSocket server: control channel (input/resize/latency) and the
+// binary video stream consumed by the browser's WebCodecs decoder.
 
 use anyhow::{Context, Result};
 use axum::{
@@ -6,9 +7,9 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    response::{Html, IntoResponse, Response},
-    routing::{get, post},
-    Json, Router,
+    response::{Html, Response},
+    routing::get,
+    Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -24,55 +25,11 @@ use crate::input::mouse::MouseEvent;
 use crate::input::touch::TouchEvent;
 use crate::latency::LatencyReport;
 use crate::web::client_html::CLIENT_HTML;
-use crate::webrtc::turn_server::IceServerConfig;
-
-/// A single ICE server entry, shaped to match the `RTCIceServer` dictionary
-/// the browser's `RTCPeerConnection` constructor expects.
-#[derive(Serialize)]
-pub struct IceServerJson {
-    pub urls: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub username: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub credential: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IceConfigResponse {
-    pub ice_servers: Vec<IceServerJson>,
-}
-
-/// SDP offer from the browser
-#[derive(Debug, Deserialize)]
-pub struct SdpOffer {
-    pub sdp: String,
-}
-
-/// SDP answer to the browser
-#[derive(Debug, Serialize)]
-pub struct SdpAnswer {
-    pub sdp: String,
-    #[serde(rename = "type")]
-    pub sdp_type: String,
-}
-
-/// ICE candidate message
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IceCandidate {
-    pub candidate: String,
-    #[serde(rename = "sdpMLineIndex")]
-    pub sdp_mline_index: u16,
-    #[serde(rename = "sdpMid")]
-    pub sdp_mid: Option<String>,
-}
 
 /// Signaling messages between client and server
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SignalingMessage {
-    #[serde(rename = "ice")]
-    Ice { candidate: IceCandidate },
     #[serde(rename = "ready")]
     Ready,
     #[serde(rename = "resize")]
@@ -107,15 +64,9 @@ pub enum SignalingMessage {
     },
 }
 
-/// Shared state for the signaling server
+/// Shared state for the server
 #[derive(Clone)]
 pub struct SignalingState {
-    /// Broadcast channel for ICE candidates from server to clients
-    ice_tx: broadcast::Sender<IceCandidate>,
-    /// Channel to send offers from clients to the WebRTC session manager
-    offer_tx: mpsc::Sender<(SdpOffer, tokio::sync::oneshot::Sender<SdpAnswer>)>,
-    /// Channel to forward ICE candidates trickled by clients to the WebRTC session manager
-    remote_ice_tx: mpsc::Sender<IceCandidate>,
     /// Channel to send resize requests from clients
     resize_tx: mpsc::Sender<(u32, u32)>,
     /// Channel to send touch events from clients
@@ -124,70 +75,41 @@ pub struct SignalingState {
     mouse_tx: mpsc::Sender<MouseEvent>,
     /// Channel to send latency reports from clients
     latency_tx: Option<mpsc::Sender<LatencyReport>>,
-    /// STUN/TURN server list handed out to clients via `/ice-config`
-    ice_config: IceServerConfig,
     /// Broadcasts encoded video packets to `/stream` WebSocket clients. Small
     /// capacity is deliberate: a slow client should skip forward to a recent
     /// frame rather than build up a backlog, since H.264 P-frames in the
     /// backlog would be stale by the time they're sent anyway. The next
     /// periodic keyframe resyncs any client that fell behind and missed some.
     video_tx: broadcast::Sender<EncodedPacket>,
-    /// Lets a new `/stream` client request a fresh keyframe, the same way
-    /// `SessionManager` does for new WebRTC sessions -- without this, a
-    /// client connecting while the screen is idle could wait until the next
-    /// damage or GOP-cycle keyframe before seeing anything decodable.
+    /// Lets a new `/stream` client request a fresh keyframe -- without this,
+    /// a client connecting while the screen is idle could wait until the
+    /// next damage or GOP-cycle keyframe before seeing anything decodable.
     encoder_control_tx: mpsc::Sender<EncoderControl>,
-    /// Same purpose as `SessionManager`'s copy: force the capture loop to
-    /// render+encode a frame right away for a newly connected client to ride
-    /// on, rather than waiting on damage or the periodic keyframe cadence.
+    /// Forces the capture loop to render+encode a frame right away for a
+    /// newly connected client to ride on, rather than waiting on damage or
+    /// the periodic keyframe cadence.
     force_render: Arc<AtomicBool>,
 }
 
 impl SignalingState {
     pub fn new(
-        offer_tx: mpsc::Sender<(SdpOffer, tokio::sync::oneshot::Sender<SdpAnswer>)>,
-        remote_ice_tx: mpsc::Sender<IceCandidate>,
         resize_tx: mpsc::Sender<(u32, u32)>,
         touch_tx: mpsc::Sender<TouchEvent>,
         mouse_tx: mpsc::Sender<MouseEvent>,
         latency_tx: Option<mpsc::Sender<LatencyReport>>,
-        ice_config: IceServerConfig,
         encoder_control_tx: mpsc::Sender<EncoderControl>,
         force_render: Arc<AtomicBool>,
     ) -> Self {
-        let (ice_tx, _) = broadcast::channel(16);
         let (video_tx, _) = broadcast::channel(3);
         Self {
-            ice_tx,
-            offer_tx,
-            remote_ice_tx,
             resize_tx,
             touch_tx,
             mouse_tx,
             latency_tx,
-            ice_config,
             video_tx,
             encoder_control_tx,
             force_render,
         }
-    }
-
-    pub fn get_ice_receiver(&self) -> broadcast::Receiver<IceCandidate> {
-        self.ice_tx.subscribe()
-    }
-
-    pub fn get_ice_sender(&self) -> mpsc::Sender<IceCandidate> {
-        let tx = self.ice_tx.clone();
-        let (ice_mpsc_tx, mut ice_mpsc_rx) = mpsc::channel::<IceCandidate>(16);
-
-        // Spawn a task to forward mpsc messages to broadcast
-        tokio::spawn(async move {
-            while let Some(candidate) = ice_mpsc_rx.recv().await {
-                let _ = tx.send(candidate);
-            }
-        });
-
-        ice_mpsc_tx
     }
 
     /// Cloneable sender for feeding encoded video packets in from the
@@ -206,8 +128,6 @@ impl SignalingServer {
     pub fn new(state: SignalingState) -> Self {
         let router = Router::new()
             .route("/", get(serve_client))
-            .route("/offer", post(handle_offer))
-            .route("/ice-config", get(handle_ice_config))
             .route("/ws", get(handle_websocket))
             .route("/stream", get(handle_video_stream))
             .layer(TraceLayer::new_for_http())
@@ -235,64 +155,8 @@ async fn serve_client() -> Html<&'static str> {
     Html(CLIENT_HTML)
 }
 
-/// Serve the STUN/TURN server list the client should use for ICE
-async fn handle_ice_config(State(state): State<SignalingState>) -> Json<IceConfigResponse> {
-    let ice_config = &state.ice_config;
-    Json(IceConfigResponse {
-        ice_servers: vec![
-            IceServerJson {
-                urls: vec![ice_config.stun_url.clone()],
-                username: None,
-                credential: None,
-            },
-            IceServerJson {
-                urls: vec![ice_config.turn_url.clone()],
-                username: Some(ice_config.turn_username.clone()),
-                credential: Some(ice_config.turn_password.clone()),
-            },
-        ],
-    })
-}
-
-/// Handle SDP offer from browser
-async fn handle_offer(
-    State(state): State<SignalingState>,
-    Json(offer): Json<SdpOffer>,
-) -> Result<Json<SdpAnswer>, Response> {
-    info!("Received SDP offer from client");
-
-    // Create a oneshot channel to receive the answer
-    let (tx, rx) = tokio::sync::oneshot::channel();
-
-    // Send the offer to the WebRTC session manager
-    state
-        .offer_tx
-        .send((offer, tx))
-        .await
-        .map_err(|_| {
-            warn!("Failed to send offer to WebRTC session");
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "WebRTC session not available",
-            )
-                .into_response()
-        })?;
-
-    // Wait for the answer
-    let answer = rx.await.map_err(|_| {
-        warn!("Failed to receive answer from WebRTC session");
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to generate answer",
-        )
-            .into_response()
-    })?;
-
-    info!("Sending SDP answer to client");
-    Ok(Json(answer))
-}
-
-/// Handle WebSocket connection for ICE candidate trickle
+/// Handle the control WebSocket (`/ws`): touch/pointer/resize/latency and
+/// keyframe-resync requests.
 async fn handle_websocket(
     ws: WebSocketUpgrade,
     State(state): State<SignalingState>,
@@ -300,34 +164,13 @@ async fn handle_websocket(
     ws.on_upgrade(move |socket| websocket_handler(socket, state))
 }
 
-/// WebSocket handler for ICE candidate exchange
 async fn websocket_handler(socket: WebSocket, state: SignalingState) {
-    let (mut sender, mut receiver) = socket.split();
-    let mut ice_rx = state.get_ice_receiver();
+    let (_sender, mut receiver) = socket.split();
 
-    // Spawn task to forward server ICE candidates to client
-    let send_task = tokio::spawn(async move {
-        while let Ok(candidate) = ice_rx.recv().await {
-            let msg = SignalingMessage::Ice { candidate };
-            if let Ok(json) = serde_json::to_string(&msg) {
-                if sender.send(Message::Text(json)).await.is_err() {
-                    break;
-                }
-            }
-        }
-    });
-
-    // Handle incoming messages from client
     while let Some(Ok(msg)) = receiver.next().await {
         if let Message::Text(text) = msg {
             if let Ok(msg) = serde_json::from_str::<SignalingMessage>(&text) {
                 match msg {
-                    SignalingMessage::Ice { candidate } => {
-                        info!("Received ICE candidate from client: {:?}", candidate);
-                        if let Err(e) = state.remote_ice_tx.send(candidate).await {
-                            warn!("Failed to forward ICE candidate to session manager: {}", e);
-                        }
-                    }
                     SignalingMessage::Ready => {
                         info!("Client is ready");
                     }
@@ -363,7 +206,7 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                             report.jitter_buffer_ms = jitter_buffer_ms;
                             report.decoding_ms = decoding_ms;
                             report.total_ms = total_ms;
-                            
+
                             if let Err(e) = latency_tx.send(report).await {
                                 warn!("Failed to send latency report: {}", e);
                             } else {
@@ -377,8 +220,6 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
             }
         }
     }
-
-    send_task.abort();
 }
 
 /// Handle the binary video WebSocket (`/stream`). Each connected client gets
@@ -411,10 +252,9 @@ async fn video_stream_handler(socket: WebSocket, state: SignalingState) {
     let (mut sender, _receiver) = socket.split();
     let mut video_rx = state.get_video_sender().subscribe();
 
-    // Request a fresh keyframe and force a render right away, mirroring what
-    // SessionManager does for new WebRTC sessions -- otherwise this client
-    // has no decodable frame to start from until the screen happens to
-    // change or the next GOP-cycle keyframe comes around.
+    // Request a fresh keyframe and force a render right away -- otherwise
+    // this client has no decodable frame to start from until the screen
+    // happens to change or the next GOP-cycle keyframe comes around.
     state.force_render.store(true, Ordering::Relaxed);
     if let Err(e) = state.encoder_control_tx.send(EncoderControl::ForceKeyframe).await {
         warn!("Failed to request keyframe for new video stream client: {}", e);
@@ -498,29 +338,17 @@ mod tests {
 
     #[tokio::test]
     async fn stream_endpoint_delivers_frames_in_wire_format() {
-        let (offer_tx, _offer_rx) = mpsc::channel(4);
-        let (remote_ice_tx, _remote_ice_rx) = mpsc::channel(4);
         let (resize_tx, _resize_rx) = mpsc::channel(4);
         let (touch_tx, _touch_rx) = mpsc::channel(4);
         let (mouse_tx, _mouse_rx) = mpsc::channel(4);
         let (encoder_control_tx, mut encoder_control_rx) = mpsc::channel(4);
         let force_render = Arc::new(AtomicBool::new(false));
 
-        let ice_config = IceServerConfig {
-            stun_url: "stun:stun.l.google.com:19302".to_string(),
-            turn_url: "turn:127.0.0.1:3478".to_string(),
-            turn_username: "u".to_string(),
-            turn_password: "p".to_string(),
-        };
-
         let state = SignalingState::new(
-            offer_tx,
-            remote_ice_tx,
             resize_tx,
             touch_tx,
             mouse_tx,
             None,
-            ice_config,
             encoder_control_tx,
             force_render.clone(),
         );
@@ -548,7 +376,6 @@ mod tests {
         assert!(video_tx
             .send(EncodedPacket {
                 data: vec![0xAA, 0xBB, 0xCC],
-                capture_time: std::time::Instant::now(),
                 is_keyframe: true,
                 frame_id: 42,
             })
@@ -556,7 +383,6 @@ mod tests {
         assert!(video_tx
             .send(EncodedPacket {
                 data: vec![0xDD],
-                capture_time: std::time::Instant::now(),
                 is_keyframe: false,
                 frame_id: 43,
             })

@@ -1,21 +1,21 @@
 /**
- * WebRTC capture script for automated testing
- * Connects to the compositor's web interface and captures a frame
+ * Stream capture script for automated testing.
+ * Connects to the compositor's web interface (WebSocket + WebCodecs client)
+ * and captures a decoded frame from the canvas.
  */
 
 import puppeteer from 'puppeteer';
-import fs from 'fs';
 
 const COMPOSITOR_URL = 'http://localhost:8080';
 const SCREENSHOT_PATH = process.argv[2] || '/tmp/compositor_test_screenshot.png';
 
 async function captureFrame() {
     console.log('Launching browser...');
-    
+
     // Use system chromium
     const executablePath = '/usr/bin/chromium';
     console.log(`Using Chromium at: ${executablePath}`);
-    
+
     const browser = await puppeteer.launch({
         headless: 'new',
         executablePath: executablePath,
@@ -23,58 +23,55 @@ async function captureFrame() {
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
-            '--use-fake-ui-for-media-stream',
-            '--use-fake-device-for-media-stream',
         ]
     });
 
     try {
         const page = await browser.newPage();
-        
+
         console.log(`Navigating to ${COMPOSITOR_URL}...`);
         await page.goto(COMPOSITOR_URL, { waitUntil: 'networkidle2', timeout: 10000 });
-        
-        console.log('Waiting for video element...');
-        await page.waitForSelector('video', { timeout: 10000 });
-        
-        // Wait for video to start playing
+
+        console.log('Waiting for canvas element...');
+        await page.waitForSelector('canvas', { timeout: 10000 });
+
+        // The client sizes the canvas to the decoded frame's dimensions on
+        // the first frame it paints (see `handleFrame` in client.html), so
+        // a non-zero size means at least one frame has been decoded.
+        console.log('Waiting for first decoded frame...');
         await page.waitForFunction(
             () => {
-                const video = document.querySelector('video');
-                return video && video.readyState >= 2; // HAVE_CURRENT_DATA
+                const canvas = document.querySelector('canvas');
+                return canvas && canvas.width > 0 && canvas.height > 0;
             },
             { timeout: 15000 }
         );
-        
-        console.log('Video is playing, waiting for stable frame...');
-        // Wait a bit more to ensure we get a proper frame (not just black)
-        await page.waitForTimeout(2000);
-        
+
+        console.log('Frame decoded, waiting for a stable picture...');
+        // Wait a bit more so we capture something past the first keyframe,
+        // not just-decoded transient content.
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+
         console.log('Capturing screenshot...');
-        const videoElement = await page.$('video');
-        await videoElement.screenshot({ path: SCREENSHOT_PATH });
-        
+        const canvasElement = await page.$('canvas');
+        await canvasElement.screenshot({ path: SCREENSHOT_PATH });
+
         console.log(`Screenshot saved to ${SCREENSHOT_PATH}`);
-        
-        // Get video dimensions for validation
+
         const dimensions = await page.evaluate(() => {
-            const video = document.querySelector('video');
-            return {
-                width: video.videoWidth,
-                height: video.videoHeight,
-                readyState: video.readyState,
-            };
+            const canvas = document.querySelector('canvas');
+            return { width: canvas.width, height: canvas.height };
         });
-        
-        console.log('Video dimensions:', dimensions);
-        
+
+        console.log('Canvas dimensions:', dimensions);
+
         if (dimensions.width === 0 || dimensions.height === 0) {
-            throw new Error('Video has invalid dimensions');
+            throw new Error('Canvas has invalid dimensions');
         }
-        
+
         await browser.close();
         return true;
-        
+
     } catch (error) {
         console.error('Error during capture:', error);
         await browser.close();
