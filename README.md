@@ -80,13 +80,16 @@ compositor's input pipeline.
 | Streaming | built-in (axum WebSocket) | Binary H.264 frame delivery over `/stream`, decoded client-side with WebCodecs |
 | Control channel | built-in (hyper/axum) | HTTP + WebSocket (`/ws`) for input, resize, and latency messages |
 | Input | direct Smithay injection | Touch/keyboard/mouse events injected into SeatState |
-| Web client | embedded static HTML/JS | `<canvas>` + WebCodecs decode, touch capture, bundled in binary |
+| Web client | [Svelte](https://svelte.dev) + [Vite](https://vite.dev), embedded via `rust-embed` | `<canvas>` + WebCodecs decode, touch/pointer capture, collapsible stats panel; compiled to a static bundle and baked into the binary |
 
 ## Requirements
 
 ### Build dependencies
 
 - Rust 1.75+ (2024 edition)
+- Node.js/npm -- `build.rs` runs `npm ci && npm run build` in `web/` to
+  produce the Svelte client bundle that gets embedded into the binary
+  (falls back to a stale `web/dist/` with a warning if `npm` is missing)
 - FFmpeg development libraries (libavcodec, libavformat, libavutil, libswscale)
 - Wayland development libraries (libwayland-server)
 - pkg-config
@@ -104,6 +107,23 @@ compositor's input pipeline.
 ```sh
 cargo build --release
 ```
+
+This builds the Svelte web client (`web/`) via `build.rs` and embeds the
+resulting `web/dist/` into the binary, so `cargo build` alone is enough.
+
+### Web client dev loop
+
+For live-reloading frontend work, run the Rust server and the Vite dev
+server side by side -- Vite proxies `/ws` and `/stream` to the backend so
+you get HMR against a real compositor:
+
+```sh
+cargo run                  # backend on :8080
+cd web && npm install && npm run dev   # frontend dev server (Vite prints its own port)
+```
+
+Edits under `web/src/**` trigger `build.rs` to rebuild the embedded bundle
+on the next `cargo build`/`cargo run`.
 
 ## Usage
 

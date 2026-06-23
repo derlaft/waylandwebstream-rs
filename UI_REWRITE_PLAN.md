@@ -256,24 +256,44 @@ Carry over current handlers; normalize against the **live** canvas
       decode latency (ms), current render resolution, arrival-gap p95/max + burst
       count, max decode queue. Cheap, updates on the existing 5s cadence.
 
-## 9. Phase 6 — Rust server integration (`src/web/mod.rs`, `src/server.rs`)
+## 9. Phase 6 — Rust server integration (`src/web/mod.rs`, `src/server.rs`) ✅ done
 
-- [ ] Replace the `client_html` module with embedded-asset serving (rust-embed):
+- [x] Replace the `client_html` module with embedded-asset serving (rust-embed):
       `GET /` → `index.html`; `GET /<asset>` → hashed JS/CSS with correct
       `Content-Type` and long-cache headers (assets are content-hashed).
-- [ ] Keep `/ws` and `/stream` handlers **unchanged**.
-- [ ] Update the `serve_client` route accordingly; keep the existing server test
+- [x] Keep `/ws` and `/stream` handlers **unchanged**.
+- [x] Update the `serve_client` route accordingly; keep the existing server test
       (`stream_endpoint_delivers_frames_in_wire_format`) green.
-- [ ] Confirm `Cargo.toml` adds only `rust-embed` (+ a mime helper if needed).
+- [x] Confirm `Cargo.toml` adds only `rust-embed` (+ a mime helper if needed).
+
+  This had already landed alongside earlier phases (`src/web/mod.rs` uses
+  `rust-embed` with `serve_index`/`serve_asset`; `src/server.rs`'s router is
+  `/` → `serve_index`, `/ws` → `handle_websocket`, `/stream` →
+  `handle_video_stream`, `.fallback(serve_asset)`; `client.html` is already
+  gone; `Cargo.toml`'s only addition is `rust-embed = "8.11.0"` with the
+  `mime-guess` feature). Verified clean in this pass: `cd web && npm run
+  build` (46.38 kB JS / 1.50 kB CSS gzip'd), `cargo build`, and
+  `cargo test -- --test-threads=1` — full suite green including
+  `server::tests::stream_endpoint_delivers_frames_in_wire_format` and the
+  two Puppeteer integration tests.
 
 ## 10. Phase 7 — Cleanup, docs, verification
 
-- [ ] Delete `src/web/client.html` only after the new app reaches feature parity.
-- [ ] Update `README.md` dev instructions (Vite dev + proxy; `cargo build` embeds).
-- [ ] `npm run build` is clean; bundle size noted in PR (target: tiny, no framework bloat).
+- [x] Delete `src/web/client.html` only after the new app reaches feature parity.
+      Already gone — `src/web/` contains only `mod.rs`.
+- [x] Update `README.md` dev instructions (Vite dev + proxy; `cargo build` embeds).
+      Updated the Architecture table's "Web client" row, added Node/npm to
+      Build dependencies, and added a "Web client dev loop" section
+      documenting `cargo run` + `cd web && npm run dev` side by side.
+- [x] `npm run build` is clean; bundle size noted in PR (target: tiny, no framework bloat).
+      `dist/index.html` 0.42 kB, `assets/index-*.css` 1.50 kB (gzip 0.67 kB),
+      `assets/index-*.js` 46.38 kB (gzip 17.09 kB). `npm run check`: 0 errors,
+      0 warnings across 142 files. `cargo test -- --test-threads=1`: full
+      suite green.
 - [ ] Manual verification with the `verify`/`run` skills on a phone or DPR>1 emulation:
       edges, sharpness, rotation, panel open/close, fullscreen, stats populate,
       latency reports still reach the adaptive-bitrate controller.
+      Still open — needs real phone/DPR>1 hardware, not done in this pass.
 
 ## 11. Acceptance checklist (mobile-first)
 
