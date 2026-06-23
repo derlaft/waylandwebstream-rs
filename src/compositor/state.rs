@@ -532,8 +532,17 @@ impl WaylandWebStreamState {
     pub fn pointer_axis(&mut self, delta_x: f64, delta_y: f64) {
         let Some(pointer) = self.seat.get_pointer() else { return };
         let time = self.clock.now().as_millis();
+        // `Continuous` rather than `Wheel`: the browser can't tell us whether
+        // the delta came from a touchpad or a notched wheel, and tagging it
+        // `Wheel` makes clients like GTK accumulate deltas up to a discrete
+        // click threshold (~10px) before scrolling -- exactly the "have to
+        // scroll far before anything happens" behavior on a touchpad, whose
+        // per-event deltas are only a few pixels. `Continuous` is applied
+        // immediately with no notch quantization, which also scrolls fine
+        // for real wheel deltas (they're just applied smoothly instead of
+        // as separate clicks).
         let frame = AxisFrame::new(time)
-            .source(AxisSource::Wheel)
+            .source(AxisSource::Continuous)
             .value(Axis::Horizontal, delta_x)
             .value(Axis::Vertical, delta_y);
         pointer.axis(self, frame);
