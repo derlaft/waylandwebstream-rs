@@ -7,6 +7,13 @@ use tracing::{error, info, warn};
 #[derive(Clone)]
 pub struct RawFrame {
     pub data: Vec<u8>,
+    /// Dimensions `data` was rendered at. Carried alongside the buffer
+    /// (rather than inferred from the encoder's current `EncoderConfig`)
+    /// because a resize notification on `resize_rx` and the first frame
+    /// rendered at the new size can both reach the encoder thread before it
+    /// next checks `resize_rx` -- see the mismatch check in `encoder_thread`.
+    pub width: u32,
+    pub height: u32,
     /// When the render loop captured this frame -- the start of the
     /// server-side latency pipeline (see `capture_to_encode_ms` below).
     pub capture_instant: std::time::Instant,
@@ -163,6 +170,34 @@ pub fn spawn_encoder(
     ))
 }
 
+/// Reconfigures `config` to `width`x`height` and rebuilds everything that's
+/// sized off it (encoder, scaler, input/yuv frames), resetting `frame_count`
+/// so the next frame starts a fresh GOP with an IDR. Shared by the proactive
+/// `resize_rx` handler and the frame-size safety net in `encoder_thread`.
+fn reinitialize_for_resolution(
+    config: &mut EncoderConfig,
+    width: u32,
+    height: u32,
+    encoder: &mut ffmpeg::encoder::Video,
+    scaler: &mut ffmpeg::software::scaling::Context,
+    input_frame: &mut ffmpeg::frame::Video,
+    yuv_frame: &mut ffmpeg::frame::Video,
+    frame_count: &mut i64,
+    codec_tx: &watch::Sender<String>,
+) -> Result<()> {
+    config.width = width;
+    config.height = height;
+
+    *encoder = create_encoder(config)?;
+    *scaler = create_scaler(config)?;
+    *input_frame = create_input_frame(config.width, config.height);
+    *yuv_frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, config.width, config.height);
+    *frame_count = 0;
+    let _ = codec_tx.send(h264_codec_string(config.width, config.height, config.framerate));
+
+    Ok(())
+}
+
 /// Drain and apply any pending control messages without blocking. Split out
 /// so it can be called both before and after waiting for the next raw
 /// frame -- see the call site after `blocking_recv` for why that second
@@ -252,26 +287,16 @@ fn encoder_thread(
                     let _ = buffer_return_tx.send(stale_frame.data);
                 }
 
-                // Update config
-                config.width = resize.width;
-                config.height = resize.height;
-
                 // Reinitialize encoder and scaler
-                match (create_encoder(&config), create_scaler(&config)) {
-                    (Ok(new_encoder), Ok(new_scaler)) => {
-                        encoder = new_encoder;
-                        scaler = new_scaler;
-                        input_frame = create_input_frame(config.width, config.height);
-                        yuv_frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, config.width, config.height);
-                        frame_count = 0; // Reset frame count to force IDR
-                        let _ = codec_tx.send(h264_codec_string(config.width, config.height, config.framerate));
-                        info!("Encoder reinitialized successfully");
-                    }
-                    (Err(e), _) | (_, Err(e)) => {
-                        error!("Failed to reinitialize encoder: {}", e);
-                        return Err(e);
-                    }
+                if let Err(e) = reinitialize_for_resolution(
+                    &mut config, resize.width, resize.height,
+                    &mut encoder, &mut scaler, &mut input_frame, &mut yuv_frame,
+                    &mut frame_count, &codec_tx,
+                ) {
+                    error!("Failed to reinitialize encoder: {}", e);
+                    return Err(e);
                 }
+                info!("Encoder reinitialized successfully");
             }
         }
 
@@ -283,6 +308,33 @@ fn encoder_thread(
                 break;
             }
         };
+
+        // Safety net: normally the resize check above already reconfigures
+        // the encoder ahead of the frame that needs it (and drains anything
+        // captured at the old size). But `resize_rx` and `frame_rx` are
+        // separate channels with no joint ordering guarantee on the consumer
+        // side -- this thread can park in `blocking_recv` and wake up to a
+        // frame rendered at a *new* size before it ever observes the resize
+        // notification for it (e.g. the very first frame after startup,
+        // sized to whatever viewport the connecting client reports). Trust
+        // the frame's own declared dimensions over `config` so that case
+        // still encodes correctly instead of bailing with a buffer-size
+        // mismatch.
+        if raw_frame.width != config.width || raw_frame.height != config.height {
+            info!(
+                "Frame arrived at {}x{} while encoder was configured for {}x{}; reinitializing to match",
+                raw_frame.width, raw_frame.height, config.width, config.height
+            );
+            if let Err(e) = reinitialize_for_resolution(
+                &mut config, raw_frame.width, raw_frame.height,
+                &mut encoder, &mut scaler, &mut input_frame, &mut yuv_frame,
+                &mut frame_count, &codec_tx,
+            ) {
+                error!("Failed to reinitialize encoder for frame's actual resolution: {}", e);
+                let _ = buffer_return_tx.send(raw_frame.data);
+                return Err(e);
+            }
+        }
 
         // Drain again now that we actually have a frame in hand: a
         // ForceKeyframe sent right before this exact frame was produced
@@ -615,6 +667,8 @@ mod tests {
     fn make_raw_frame(width: u32, height: u32) -> RawFrame {
         RawFrame {
             data: vec![0u8; (width * height * 4) as usize],
+            width,
+            height,
             capture_instant: std::time::Instant::now(),
         }
     }
@@ -675,5 +729,56 @@ mod tests {
         frame_tx.send(make_raw_frame(config.width, config.height)).await.unwrap();
         let packet = handle.recv_packet().await.expect("expected a packet");
         assert!(!packet.is_keyframe, "keyframe request should not affect frames after the one it targeted");
+    }
+
+    /// Regression test for a startup race: a connecting client's viewport
+    /// resize and the first frame rendered at that new size both reach the
+    /// encoder thread before it ever observes the `resize_rx` notification
+    /// for it (it can be parked in `blocking_recv` from before the resize
+    /// was even sent). That used to make `encode_frame` compare an
+    /// already-correctly-sized buffer against the *old* `EncoderConfig`
+    /// dimensions and bail with a "too small" error. Exercise it directly by
+    /// sending a frame sized for a different resolution without ever
+    /// touching `resize_tx` -- the encoder should reinitialize to match the
+    /// frame instead of erroring.
+    #[tokio::test]
+    async fn frame_size_mismatch_reinitializes_encoder() {
+        let config = EncoderConfig {
+            width: 1280,
+            height: 720,
+            framerate: 30,
+            rate_control: RateControl::Bitrate(2_000_000),
+            keyframe_interval: 1000,
+        };
+        let (codec_tx, mut codec_rx) = watch::channel(String::new());
+        let (mut handle, _buffer_return_rx, _join_handle) =
+            spawn_encoder(config.clone(), codec_tx).expect("failed to spawn encoder");
+
+        let frame_tx = handle.get_frame_sender();
+
+        // Never sent on resize_tx -- the encoder thread only learns about
+        // this resolution from the frame's own width/height.
+        let (new_width, new_height) = (800, 592);
+        frame_tx.send(make_raw_frame(new_width, new_height)).await.unwrap();
+
+        let packet = tokio::time::timeout(std::time::Duration::from_secs(5), handle.recv_packet())
+            .await
+            .expect("encoder should not hang on a mismatched frame size")
+            .expect("expected a packet");
+        assert!(packet.is_keyframe, "reinitializing for the new size should reset the GOP");
+
+        // codec_tx should reflect the new resolution.
+        codec_rx.changed().await.unwrap();
+        let codec = codec_rx.borrow().clone();
+        assert!(!codec.is_empty(), "codec string should be updated for the new resolution");
+
+        // A second frame at the same (new) size should encode normally, with
+        // no further reinitialization needed.
+        frame_tx.send(make_raw_frame(new_width, new_height)).await.unwrap();
+        let packet = tokio::time::timeout(std::time::Duration::from_secs(5), handle.recv_packet())
+            .await
+            .expect("follow-up frame at the same size should encode without hanging")
+            .expect("expected a packet");
+        assert!(!packet.is_keyframe, "frame after the reinit should not force another IDR");
     }
 }
