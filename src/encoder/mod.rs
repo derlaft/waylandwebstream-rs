@@ -488,3 +488,72 @@ fn encode_frame(
 
     Ok(packets)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_raw_frame(width: u32, height: u32) -> RawFrame {
+        RawFrame {
+            data: vec![0u8; (width * height * 4) as usize],
+            capture_time: std::time::Instant::now(),
+        }
+    }
+
+    /// Regression test for a real bug found while wiring up forced
+    /// keyframes for new `/stream` clients: `EncoderControl::ForceKeyframe`
+    /// used to just reset a local PTS counter, which libx264 ignores for
+    /// IDR placement (it uses its own internal counter against
+    /// `g`/`keyint_min`), so requested keyframes silently never happened.
+    /// The fix tags the frame `AV_PICTURE_TYPE_I`, which libx264 does honor.
+    ///
+    /// Also exercises the case that mirrors production: the keyframe
+    /// request and the frame it's meant to apply to arrive back-to-back
+    /// (a `/stream` connect requests a keyframe, and the capture loop
+    /// renders+sends a frame for it moments later) -- this depends on the
+    /// encoder thread draining the control channel again after
+    /// `blocking_recv`, not just before it.
+    #[tokio::test]
+    async fn force_keyframe_actually_forces_an_idr() {
+        let config = EncoderConfig {
+            width: 64,
+            height: 64,
+            framerate: 30,
+            rate_control: RateControl::Bitrate(500_000),
+            // Large enough that nothing in this test's frame count crosses
+            // a natural GOP boundary on its own -- every keyframe we see
+            // must come from an explicit ForceKeyframe.
+            keyframe_interval: 1000,
+        };
+        let (mut handle, _buffer_return_rx) =
+            spawn_encoder(config.clone()).expect("failed to spawn encoder");
+
+        let frame_tx = handle.get_frame_sender();
+        let control_tx = handle.get_control_sender();
+
+        // The first frame of a fresh GOP is always a keyframe -- baseline
+        // sanity check, not the thing under test.
+        frame_tx.send(make_raw_frame(config.width, config.height)).await.unwrap();
+        let packet = handle.recv_packet().await.expect("expected a packet");
+        assert!(packet.is_keyframe, "first frame of a GOP should be a keyframe");
+
+        // Ordinary frames with nothing requested should be P-frames.
+        for _ in 0..3 {
+            frame_tx.send(make_raw_frame(config.width, config.height)).await.unwrap();
+            let packet = handle.recv_packet().await.expect("expected a packet");
+            assert!(!packet.is_keyframe, "frame without a keyframe request should not be an IDR");
+        }
+
+        // Request a keyframe, then immediately send the next frame with no
+        // delay -- exercises the post-`blocking_recv` drain.
+        control_tx.send(EncoderControl::ForceKeyframe).await.unwrap();
+        frame_tx.send(make_raw_frame(config.width, config.height)).await.unwrap();
+        let packet = handle.recv_packet().await.expect("expected a packet");
+        assert!(packet.is_keyframe, "ForceKeyframe should make the next frame an IDR");
+
+        // The request should not stick beyond that one frame.
+        frame_tx.send(make_raw_frame(config.width, config.height)).await.unwrap();
+        let packet = handle.recv_packet().await.expect("expected a packet");
+        assert!(!packet.is_keyframe, "keyframe request should not affect frames after the one it targeted");
+    }
+}
