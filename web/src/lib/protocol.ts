@@ -11,7 +11,9 @@ export interface TouchPoint {
   pressure: number;
 }
 
-export type TouchEvent =
+// Named `*Message`, not `TouchEvent`/`PointerEvent`, to avoid shadowing the
+// DOM's own ambient `TouchEvent`/`PointerEvent` types that input.ts needs.
+export type TouchMessage =
   | { eventType: 'touchstart'; touches: TouchPoint[] }
   | { eventType: 'touchmove'; touches: TouchPoint[] }
   | { eventType: 'touchend'; touches: TouchPoint[] }
@@ -25,7 +27,7 @@ export interface PointerPoint {
   pressure: number;
 }
 
-export type PointerEvent =
+export type PointerMessage =
   | { eventType: 'pointerdown'; pointer: PointerPoint }
   | { eventType: 'pointermove'; pointer: PointerPoint }
   | { eventType: 'pointerup'; pointer: PointerPoint }
@@ -36,8 +38,8 @@ export type PointerEvent =
 export type ClientMessage =
   | { type: 'ready' }
   | { type: 'resize'; width: number; height: number }
-  | ({ type: 'touch' } & TouchEvent)
-  | ({ type: 'pointer' } & PointerEvent)
+  | ({ type: 'touch' } & TouchMessage)
+  | ({ type: 'pointer' } & PointerMessage)
   | { type: 'request_keyframe' }
   | {
       type: 'latency';

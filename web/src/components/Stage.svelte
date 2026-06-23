@@ -1,0 +1,78 @@
+<script lang="ts">
+  import { onDestroy, onMount } from 'svelte';
+  import { ControlChannel } from '../lib/control';
+  import { attachInput } from '../lib/input';
+  import type { ClientMessage } from '../lib/protocol';
+  import { VideoStream } from '../lib/stream';
+  import { Viewport } from '../lib/viewport';
+
+  let canvas: HTMLCanvasElement;
+
+  let control: ControlChannel | null = null;
+  let stream: VideoStream | null = null;
+  let viewport: Viewport | null = null;
+  let detachInput: (() => void) | null = null;
+
+  function sendControl(msg: ClientMessage): void {
+    control?.send(msg);
+  }
+
+  function teardown(): void {
+    detachInput?.();
+    detachInput = null;
+    viewport?.stop();
+    viewport = null;
+    stream?.close();
+    stream = null;
+    control?.close();
+    control = null;
+  }
+
+  onMount(() => {
+    control = new ControlChannel();
+    control.connect();
+
+    stream = new VideoStream({ canvas, sendControl });
+    stream.connect();
+
+    viewport = new Viewport({
+      canvas,
+      sendControl,
+      onResizeSent: () => stream?.notifyResizeRequested(),
+    });
+    viewport.start();
+
+    detachInput = attachInput(canvas, sendControl);
+
+    window.addEventListener('beforeunload', teardown);
+  });
+
+  onDestroy(() => {
+    window.removeEventListener('beforeunload', teardown);
+    teardown();
+  });
+</script>
+
+<div class="stage">
+  <canvas bind:this={canvas}></canvas>
+</div>
+
+<style>
+  .stage {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+  }
+
+  canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+  }
+</style>

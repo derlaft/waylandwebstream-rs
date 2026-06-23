@@ -139,7 +139,7 @@ Preserve every comment-documented policy:
   only, not a live browser run. Bundle size is unchanged after adding these
   files, confirming they're currently dead code pending that wiring.
 
-## 6. Phase 3 — Viewport / scaling / resize (`lib/viewport.ts`) — THE bug fix
+## 6. Phase 3 — Viewport / scaling / resize (`lib/viewport.ts`) — THE bug fix ✅ module done, ⏳ acceptance pending Phase 4
 
 This is the heart of the rewrite. Root cause of the old bug: resize used CSS
 px (no DPR), the canvas's CSS size ended up equal to its buffer size and got
@@ -147,21 +147,33 @@ flex-centered, creating edge dead zones and a blurry sub-DPR image.
 
 New model — **1:1 device pixel, top-left aligned, scaleFactor-aware**:
 
-- [ ] Read `dpr = window.devicePixelRatio || 1`. Define `scaleFactor` (default `1`;
+- [x] Read `dpr = window.devicePixelRatio || 1`. Define `scaleFactor` (default `1`;
       future `2` halves render resolution for hidpi perf). Expose as a store so a
       later button can flip it.
-- [ ] Use `window.visualViewport` when available (correct under mobile browser
+- [x] Use `window.visualViewport` when available (correct under mobile browser
       chrome / soft keyboard); fall back to `window.innerWidth/Height`.
-- [ ] Compute **render resolution** (sent to server), each dim:
+- [x] Compute **render resolution** (sent to server), each dim:
       `render = floor(viewportCssPx * dpr / scaleFactor / 16) * 16`.
       Clamp to server `max_resolution`. This is the `{type:"resize",width,height}`.
-- [ ] The decoded frame comes back at `render`. Set **canvas buffer** = frame size
+
+      The server doesn't expose its configured `max_resolution` over the wire
+      (and doesn't even enforce it server-side on resize requests today — see
+      `src/main.rs`'s resize handling), and adding a new message would mean
+      touching the protocol section 3 says not to change. So the clamp is a
+      hardcoded constant mirroring the CLI default (3840x2160) — a
+      conservative client-side sanity bound, not authoritative. Documented in
+      `lib/viewport.ts`.
+- [x] The decoded frame comes back at `render`. Set **canvas buffer** = frame size
       (handled in stream.ts). Set **canvas CSS size** = `render * scaleFactor / dpr`
       px → ≈ viewport minus the sub-16px flooring remainder. Result: sharp 1:1
       mapping with a thin margin on right/bottom (acceptable, documented).
-- [ ] Position canvas **top-left** of a black full-viewport container (margins sit
+- [x] Position canvas **top-left** of a black full-viewport container (margins sit
       bottom/right, deterministic — not centered, so input math is simple).
-- [ ] **Throttle** resize: debounce ~300ms AND drop no-op requests (only send if the
+
+      `viewport.ts` only sets the canvas's CSS width/height; the actual
+      top-left-in-a-black-container layout is static CSS owned by
+      `Stage.svelte`, which doesn't exist yet (Phase 4).
+- [x] **Throttle** resize: debounce ~300ms AND drop no-op requests (only send if the
       computed /16 dims actually changed). Fire on `resize`, `orientationchange`,
       `visualViewport` `resize`/`scroll`, and once on load. On send, reset
       `canvasSized` so the next frame re-measures the buffer.
@@ -169,21 +181,64 @@ New model — **1:1 device pixel, top-left aligned, scaleFactor-aware**:
       visible canvas including all four edges; image is crisp (no blur); rotating
       the device and opening the side panel never offsets input.
 
-## 7. Phase 4 — Input (`lib/input.ts`, wired in `Stage.svelte`)
+      Now wired and exercised headlessly via Phase 4's verification
+      (synthetic pointer/wheel events landed at the expected normalized
+      coordinates, canvas rendered sharp at the negotiated resolution).
+      Still left unchecked here pending **real phone/DPR>1 hardware**
+      testing — synthetic/headless input doesn't exercise actual touch
+      hardware, device rotation, or the side panel (not built yet). Real
+      device pass is Phase 7's job.
+
+## 7. Phase 4 — Input (`lib/input.ts`, wired in `Stage.svelte`) ✅ done
 
 Carry over current handlers; normalize against the **live** canvas
 `getBoundingClientRect()` every event (never a cached rect).
 
-- [ ] Touch: `touchstart/move/end/cancel`, `preventDefault`, `{passive:false}`.
+- [x] Touch: `touchstart/move/end/cancel`, `preventDefault`, `{passive:false}`.
       Normalize x,y to [0,1] vs canvas rect; **drop touches outside [0,1]** (margins).
       `touchend`/`cancel` use `changedTouches`.
-- [ ] Pointer (mouse/pen): ignore `pointerType==='touch'` (dedup vs touch handlers).
+- [x] Pointer (mouse/pen): ignore `pointerType==='touch'` (dedup vs touch handlers).
       `setPointerCapture` on down, release on up. `pointerdown/move/up/cancel`.
-- [ ] Wheel: `preventDefault`, send `{type:"pointer",eventType:"wheel",x,y,deltaX,deltaY}`.
-- [ ] `contextmenu` → `preventDefault` (right-click reaches remote).
-- [ ] `touch-action: none` on canvas; disable text selection / callouts on mobile.
-- [ ] Input must target the canvas only — the side panel must **not** forward its
+- [x] Wheel: `preventDefault`, send `{type:"pointer",eventType:"wheel",x,y,deltaX,deltaY}`.
+- [x] `contextmenu` → `preventDefault` (right-click reaches remote).
+- [x] `touch-action: none` on canvas; disable text selection / callouts on mobile.
+- [x] Input must target the canvas only — the side panel must **not** forward its
       own taps as remote input (stop propagation / panel sits above canvas).
+
+  Added `components/Stage.svelte`, the first component that actually wires
+  everything together: instantiates `ControlChannel` (see below),
+  `VideoStream`, `Viewport`, and `attachInput`, all sharing one
+  `sendControl` closure. `App.svelte` now renders `<Stage/>` instead of the
+  placeholder, so the new client is live end-to-end again.
+
+  Also added `lib/control.ts` (`ControlChannel`: `/ws` connect, send-queue
+  buffering until OPEN, `{type:"ready"}` on open), pulled forward from its
+  nominal Phase 5 slot because Stage.svelte cannot assemble a working
+  `sendControl` without it. Phase 5's remaining scope (pushing connection
+  state into `stats.ts`, auto-reconnect, the side panel UI itself) is still
+  open.
+
+  Renamed `protocol.ts`'s `TouchEvent`/`PointerEvent` message types to
+  `TouchMessage`/`PointerMessage` — they were shadowing the DOM's own
+  ambient `TouchEvent`/`PointerEvent` types, which `input.ts` needs.
+
+  Verified live in a browser via a background agent driving headless
+  Chromium against the real server + a Wayland test client: canvas
+  decodes and renders real (non-black) content at the negotiated
+  resolution; synthetic pointerdown/move/up and wheel events produced the
+  exact `/ws` JSON shapes the protocol expects and were confirmed
+  server-side (`Received resize request...`, ready handshake); contextmenu
+  was suppressed (`defaultPrevented === true`, no native menu); wheel
+  `preventDefault` confirmed (`window.scrollY` stayed `0`); zero page
+  errors (one pre-existing, unrelated `/favicon.ico` 404 console error).
+  `tests/integration_test.rs::test_compositor_pipeline` (the Puppeteer
+  screenshot test that needed a live canvas) now passes again — confirmed
+  via `cargo test -- --test-threads=1` (full suite green). Note: that test
+  and `test_compositor_startup` both hardcode the Wayland display name
+  `wayland-test-0`, so they collide if run in parallel — run integration
+  tests with `--test-threads=1`, or accept that default `cargo test`
+  parallelism can spuriously fail them (pre-existing, unrelated to this
+  phase).
 
 ## 8. Phase 5 — Control channel, side panel, fullscreen, stats
 
