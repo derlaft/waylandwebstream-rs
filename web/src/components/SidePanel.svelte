@@ -77,6 +77,13 @@
     align-items: flex-start;
     transform: translateX(calc(100% - 32px));
     transition: transform 0.2s ease-out;
+    /* The flex container's own box spans the full screen height even
+       though only the 48px-tall .tab button is ever drawn in it -- without
+       this, that empty space (the whole right edge of the screen, full
+       height, 32px wide once collapsed) would still intercept pointer/touch
+       events meant for the canvas underneath. .tab and .content opt back
+       into hit-testing individually below. */
+    pointer-events: none;
   }
 
   .panel.open {
@@ -95,6 +102,7 @@
     font-size: 18px;
     line-height: 1;
     cursor: pointer;
+    pointer-events: auto;
   }
 
   .content {
@@ -108,5 +116,6 @@
     display: flex;
     flex-direction: column;
     gap: 16px;
+    pointer-events: auto;
   }
 </style>
