@@ -15,10 +15,11 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, watch};
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::adaptive_bitrate::BitrateEvent;
 use crate::encoder::{EncodedPacket, EncoderControl};
@@ -41,6 +42,24 @@ use crate::web::{serve_asset, serve_index};
 /// is robust to them. A handful of incidental near-simultaneous arrivals
 /// can happen by chance, hence a small floor rather than firing on >=1.
 const ARRIVAL_STALL_BURST_THRESHOLD: u32 = 5;
+
+/// Minimum spacing between honoring two `RequestKeyframe` resyncs. A client
+/// genuinely too overloaded to keep up (e.g. its decode throughput can't
+/// match the configured resolution/framerate at all, not just a transient
+/// blip) re-backlogs and re-requests within a handful of frames of the last
+/// forced keyframe -- observed in practice as a tight loop, every keyframe
+/// arriving just makes the client clear its queue for a couple of frames
+/// before falling behind again. Forcing a *new* keyframe on every one of
+/// those requests only makes things worse: keyframes are bigger and slower
+/// to decode than the delta frames they replace, so spamming them feeds
+/// more load into an already-overloaded pipe. The adaptive-bitrate cut this
+/// also triggers (`BitrateEvent::KeyframeRequested`) is the actual remedy,
+/// but it has its own multi-second cooldown (`decrease_cooldown`) -- without
+/// this gate, dozens of full-size forced keyframes can go out before a
+/// single cut lands. Unlike `decrease_cooldown`, this applies unconditionally
+/// (even with adaptive bitrate disabled), since the keyframe-spam problem
+/// exists independent of whether the bitrate is allowed to change.
+const KEYFRAME_FORCE_COOLDOWN: Duration = Duration::from_millis(500);
 
 /// Signaling messages between client and server
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +188,12 @@ pub struct SignalingState {
     /// Lazily starts the session's configured client app on the first
     /// `/ws` or `/stream` connection. A no-op if no command was configured.
     session: SessionManager,
+    /// When a `RequestKeyframe` resync was last actually honored (forced a
+    /// new keyframe), shared across every `/ws` connection -- see
+    /// `KEYFRAME_FORCE_COOLDOWN`. Plain `std::sync::Mutex` rather than
+    /// tokio's: the critical section is a single comparison/store, never
+    /// held across an `.await`.
+    last_keyframe_force: Arc<Mutex<Instant>>,
 }
 
 impl SignalingState {
@@ -188,6 +213,11 @@ impl SignalingState {
         session: SessionManager,
     ) -> Self {
         let (video_tx, _) = broadcast::channel(3);
+        // Backdated so the very first `RequestKeyframe` after startup is
+        // never suppressed by the cooldown.
+        let last_keyframe_force = Instant::now()
+            .checked_sub(KEYFRAME_FORCE_COOLDOWN)
+            .unwrap_or_else(Instant::now);
         Self {
             resize_tx,
             touch_tx,
@@ -203,6 +233,7 @@ impl SignalingState {
             codec_rx,
             shutdown_rx,
             session,
+            last_keyframe_force: Arc::new(Mutex::new(last_keyframe_force)),
         }
     }
 
@@ -324,12 +355,32 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                     }
                     SignalingMessage::RequestKeyframe => {
                         info!("Client requested a keyframe resync (decoder fell behind)");
-                        state.force_render.store(true, Ordering::Relaxed);
-                        if let Err(e) = state.encoder_control_tx.send(EncoderControl::ForceKeyframe).await {
-                            warn!("Failed to request keyframe resync: {}", e);
-                        }
+                        // Always feed the congestion signal -- `BitrateAlgorithm`
+                        // has its own (longer) cooldown on actually cutting, so
+                        // this can't over-cut even when called every loop of a
+                        // tight resync spiral.
                         if let Some(ref bitrate_event_tx) = state.bitrate_event_tx {
                             let _ = bitrate_event_tx.send(BitrateEvent::KeyframeRequested).await;
+                        }
+                        // But don't force a *new* keyframe more often than
+                        // `KEYFRAME_FORCE_COOLDOWN` -- see its doc comment for
+                        // why honoring every request here can spiral.
+                        let should_force = {
+                            let mut last = state.last_keyframe_force.lock().unwrap();
+                            if last.elapsed() >= KEYFRAME_FORCE_COOLDOWN {
+                                *last = Instant::now();
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if should_force {
+                            state.force_render.store(true, Ordering::Relaxed);
+                            if let Err(e) = state.encoder_control_tx.send(EncoderControl::ForceKeyframe).await {
+                                warn!("Failed to request keyframe resync: {}", e);
+                            }
+                        } else {
+                            debug!("Suppressing keyframe resync, last one was less than {:?} ago", KEYFRAME_FORCE_COOLDOWN);
                         }
                     }
                     SignalingMessage::Ping { client_ts } => {
