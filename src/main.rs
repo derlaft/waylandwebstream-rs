@@ -49,6 +49,7 @@ async fn main() -> Result<()> {
     // close frame instead of just vanishing) and the packet-forwarding
     // task (so it releases its `EncoderHandle` instead of running forever).
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let session_shutdown_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         let ctrl_c = async {
             tokio::signal::ctrl_c()
@@ -329,7 +330,7 @@ async fn main() -> Result<()> {
     // by `SignalingState`'s connection handlers on the first `/ws` or
     // `/stream` connection rather than here, so an idle server with nobody
     // watching never runs it.
-    let session = SessionManager::new(config.command.clone(), config.display_name.clone());
+    let session = SessionManager::new(config.command.clone(), config.display_name.clone(), session_shutdown_tx);
 
     // Create signaling state and server
     let signaling_state = SignalingState::new(

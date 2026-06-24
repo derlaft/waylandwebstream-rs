@@ -623,7 +623,7 @@ mod tests {
         let (pending_ping_tx, _pending_ping_rx) = mpsc::channel(4);
         let (_bitrate_tx, bitrate_rx) = watch::channel(2_000_000usize);
         let (_codec_tx, codec_rx) = watch::channel(String::new());
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let force_render = Arc::new(AtomicBool::new(false));
 
         let state = SignalingState::new(
@@ -639,7 +639,7 @@ mod tests {
             bitrate_rx,
             codec_rx,
             shutdown_rx,
-            SessionManager::new(Vec::new(), String::new()),
+            SessionManager::new(Vec::new(), String::new(), shutdown_tx),
         );
         let video_tx = state.get_video_sender();
         let server = SignalingServer::new(state);
