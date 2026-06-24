@@ -14,8 +14,9 @@ export function attachInput(
       const touch = touchList[i];
       const x = (touch.clientX - rect.left) / rect.width;
       const y = (touch.clientY - rect.top) / rect.height;
-      // Drop touches outside [0,1] -- the sub-16px margin at the
-      // right/bottom edge of the canvas from viewport.ts's /16 flooring.
+      // Drop touches outside [0,1] -- a defensive clamp against
+      // floating-point rect math at the exact edge, now that the canvas's
+      // CSS box always matches the viewport exactly (see viewport.ts).
       if (x >= 0 && x <= 1 && y >= 0 && y <= 1) {
         touches.push({ identifier: touch.identifier, x, y, pressure: touch.force || 0.5 });
       }

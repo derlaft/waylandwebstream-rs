@@ -109,13 +109,23 @@ export class Viewport {
 
   private update(): void {
     const render = computeRenderResolution(this.currentScale);
+    const viewport = getViewportCssSize();
 
-    // Canvas CSS size = render * scaleFactor -- approximately the full
-    // viewport minus the sub-16px flooring remainder. Top-left alignment
-    // within the black full-viewport container is plain static CSS on
-    // Stage.svelte; this only ever sets width/height.
-    this.canvas.style.width = `${render.width * this.currentScale}px`;
-    this.canvas.style.height = `${render.height * this.currentScale}px`;
+    // Canvas CSS size always fills the full viewport edge-to-edge, even
+    // though the render resolution sent to the server is a few px smaller
+    // (the /16 flooring, plus whatever scaleFactor subtracts) -- the
+    // browser stretches the canvas's bitmap to whatever CSS box it's
+    // given for free, so there's no visual cost. Sizing the CSS box to
+    // `render` instead, as before, left a sub-16px dead strip at the
+    // right/bottom edge of the viewport that was part of `.stage` but
+    // outside the canvas -- and so outside every touch/pointer listener,
+    // since those only ever attach to the canvas itself. Negligible on a
+    // wide desktop viewport, but a much bigger fraction of a narrow phone
+    // screen, where it read as touches near the edge being swallowed.
+    // Top-left alignment within the black full-viewport container is
+    // plain static CSS on Stage.svelte; this only ever sets width/height.
+    this.canvas.style.width = `${viewport.width}px`;
+    this.canvas.style.height = `${viewport.height}px`;
 
     if (this.lastSent && this.lastSent.width === render.width && this.lastSent.height === render.height) {
       return;
