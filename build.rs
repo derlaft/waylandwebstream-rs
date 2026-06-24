@@ -24,37 +24,40 @@ fn main() {
     let web_dir = Path::new("web");
     let dist_index = web_dir.join("dist").join("index.html");
 
-    // `cargo:rerun-if-changed` only dedups reruns within one fingerprint
-    // bucket -- a plain `cargo build` and e.g. rust-analyzer's
-    // `cargo check --all-targets` get *different* buckets (different flags),
-    // so each one's first-ever invocation of this script still pays the
-    // full `npm ci` cost on a freshly checked-out repo, even back-to-back.
-    // Checking dist's freshness against the actual filesystem -- instead of
-    // only trusting "is this the first time *this* fingerprint ran" --
-    // makes every invocation after the very first one a no-op, regardless
-    // of which Cargo command triggers it.
-    if let Some(dist_mtime) = modified(&dist_index) {
-        let stale = WATCHED_PATHS
-            .iter()
-            .any(|p| is_newer_than(&web_dir.join(p), dist_mtime));
-        if !stale {
-            return;
+    // We only ever invoke npm automatically when `web/dist` doesn't exist at
+    // all (e.g. a fresh checkout). Once it exists, we never rebuild it for
+    // the caller automatically -- we just warn if it looks stale. Auto-
+    // rebuilding on every detected staleness used to retrigger `npm ci` +
+    // `npm run build` repeatedly whenever something (e.g. rust-analyzer
+    // firing `cargo check` on every save) invoked this script in quick
+    // succession, since each npm run's own filesystem writes could make the
+    // *next* invocation's staleness check fire again. Building at most once
+    // per checkout removes that loop entirely.
+    if dist_index.exists() {
+        if let Some(dist_mtime) = modified(&dist_index) {
+            let stale = WATCHED_PATHS
+                .iter()
+                .any(|p| is_newer_than(&web_dir.join(p), dist_mtime));
+            if stale {
+                println!(
+                    "cargo:warning=web/dist looks older than the frontend sources; \
+                     rebuild it manually with `cd web && npm run build` (or `npm ci && npm run build`) \
+                     if you've changed the web client."
+                );
+            }
         }
+        return;
     }
 
     if Command::new("npm").arg("--version").output().is_err() {
-        if dist_index.exists() {
-            println!(
-                "cargo:warning=npm not found; reusing existing web/dist (may be stale)"
-            );
-            return;
-        }
         panic!(
             "npm not found on PATH and no prebuilt web/dist/ exists. \
-             Install Node.js/npm to build the web client, or commit a prebuilt web/dist/."
+             Install Node.js/npm and run `cd web && npm ci && npm run build`, \
+             or commit a prebuilt web/dist/."
         );
     }
 
+    println!("cargo:warning=web/dist not found; running `npm ci && npm run build` once");
     run(web_dir, "npm", &["ci"]);
     run(web_dir, "npm", &["run", "build"]);
 }
