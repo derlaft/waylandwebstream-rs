@@ -154,10 +154,6 @@ browser input → /ws WS → mpsc → compositor seat injection
   `web/dist/` with a warning, or panics if none exists.
 - For frontend work: `cargo run` (backend :8080) + `cd web && npm run dev`
   (Vite proxies `/ws` and `/stream`, HMR against the real compositor).
-- **Integration tests are not parallel-safe** — `test_compositor_pipeline` and
-  `test_compositor_startup` both hardcode the `wayland-test-0` display name and
-  collide. Run `cargo test -- --test-threads=1` (what `run_integration_test.sh`
-  does). This is pre-existing, not a regression you introduced.
 - `wayland-test-client/` is a minimal Wayland client used by the integration
   tests (and handy for manual checks against `--display-name`).
 

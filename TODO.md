@@ -36,10 +36,6 @@ before this is more than a viewing-only multi-client.
   parsed but the resize handler in `main.rs` doesn't clamp to it; the client
   clamps to a hardcoded 3840×2160 instead. Enforce on the server and consider
   advertising the real bound over `/ws` so the client stops guessing.
-- **No resize-spam guard.** Nothing server-side bounds resize-request rate (the
-  client debounces, but a hostile client could spam encoder reinits). A simple
-  rate limit is cheap insurance. (Note: this is DoS hardening, *not* auth — see
-  "Non-goals" below.)
 - **No metrics endpoint** (encode latency, bitrate, drops, active clients are
   logged but not exported).
 - **Containerization** (Dockerfile with FFmpeg + Wayland libs) doesn't exist.
@@ -70,10 +66,3 @@ before this is more than a viewing-only multi-client.
   needs repainting. Optional — the encoder already sees a full frame either way.
 - **A/B measurement** against Selkies: quantify the frame-pacing and
   jitter-buffer behavior on identical content (never formally measured).
-
-## Verification debt
-
-- **Real mobile / DPR>1 hardware pass.** The UI rewrite's edge-accuracy,
-  sharpness, rotation, side-panel-doesn't-shift-input, and fullscreen
-  acceptance criteria were only checked headlessly/synthetically. Needs a real
-  phone with `devicePixelRatio > 1`.
