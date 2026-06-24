@@ -69,6 +69,16 @@ pub struct Config {
     /// Wayland display name
     #[arg(long, default_value = "wayland-wws-0")]
     pub display_name: String,
+
+    /// Command to run as the session's client app, e.g.
+    /// `waylandwebstream -- foot -e vim`. Everything after `--` is passed
+    /// through verbatim as the program and its arguments. The session is
+    /// lazy: this command isn't started until the first browser connection
+    /// arrives, so an idle server with nobody watching never runs it. If
+    /// omitted, no child process is spawned -- Wayland clients can still be
+    /// launched manually against `--display-name` as before.
+    #[arg(last = true, value_name = "COMMAND")]
+    pub command: Vec<String>,
 }
 
 impl Config {
@@ -84,5 +94,29 @@ impl Config {
 
     pub fn get_initial_resolution(&self) -> anyhow::Result<(u32, u32)> {
         Self::parse_resolution(&self.initial_resolution)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_trailing_command_leaves_it_empty() {
+        let config = Config::parse_from(["waylandwebstream", "--port", "9999"]);
+        assert!(config.command.is_empty());
+        assert_eq!(config.port, 9999);
+    }
+
+    #[test]
+    fn trailing_command_with_hyphenated_args_is_captured_verbatim() {
+        let config = Config::parse_from([
+            "waylandwebstream", "--port", "9999", "--", "foot", "-e", "--some-flag", "value",
+        ]);
+        assert_eq!(config.port, 9999);
+        assert_eq!(
+            config.command,
+            vec!["foot", "-e", "--some-flag", "value"]
+        );
     }
 }

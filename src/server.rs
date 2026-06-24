@@ -26,6 +26,7 @@ use crate::input::keyboard::KeyboardEvent;
 use crate::input::mouse::MouseEvent;
 use crate::input::touch::TouchEvent;
 use crate::latency::LatencyReport;
+use crate::session::SessionManager;
 use crate::web::{serve_asset, serve_index};
 
 /// Number of within-~3ms frame arrivals (see
@@ -165,6 +166,9 @@ pub struct SignalingState {
     /// `axum::serve`'s graceful shutdown actually complete -- instead of
     /// only ending when the client happens to disconnect on its own.
     shutdown_rx: watch::Receiver<bool>,
+    /// Lazily starts the session's configured client app on the first
+    /// `/ws` or `/stream` connection. A no-op if no command was configured.
+    session: SessionManager,
 }
 
 impl SignalingState {
@@ -181,6 +185,7 @@ impl SignalingState {
         bitrate_rx: watch::Receiver<usize>,
         codec_rx: watch::Receiver<String>,
         shutdown_rx: watch::Receiver<bool>,
+        session: SessionManager,
     ) -> Self {
         let (video_tx, _) = broadcast::channel(3);
         Self {
@@ -197,6 +202,7 @@ impl SignalingState {
             bitrate_rx,
             codec_rx,
             shutdown_rx,
+            session,
         }
     }
 
@@ -261,6 +267,8 @@ async fn handle_websocket(
 }
 
 async fn websocket_handler(socket: WebSocket, state: SignalingState) {
+    state.session.ensure_started().await;
+
     let (mut sender, mut receiver) = socket.split();
     let mut bitrate_rx = state.bitrate_rx.clone();
     let mut codec_rx = state.codec_rx.clone();
@@ -453,6 +461,8 @@ fn encode_video_frame(packet: &EncodedPacket) -> Vec<u8> {
 
 async fn video_stream_handler(socket: WebSocket, state: SignalingState) {
     info!("Video stream client connected");
+    state.session.ensure_started().await;
+
     let (mut sender, _receiver) = socket.split();
     let mut video_rx = state.get_video_sender().subscribe();
     let mut shutdown_rx = state.shutdown_rx.clone();
@@ -578,6 +588,7 @@ mod tests {
             bitrate_rx,
             codec_rx,
             shutdown_rx,
+            SessionManager::new(Vec::new(), String::new()),
         );
         let video_tx = state.get_video_sender();
         let server = SignalingServer::new(state);

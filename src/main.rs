@@ -17,6 +17,7 @@ mod encoder;
 mod input;
 mod latency;
 mod server;
+mod session;
 mod web;
 
 use adaptive_bitrate::{AdaptiveBitrateConfig, AdaptiveBitrateController, BitrateEvent};
@@ -25,6 +26,7 @@ use encoder::{EncoderConfig, RateControl, spawn_encoder};
 use input::mouse::MouseHandler;
 use input::touch::TouchHandler;
 use server::{SignalingServer, SignalingState};
+use session::SessionManager;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -278,6 +280,12 @@ async fn main() -> Result<()> {
     // keyframe-cadence render.
     let force_render = Arc::new(AtomicBool::new(false));
 
+    // The session's client app, if one was given after `--`. Spawned lazily
+    // by `SignalingState`'s connection handlers on the first `/ws` or
+    // `/stream` connection rather than here, so an idle server with nobody
+    // watching never runs it.
+    let session = SessionManager::new(config.command.clone(), config.display_name.clone());
+
     // Create signaling state and server
     let signaling_state = SignalingState::new(
         resize_tx,
@@ -292,6 +300,7 @@ async fn main() -> Result<()> {
         bitrate_rx,
         codec_rx,
         shutdown_rx.clone(),
+        session.clone(),
     );
     let video_tx = signaling_state.get_video_sender();
     let signaling_server = SignalingServer::new(signaling_state);
@@ -576,6 +585,12 @@ async fn main() -> Result<()> {
     // clients to disconnect on their own.
     if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, server_join_handle).await.is_err() {
         warn!("Timed out waiting for the signaling server to finish");
+    }
+
+    // Session: kill the spawned client app, if one was ever started --
+    // otherwise it would outlive the compositor it depends on.
+    if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, session.shutdown()).await.is_err() {
+        warn!("Timed out waiting for the session's child process to be killed");
     }
 
     info!("Graceful shutdown complete");

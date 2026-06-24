@@ -139,6 +139,23 @@ on the next `cargo build`/`cargo run`.
 
 Then open `http://<server-ip>:8080` in a browser.
 
+### Sessions
+
+Everything after `--` is run as the session's client app, inside the
+compositor's headless Wayland display:
+
+```sh
+./waylandwebstream -- foot -e vim
+```
+
+The session is lazy: the command above isn't started at server launch, only
+once the first browser connection (`/ws` or `/stream`) arrives, so an idle
+server with nobody watching never runs it. It's started at most once per
+server run and killed on shutdown.
+
+If no command is given, no child process is spawned -- a Wayland client can
+still be launched manually against `--display-name` as before.
+
 ## Deployment Notes
 
 - The server just needs its HTTP port reachable from the client -- ordinary
