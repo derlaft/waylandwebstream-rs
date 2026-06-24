@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use smithay::{
     backend::{
-        allocator::dmabuf::Dmabuf,
+        allocator::{dmabuf::Dmabuf, Buffer as _},
         input::{Axis, AxisSource, ButtonState, KeyState, TouchSlot},
         renderer::{gles::GlesRenderer, utils::with_renderer_surface_state, ImportDma},
     },
@@ -21,9 +21,9 @@ use smithay::{
         calloop::EventLoop,
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
-            backend::{ClientData, ClientId, DisconnectReason},
+            backend::{ClientData, ClientId, DisconnectReason, ObjectId},
             protocol::{wl_seat, wl_surface::WlSurface},
-            Display, DisplayHandle,
+            Display, DisplayHandle, Resource,
         },
     },
     utils::{Clock, Logical, Monotonic, Point, Rectangle, Transform, SERIAL_COUNTER},
@@ -42,6 +42,7 @@ use smithay::{
     },
 };
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use tracing::{info, trace, warn};
 
@@ -82,6 +83,11 @@ pub struct WaylandWebStreamState {
     // `GlCompositor::renderer_handle`), not a second renderer.
     dmabuf_state: Option<DmabufState>,
     dmabuf_renderer: Option<Rc<RefCell<GlesRenderer>>>,
+
+    // Toplevels that have already received their post-first-commit "kick"
+    // configure -- see `commit`'s call to `configure_toplevel_fullscreen`
+    // below. Cleared per-surface in `toplevel_destroyed`.
+    kicked_toplevels: HashSet<ObjectId>,
 }
 
 impl WaylandWebStreamState {
@@ -95,8 +101,10 @@ impl WaylandWebStreamState {
 
         let dh = display.handle();
         
-        // Initialize all Wayland protocol states
-        let compositor_state = SmithayCompositorState::new::<Self>(&dh);
+        // Initialize all Wayland protocol states.
+        // Hyprland's Aquamarine backend requires wl_compositor >= 6; new() only
+        // advertises version 5, which makes it reject the bind and abort.
+        let compositor_state = SmithayCompositorState::new_v6::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         // Registers the wl_output/xdg-output globals as a side effect; the
@@ -151,6 +159,7 @@ impl WaylandWebStreamState {
             frame_counter: 0,
             dmabuf_state: None,
             dmabuf_renderer: None,
+            kicked_toplevels: HashSet::new(),
         }
     }
 
@@ -679,10 +688,17 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         info!("New toplevel surface created");
 
-        // Send initial configure to the client, sized to fill the output
+        // Stage the fullscreen size/state, but don't send the configure yet:
+        // `commit()` sends it on the client's first commit instead. Some
+        // clients (e.g. wlroots' nested Wayland backend, used by labwc/sway
+        // running nested) move their xdg_surface/xdg_toplevel proxies onto a
+        // private queue only right before their own initial commit, then
+        // busy-wait on just that queue for this configure. Sending it earlier
+        // risks the bytes being read and demultiplexed into the client's
+        // default queue before that swap happens, where they'd never be
+        // dispatched -- a permanent, silent hang on the client side.
         self.configure_toplevel_fullscreen(&surface);
-        surface.send_configure();
-        
+
         #[allow(deprecated)]
         let window = Window::new(surface);
         self.space.map_element(window, (0, 0), false);
@@ -698,6 +714,8 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        self.kicked_toplevels.remove(&surface.wl_surface().id());
+
         let window = self.space.elements()
             .find(|w| w.toplevel() == Some(&surface))
             .cloned();
@@ -767,6 +785,30 @@ impl smithay::wayland::compositor::CompositorHandler for WaylandWebStreamState {
         if let Some(window) = window {
             window.on_commit();
             trace!("Window surface committed");
+
+            // Nested wlroots compositors (e.g. sway run as this compositor's
+            // client) don't size their own emulated output from the very
+            // first xdg_toplevel configure -- that one only unblocks their
+            // first commit, since nothing has been displayed yet for them to
+            // resize *from*. They only actually adopt a suggested size from
+            // a configure that arrives once they're already mapped and have
+            // committed at least once, same as a real interactive window
+            // resize would deliver. Manually proved out: resizing the
+            // browser window after such a client has mapped (sending it
+            // another, otherwise-identical configure) fixes it; restarting
+            // the client without ever touching the browser reproduces the
+            // undersized render every time. So immediately after a
+            // toplevel's first-ever commit, send it a second configure
+            // identical to the first -- this reproduces that fix
+            // automatically instead of requiring the user to nudge the
+            // browser window.
+            if let Some(toplevel) = window.toplevel() {
+                let surface_id = toplevel.wl_surface().id();
+                if self.kicked_toplevels.insert(surface_id) {
+                    self.configure_toplevel_fullscreen(toplevel);
+                    toplevel.send_configure();
+                }
+            }
         }
 
         // Surface state is updated, frame callbacks will be sent in main loop
@@ -800,11 +842,18 @@ impl DmabufHandler for WaylandWebStreamState {
     }
 
     fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
+        info!(
+            "dmabuf_imported called: format={:?} num_planes={} size={:?}",
+            dmabuf.format(),
+            dmabuf.num_planes(),
+            (dmabuf.width(), dmabuf.height())
+        );
         let imported = self
             .dmabuf_renderer
             .as_ref()
             .map(|renderer| renderer.borrow_mut().import_dmabuf(&dmabuf, None).is_ok())
             .unwrap_or(false);
+        info!("dmabuf_imported result: imported={imported}");
 
         if imported {
             if let Err(e) = notifier.successful::<Self>() {

@@ -4,6 +4,15 @@
 //! raw captured frame, never converts pixels itself. `h264_vaapi` then
 //! encodes the resulting NV12 surfaces.
 //!
+//! Phase B.5 adds a second, zero-copy path for `CapturedFrame::Gpu`: instead
+//! of uploading a CPU-side BGRA buffer, a client's dmabuf is mapped directly
+//! into a VAAPI surface (`av_hwframe_map`, no pixel copy -- proven against
+//! this exact dmabuf shape on real hardware, see
+//! `tests::dmabuf_can_be_mapped_into_a_vaapi_surface`) and fed into the same
+//! `scale_vaapi=format=nv12` GPU colour conversion `hwupload` would
+//! otherwise feed. `EncoderConfig::gpu_frames` decides which of the two
+//! pipelines this encoder builds -- never both, see `VaapiPipeline`.
+//!
 //! ffmpeg-next's safe wrapper has no VAAPI-specific accessors (see
 //! docs/hardware-acceleration-plan.md's feasibility findings), so device
 //! setup, the filtergraph's `hw_device_ctx` wiring, and pulling the
@@ -13,6 +22,9 @@
 use anyhow::{Context as _, Result};
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::ffi;
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::Buffer as _;
+use std::os::fd::AsRawFd;
 use tracing::{error, info, warn};
 
 use super::{
@@ -20,24 +32,60 @@ use super::{
     EncodedPacket, EncoderConfig, RateControl, RawFrame, VideoEncoder,
 };
 
-/// VAAPI backend. Owns the device once; `graph` + `encoder` are rebuilt
-/// together on every resolution change (and bitrate change, since CBR's
-/// target is baked into the encoder at open time) -- see `build_pipeline`
-/// for why they have to be rebuilt as a pair.
+/// The two encode pipelines `VaapiEncoder` can drive, mutually exclusive for
+/// the lifetime of one encoder (`EncoderConfig::gpu_frames` decides which at
+/// construction, see `VaapiEncoder::new`) -- never both at once, since that
+/// would mean two concurrent `h264_vaapi` hardware encode sessions for what
+/// is logically a single output stream.
+enum VaapiPipeline {
+    /// Phase A: `buffer(bgra) -> hwupload -> scale_vaapi=nv12 -> buffersink`.
+    /// `bgra_frame` is reused across `submit` calls the same way
+    /// `X264Encoder::input_frame` is: never owns a buffer, just points at
+    /// whichever `RawFrame` is being encoded right now. `av_buffersrc_add_frame`
+    /// copies it synchronously (this frame isn't refcounted, so ffmpeg can't
+    /// just take a reference), so repointing it next call is safe once this
+    /// call returns.
+    Cpu {
+        graph: ffmpeg::filter::Graph,
+        encoder: ffmpeg::encoder::Video,
+        bgra_frame: ffmpeg::frame::Video,
+    },
+    /// Phase B.5: `buffer(vaapi, hw_frames_ctx=frames_ref) -> scale_vaapi=nv12
+    /// -> buffersink` -- no `hwupload`, the frame is already on the GPU.
+    /// `frames_ref` describes the *shape* every per-frame zero-copy mapped
+    /// surface conforms to (format/sw_format/size); it isn't a real surface
+    /// pool -- `av_hwframe_map` (see `encode_gpu_frame`) creates one actual
+    /// VA surface per dmabuf import, wrapping that specific buffer, every
+    /// time. Rebuilt alongside `graph`/`encoder` on resize/bitrate change,
+    /// same as the `Cpu` variant.
+    Gpu {
+        frames_ref: *mut ffi::AVBufferRef,
+        graph: ffmpeg::filter::Graph,
+        encoder: ffmpeg::encoder::Video,
+    },
+}
+
+impl Drop for VaapiPipeline {
+    fn drop(&mut self) {
+        // `graph`/`encoder` free themselves (and any refs they hold) via
+        // their own Drop impls -- only `Gpu`'s `frames_ref` is a raw ref this
+        // type owns directly.
+        if let VaapiPipeline::Gpu { frames_ref, .. } = self {
+            unsafe { ffi::av_buffer_unref(frames_ref) };
+        }
+    }
+}
+
+/// VAAPI backend. Owns the device once; `pipeline` is rebuilt wholesale on
+/// every resolution change (and bitrate change, since CBR's target is baked
+/// into the encoder at open time) -- see `build_pipeline`/`build_gpu_pipeline`
+/// for why `graph` and `encoder` have to be rebuilt as a pair.
 pub struct VaapiEncoder {
     config: EncoderConfig,
-    /// `av_hwdevice_ctx_create`'s output. Outlives every `graph`/`encoder`
-    /// rebuild (the device doesn't depend on resolution); unreffed in
-    /// `Drop`.
+    /// `av_hwdevice_ctx_create`'s output. Outlives every `pipeline` rebuild
+    /// (the device doesn't depend on resolution); unreffed in `Drop`.
     device_ref: *mut ffi::AVBufferRef,
-    graph: ffmpeg::filter::Graph,
-    encoder: ffmpeg::encoder::Video,
-    /// Reused across `submit` calls the same way `X264Encoder::input_frame`
-    /// is: never owns a buffer, just points at whichever `RawFrame` is being
-    /// encoded right now. `av_buffersrc_add_frame` copies it synchronously
-    /// (this frame isn't refcounted, so ffmpeg can't just take a reference),
-    /// so repointing it next call is safe once this call returns.
-    bgra_frame: ffmpeg::frame::Video,
+    pipeline: VaapiPipeline,
     frame_count: i64,
     next_frame_id: u32,
     buffer_return_tx: std::sync::mpsc::Sender<Vec<u8>>,
@@ -46,117 +94,122 @@ pub struct VaapiEncoder {
 impl VaapiEncoder {
     pub fn new(config: EncoderConfig, buffer_return_tx: std::sync::mpsc::Sender<Vec<u8>>) -> Result<Self> {
         let device_ref = create_device(&config.vaapi_device)?;
-        let (graph, encoder) = build_pipeline(&config, device_ref)?;
-        let bgra_frame = create_input_frame(config.width, config.height);
+        let pipeline = build_pipeline_for(&config, device_ref)?;
         Ok(Self {
             config,
             device_ref,
-            graph,
-            encoder,
-            bgra_frame,
+            pipeline,
             frame_count: 0,
             next_frame_id: 0,
             buffer_return_tx,
         })
     }
 
-    /// Feeds one BGRA frame through the filtergraph and drains whatever NV12
-    /// hardware frame(s) it produces into the encoder. Almost always exactly
-    /// one frame in, one out, but the buffersink drain loop doesn't assume
-    /// that -- see the comment in `build_pipeline` on why frames aren't
-    /// reused (filter pool owns surface lifetime here, unlike `X264Encoder`'s
-    /// `yuv_frame`).
-    fn encode_frame(&mut self, raw_frame: &RawFrame, force_keyframe: bool, capture_to_encode_ms: f64) -> Result<Vec<EncodedPacket>> {
-        let expected_len = (self.bgra_frame.width() * self.bgra_frame.height() * 4) as usize;
+    /// Feeds one BGRA frame through the `Cpu` filtergraph and drains
+    /// whatever NV12 hardware frame(s) it produces into the encoder. Almost
+    /// always exactly one frame in, one out, but the buffersink drain loop
+    /// doesn't assume that -- see the comment in `build_pipeline` on why
+    /// frames aren't reused (filter pool owns surface lifetime here, unlike
+    /// `X264Encoder`'s `yuv_frame`).
+    fn encode_cpu_frame(
+        graph: &mut ffmpeg::filter::Graph,
+        encoder: &mut ffmpeg::encoder::Video,
+        bgra_frame: &mut ffmpeg::frame::Video,
+        raw_frame: &RawFrame,
+        frame_count: i64,
+        next_frame_id: &mut u32,
+        force_keyframe: bool,
+        capture_to_encode_ms: f64,
+    ) -> Result<Vec<EncodedPacket>> {
+        let expected_len = (bgra_frame.width() * bgra_frame.height() * 4) as usize;
         if raw_frame.data.len() < expected_len {
             anyhow::bail!(
                 "raw frame buffer ({} bytes) too small for {}x{} BGRA ({} bytes expected)",
                 raw_frame.data.len(),
-                self.bgra_frame.width(),
-                self.bgra_frame.height(),
+                bgra_frame.width(),
+                bgra_frame.height(),
                 expected_len
             );
         }
         unsafe {
-            let ptr = self.bgra_frame.as_mut_ptr();
+            let ptr = bgra_frame.as_mut_ptr();
             (*ptr).data[0] = raw_frame.data.as_ptr() as *mut u8;
-            (*ptr).linesize[0] = (self.bgra_frame.width() * 4) as i32;
+            (*ptr).linesize[0] = (bgra_frame.width() * 4) as i32;
         }
-        self.bgra_frame.set_pts(Some(self.frame_count));
+        bgra_frame.set_pts(Some(frame_count));
 
-        let mut in_ctx = self
-            .graph
+        let mut in_ctx = graph
             .get("in")
             .context("vaapi filtergraph missing its \"in\" buffer source")?;
         in_ctx
             .source()
-            .add(&self.bgra_frame)
+            .add(bgra_frame)
             .context("failed to feed frame into vaapi filtergraph")?;
 
-        let mut out_ctx = self
-            .graph
-            .get("out")
-            .context("vaapi filtergraph missing its \"out\" buffersink")?;
-
-        let mut packets = Vec::new();
-        loop {
-            let mut hw_frame = ffmpeg::frame::Video::empty();
-            match out_ctx.sink().frame(&mut hw_frame) {
-                Ok(()) => {
-                    // Forcing a keyframe out of h264_vaapi: this build's
-                    // h264_vaapi has no `forced_idr` AVOption (checked via
-                    // `ffmpeg -h encoder=h264_vaapi` on the target hardware --
-                    // it only exists on some other hwaccel encoders), so
-                    // tagging the frame is the only mechanism available.
-                    // Verified by the keyframe regression test ported to
-                    // this backend (hardware-acceleration-plan.md A.4).
-                    hw_frame.set_kind(if force_keyframe {
-                        ffmpeg::picture::Type::I
-                    } else {
-                        ffmpeg::picture::Type::None
-                    });
-                    self.encoder.send_frame(&hw_frame)?;
-                    packets.extend(super::drain_packets(&mut self.encoder, &mut self.next_frame_id, capture_to_encode_ms)?);
-                }
-                Err(ffmpeg::Error::Other { errno: ffmpeg::error::EAGAIN }) => break,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(packets)
+        drain_filtergraph(graph, encoder, next_frame_id, force_keyframe, capture_to_encode_ms)
     }
 }
 
 impl VideoEncoder for VaapiEncoder {
     fn submit(&mut self, frame: CapturedFrame, capture_to_encode_ms: f64, force_keyframe: bool) -> Result<Vec<EncodedPacket>> {
-        let raw_frame = match frame {
-            CapturedFrame::Cpu(raw_frame) => raw_frame,
-            CapturedFrame::Gpu { .. } => {
-                anyhow::bail!(
-                    "vaapi backend doesn't accept GPU frames yet; zero-copy dmabuf import \
-                     lands in hardware-acceleration-plan.md Phase B"
+        match (&mut self.pipeline, frame) {
+            (VaapiPipeline::Cpu { graph, encoder, bgra_frame }, CapturedFrame::Cpu(raw_frame)) => {
+                let result = Self::encode_cpu_frame(
+                    graph,
+                    encoder,
+                    bgra_frame,
+                    &raw_frame,
+                    self.frame_count,
+                    &mut self.next_frame_id,
+                    force_keyframe,
+                    capture_to_encode_ms,
                 );
+                // encode_cpu_frame only borrows raw_frame, so hand the
+                // buffer back regardless of outcome (mirrors X264Encoder).
+                let _ = self.buffer_return_tx.send(raw_frame.data);
+                let packets = result?;
+                self.frame_count += 1;
+                Ok(packets)
             }
-        };
-
-        let result = self.encode_frame(&raw_frame, force_keyframe, capture_to_encode_ms);
-
-        // Mirrors X264Encoder::submit: encode_frame only borrows raw_frame,
-        // so hand the buffer back regardless of outcome.
-        let _ = self.buffer_return_tx.send(raw_frame.data);
-
-        let packets = result?;
-        self.frame_count += 1;
-        Ok(packets)
+            (VaapiPipeline::Gpu { frames_ref, graph, encoder }, CapturedFrame::Gpu { dmabuf, width, height, .. }) => {
+                let packets = encode_gpu_frame(
+                    *frames_ref,
+                    graph,
+                    encoder,
+                    &dmabuf,
+                    width,
+                    height,
+                    &mut self.next_frame_id,
+                    force_keyframe,
+                    capture_to_encode_ms,
+                )?;
+                self.frame_count += 1;
+                Ok(packets)
+            }
+            (VaapiPipeline::Cpu { .. }, CapturedFrame::Gpu { .. }) => anyhow::bail!(
+                "vaapi encoder is configured for CPU frames (gl compositor not selected, or it \
+                 fell back to sw) but received a GPU frame -- this is a bug in how the \
+                 compositor/encoder backends were paired at startup"
+            ),
+            (VaapiPipeline::Gpu { .. }, CapturedFrame::Cpu(raw_frame)) => {
+                // Hand the buffer back even though this is an error: the
+                // render loop still needs it returned to reuse, regardless
+                // of why this frame can't be encoded.
+                let _ = self.buffer_return_tx.send(raw_frame.data);
+                anyhow::bail!(
+                    "vaapi encoder is configured for zero-copy GPU frames but received a CPU \
+                     frame -- this is a bug in how the compositor/encoder backends were paired \
+                     at startup"
+                )
+            }
+        }
     }
 
     fn reinitialize(&mut self, width: u32, height: u32) -> Result<()> {
         self.config.width = width;
         self.config.height = height;
 
-        let (graph, encoder) = build_pipeline(&self.config, self.device_ref)?;
-        self.graph = graph;
-        self.encoder = encoder;
-        self.bgra_frame = create_input_frame(width, height);
+        self.pipeline = build_pipeline_for(&self.config, self.device_ref)?;
         self.frame_count = 0;
 
         Ok(())
@@ -173,10 +226,9 @@ impl VideoEncoder for VaapiEncoder {
         info!("Changing VAAPI bitrate from {:?} to {} bps", self.config.rate_control, bitrate);
         self.config.rate_control = RateControl::Bitrate(bitrate);
 
-        match build_pipeline(&self.config, self.device_ref) {
-            Ok((graph, encoder)) => {
-                self.graph = graph;
-                self.encoder = encoder;
+        match build_pipeline_for(&self.config, self.device_ref) {
+            Ok(pipeline) => {
+                self.pipeline = pipeline;
                 self.frame_count = 0; // Reset frame count to force IDR
                 info!("VAAPI encoder reinitialized with new bitrate");
                 true
@@ -203,13 +255,243 @@ impl VideoEncoder for VaapiEncoder {
 
 impl Drop for VaapiEncoder {
     fn drop(&mut self) {
-        // `graph`/`encoder` free themselves (and the device refs they hold)
-        // via their own Drop impls when this struct is dropped -- only the
-        // device ref this struct created directly needs unreffing here.
+        // `pipeline` frees itself (including the refs it holds) via its own
+        // Drop impl when this struct is dropped -- only the device ref this
+        // struct created directly needs unreffing here.
         unsafe {
             ffi::av_buffer_unref(&mut self.device_ref);
         }
     }
+}
+
+/// Builds whichever pipeline `config.gpu_frames` selects. Building only the
+/// one actually needed (rather than both) matters beyond avoiding wasted
+/// setup: each pipeline opens its own `h264_vaapi` hardware encode session,
+/// and some VAAPI drivers cap how many of those can run concurrently.
+fn build_pipeline_for(config: &EncoderConfig, device_ref: *mut ffi::AVBufferRef) -> Result<VaapiPipeline> {
+    if config.gpu_frames {
+        let (frames_ref, graph, encoder) = build_gpu_pipeline(config, device_ref)?;
+        Ok(VaapiPipeline::Gpu { frames_ref, graph, encoder })
+    } else {
+        let (graph, encoder) = build_pipeline(config, device_ref)?;
+        let bgra_frame = create_input_frame(config.width, config.height);
+        Ok(VaapiPipeline::Cpu { graph, encoder, bgra_frame })
+    }
+}
+
+/// Drains whatever NV12 hardware frame(s) `graph`'s buffersink has ready
+/// into `encoder`, tagging the first/only one as a keyframe if requested.
+/// Shared by both pipelines -- the only difference between them is how the
+/// frame got *into* the graph (`hwupload` vs. a zero-copy `av_hwframe_map`),
+/// not how packets come back out.
+fn drain_filtergraph(
+    graph: &mut ffmpeg::filter::Graph,
+    encoder: &mut ffmpeg::encoder::Video,
+    next_frame_id: &mut u32,
+    force_keyframe: bool,
+    capture_to_encode_ms: f64,
+) -> Result<Vec<EncodedPacket>> {
+    let mut out_ctx = graph
+        .get("out")
+        .context("vaapi filtergraph missing its \"out\" buffersink")?;
+
+    let mut packets = Vec::new();
+    loop {
+        let mut hw_frame = ffmpeg::frame::Video::empty();
+        match out_ctx.sink().frame(&mut hw_frame) {
+            Ok(()) => {
+                // Forcing a keyframe out of h264_vaapi: this build's
+                // h264_vaapi has no `forced_idr` AVOption (checked via
+                // `ffmpeg -h encoder=h264_vaapi` on the target hardware --
+                // it only exists on some other hwaccel encoders), so
+                // tagging the frame is the only mechanism available.
+                // Verified by the keyframe regression test ported to
+                // this backend (hardware-acceleration-plan.md A.4).
+                hw_frame.set_kind(if force_keyframe {
+                    ffmpeg::picture::Type::I
+                } else {
+                    ffmpeg::picture::Type::None
+                });
+                encoder.send_frame(&hw_frame)?;
+                packets.extend(super::drain_packets(encoder, next_frame_id, capture_to_encode_ms)?);
+            }
+            Err(ffmpeg::Error::Other { errno: ffmpeg::error::EAGAIN }) => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(packets)
+}
+
+/// Maps `dmabuf` directly into a VAAPI surface conforming to `frames_ref`
+/// (`av_hwframe_map`, zero-copy -- proven on real hardware against this
+/// exact dmabuf shape, see `tests::dmabuf_can_be_mapped_into_a_vaapi_surface`),
+/// feeds the result through `graph`'s `scale_vaapi=format=nv12` GPU colour
+/// conversion, and drains the encoder. No CPU pixel copy happens anywhere in
+/// this path.
+fn encode_gpu_frame(
+    frames_ref: *mut ffi::AVBufferRef,
+    graph: &mut ffmpeg::filter::Graph,
+    encoder: &mut ffmpeg::encoder::Video,
+    dmabuf: &Dmabuf,
+    width: u32,
+    height: u32,
+    next_frame_id: &mut u32,
+    force_keyframe: bool,
+    capture_to_encode_ms: f64,
+) -> Result<Vec<EncodedPacket>> {
+    let src = drm_prime_frame_from_dmabuf(dmabuf, width, height)?;
+
+    let mut mapped = unsafe { ffi::av_frame_alloc() };
+    if mapped.is_null() {
+        anyhow::bail!("av_frame_alloc failed for the mapped VAAPI frame");
+    }
+    unsafe {
+        (*mapped).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
+        (*mapped).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
+    }
+
+    let map_ret = unsafe {
+        ffi::av_hwframe_map(
+            mapped,
+            src.as_ptr() as *mut ffi::AVFrame,
+            (ffi::AV_HWFRAME_MAP_READ as i32) | (ffi::AV_HWFRAME_MAP_DIRECT as i32),
+        )
+    };
+    if map_ret < 0 {
+        unsafe { ffi::av_frame_free(&mut mapped) };
+        anyhow::bail!("av_hwframe_map(DRM_PRIME -> VAAPI) failed: {}", ffmpeg::Error::from(map_ret));
+    }
+    // Safe wrapper takes ownership of `mapped` (frees it via Drop) -- same
+    // type the Cpu path's `hw_frame` uses, so it can go through the
+    // identical `Source::add`/buffersink drain code below.
+    let mapped_frame = unsafe { ffmpeg::frame::Video::wrap(mapped) };
+
+    let mut in_ctx = graph
+        .get("in_gpu")
+        .context("vaapi gpu filtergraph missing its \"in_gpu\" buffer source")?;
+    // `mapped_frame` is refcounted (av_hwframe_map populated its buf[]), so
+    // av_buffersrc_add_frame takes ownership of the reference instead of
+    // copying -- mirrors how the Cpu path's `hw_frame`s flow into the
+    // encoder, just one filter stage earlier.
+    in_ctx
+        .source()
+        .add(&mapped_frame)
+        .context("failed to feed mapped VAAPI frame into vaapi gpu filtergraph")?;
+
+    drain_filtergraph(graph, encoder, next_frame_id, force_keyframe, capture_to_encode_ms)
+}
+
+/// Owns everything a `AV_PIX_FMT_DRM_PRIME` source `AVFrame` needs to stay
+/// valid for as long as ffmpeg might reference it: the descriptor itself
+/// (`AVDRMFrameDescriptor`, pointed at by the frame's `data[0]`) and a clone
+/// of `dmabuf` (keeping its plane fd open -- the descriptor only carries the
+/// fd's numeric value, not a reference that would keep it alive on its own).
+/// Freed via `av_buffer_create`'s callback (`free_drm_frame_owner`) once the
+/// frame's last reference drops.
+struct DrmFrameOwner {
+    descriptor: Box<ffi::AVDRMFrameDescriptor>,
+    _dmabuf: Dmabuf,
+}
+
+unsafe extern "C" fn free_drm_frame_owner(opaque: *mut std::ffi::c_void, _data: *mut u8) {
+    drop(unsafe { Box::from_raw(opaque as *mut DrmFrameOwner) });
+}
+
+/// Builds an `AV_PIX_FMT_DRM_PRIME` frame describing `dmabuf` as-is -- no
+/// pixel copy, just metadata (fd, stride, offset, modifier) wrapped the way
+/// `av_hwframe_map` expects to find it. Single-plane only (every dmabuf
+/// `GlCompositor` produces is Argb8888, never subsampled/multi-plane).
+fn drm_prime_frame_from_dmabuf(dmabuf: &Dmabuf, width: u32, height: u32) -> Result<ffmpeg::frame::Video> {
+    if dmabuf.num_planes() != 1 {
+        anyhow::bail!(
+            "expected a single-plane dmabuf, got {} planes -- GlCompositor should only ever \
+             produce single-plane Argb8888 targets",
+            dmabuf.num_planes()
+        );
+    }
+    let format = dmabuf.format();
+    let fd = dmabuf.handles().next().context("dmabuf has no plane fds")?;
+    let offset = dmabuf.offsets().next().context("dmabuf has no plane offsets")?;
+    let stride = dmabuf.strides().next().context("dmabuf has no plane strides")?;
+    // dma_buf fds report their real backing size via fstat (the kernel sets
+    // the file's size at creation) -- dup the fd (we don't own the original,
+    // `dmabuf` does) just to query it without touching the dmabuf's actual
+    // handle.
+    let object_size = std::fs::File::from(
+        fd.try_clone_to_owned()
+            .context("failed to dup dmabuf fd to query its size")?,
+    )
+    .metadata()
+    .map(|m| m.len() as usize)
+    .unwrap_or(0);
+
+    let mut owner = Box::new(DrmFrameOwner {
+        descriptor: Box::new(ffi::AVDRMFrameDescriptor {
+            nb_objects: 1,
+            objects: [
+                ffi::AVDRMObjectDescriptor {
+                    fd: fd.as_raw_fd(),
+                    size: object_size,
+                    format_modifier: u64::from(format.modifier),
+                },
+                unsafe { std::mem::zeroed() },
+                unsafe { std::mem::zeroed() },
+                unsafe { std::mem::zeroed() },
+            ],
+            nb_layers: 1,
+            layers: [
+                ffi::AVDRMLayerDescriptor {
+                    format: format.code as u32,
+                    nb_planes: 1,
+                    planes: [
+                        ffi::AVDRMPlaneDescriptor {
+                            object_index: 0,
+                            offset: offset as isize,
+                            pitch: stride as isize,
+                        },
+                        unsafe { std::mem::zeroed() },
+                        unsafe { std::mem::zeroed() },
+                        unsafe { std::mem::zeroed() },
+                    ],
+                },
+                unsafe { std::mem::zeroed() },
+                unsafe { std::mem::zeroed() },
+                unsafe { std::mem::zeroed() },
+            ],
+        }),
+        _dmabuf: dmabuf.clone(),
+    });
+    let descriptor_ptr: *mut ffi::AVDRMFrameDescriptor = &mut *owner.descriptor;
+
+    let raw = unsafe { ffi::av_frame_alloc() };
+    if raw.is_null() {
+        anyhow::bail!("av_frame_alloc failed for the DRM_PRIME source frame");
+    }
+    unsafe {
+        (*raw).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+        (*raw).width = width as i32;
+        (*raw).height = height as i32;
+        (*raw).data[0] = descriptor_ptr as *mut u8;
+        (*raw).buf[0] = ffi::av_buffer_create(
+            descriptor_ptr as *mut u8,
+            std::mem::size_of::<ffi::AVDRMFrameDescriptor>(),
+            Some(free_drm_frame_owner),
+            Box::into_raw(owner) as *mut std::ffi::c_void,
+            0,
+        );
+        if (*raw).buf[0].is_null() {
+            // av_buffer_create failed (allocation failure) before taking
+            // ownership of `owner` -- reclaim and drop it ourselves so it
+            // doesn't leak, since its callback will now never run.
+            let owner_ptr = (*raw).data[0] as *mut DrmFrameOwner;
+            drop(Box::from_raw(owner_ptr));
+            let mut raw = raw;
+            ffi::av_frame_free(&mut raw);
+            anyhow::bail!("av_buffer_create failed for the DRM_PRIME frame descriptor");
+        }
+    }
+
+    Ok(unsafe { ffmpeg::frame::Video::wrap(raw) })
 }
 
 /// Opens the VAAPI render node and returns an owned device reference
@@ -297,6 +579,119 @@ fn build_pipeline(config: &EncoderConfig, device_ref: *mut ffi::AVBufferRef) -> 
     let encoder = create_vaapi_encoder(config, frames_ref)?;
 
     Ok((graph, encoder))
+}
+
+/// Builds the zero-copy input side (Phase B.5): a `scale_vaapi=format=nv12`
+/// filtergraph fed by VAAPI surfaces mapped directly from a client dmabuf --
+/// `buffer(format=vaapi)` in place of `build_pipeline`'s `buffer(format=bgra)
+/// -> hwupload` pair, since the frame is already on the GPU and needs
+/// importing, not uploading. Returns the input-side frames context alongside
+/// the graph/encoder so `VaapiPipeline::Gpu` can keep it alive (every mapped
+/// frame references it, see `encode_gpu_frame`) and free it on drop.
+fn build_gpu_pipeline(
+    config: &EncoderConfig,
+    device_ref: *mut ffi::AVBufferRef,
+) -> Result<(*mut ffi::AVBufferRef, ffmpeg::filter::Graph, ffmpeg::encoder::Video)> {
+    // Describes the *shape* every per-frame zero-copy mapped surface
+    // conforms to -- not a pool. `av_hwframe_map` creates one real VA
+    // surface per dmabuf import (see `encode_gpu_frame`); every mapped
+    // frame just references this same frames context as its declared type.
+    let input_frames_ref = unsafe { ffi::av_hwframe_ctx_alloc(device_ref) };
+    if input_frames_ref.is_null() {
+        anyhow::bail!("av_hwframe_ctx_alloc failed for the GPU input frames context");
+    }
+    unsafe {
+        let ctx = (*input_frames_ref).data as *mut ffi::AVHWFramesContext;
+        (*ctx).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+        // Matches the byte order GlCompositor's Argb8888 GBM targets are
+        // already treated as elsewhere (create_input_frame, B.3's real-
+        // hardware byte-order check).
+        (*ctx).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_BGRA;
+        (*ctx).width = config.width as i32;
+        (*ctx).height = config.height as i32;
+    }
+    let init_ret = unsafe { ffi::av_hwframe_ctx_init(input_frames_ref) };
+    if init_ret < 0 {
+        let mut input_frames_ref = input_frames_ref;
+        unsafe { ffi::av_buffer_unref(&mut input_frames_ref) };
+        anyhow::bail!("av_hwframe_ctx_init failed: {}", ffmpeg::Error::from(init_ret));
+    }
+
+    let mut graph = ffmpeg::filter::Graph::new();
+    let buffer_filter = ffmpeg::filter::find("buffer").context("\"buffer\" filter not registered")?;
+    let scale_vaapi_filter = ffmpeg::filter::find("scale_vaapi").context("\"scale_vaapi\" filter not registered")?;
+    let buffersink_filter = ffmpeg::filter::find("buffersink").context("\"buffersink\" filter not registered")?;
+
+    // **Real bug found on hardware, not just theoretical**: `buffer`'s own
+    // init() callback checks `hw_frames_ctx` immediately when `pix_fmt` is a
+    // hw format ("Setting BufferSourceContext.pix_fmt to a HW format
+    // requires hw_frames_ctx to be non-NULL!"), so going through
+    // `Graph::add` with a `pix_fmt=vaapi` args string (which initializes on
+    // return) fails before `av_buffersrc_parameters_set` ever runs -- the
+    // exact same "alloc before init" problem `hwupload`/`scale_vaapi` have
+    // (see `alloc_hw_filter`), just solved differently here since the field
+    // that needs setting pre-init is `hw_frames_ctx`, set via
+    // `AVBufferSrcParameters`, not `hw_device_ctx` set directly on the
+    // context. `av_buffersrc_parameters_set` itself works before init
+    // (that's its documented purpose: configure a buffersrc instead of an
+    // options string) and takes its own `av_buffer_ref` of what we pass, so
+    // `input_frames_ref` itself is only borrowed here.
+    let cname = std::ffi::CString::new("in_gpu").unwrap();
+    let in_ctx_ptr = unsafe { ffi::avfilter_graph_alloc_filter(graph.as_mut_ptr(), buffer_filter.as_ptr(), cname.as_ptr()) };
+    if in_ctx_ptr.is_null() {
+        anyhow::bail!("avfilter_graph_alloc_filter(\"in_gpu\") failed");
+    }
+
+    let params = unsafe { ffi::av_buffersrc_parameters_alloc() };
+    if params.is_null() {
+        anyhow::bail!("av_buffersrc_parameters_alloc failed");
+    }
+    unsafe {
+        (*params).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
+        (*params).width = config.width as i32;
+        (*params).height = config.height as i32;
+        (*params).time_base = ffi::AVRational { num: 1, den: config.framerate as i32 };
+        (*params).hw_frames_ctx = input_frames_ref;
+    }
+    let params_ret = unsafe { ffi::av_buffersrc_parameters_set(in_ctx_ptr, params) };
+    unsafe { ffi::av_free(params as *mut std::ffi::c_void) };
+    if params_ret < 0 {
+        anyhow::bail!("av_buffersrc_parameters_set failed: {}", ffmpeg::Error::from(params_ret));
+    }
+
+    let init_ret = unsafe { ffi::avfilter_init_dict(in_ctx_ptr, std::ptr::null_mut()) };
+    if init_ret < 0 {
+        anyhow::bail!("avfilter_init_dict(\"in_gpu\") failed: {}", ffmpeg::Error::from(init_ret));
+    }
+    let mut in_ctx = unsafe { ffmpeg::filter::Context::wrap(in_ctx_ptr) };
+
+    let mut out_ctx = graph
+        .add(&buffersink_filter, "out", "")
+        .context("failed to add buffersink to vaapi gpu filtergraph")?;
+    // scale_vaapi still needs hw_device_ctx set before its own init() --
+    // same requirement and same split-alloc/init fix as build_pipeline.
+    let mut scale_ctx = alloc_hw_filter(&mut graph, &scale_vaapi_filter, "scale_vaapi", device_ref, Some(("format", "nv12")))
+        .context("failed to initialize scale_vaapi filter")?;
+
+    in_ctx.link(0, &mut scale_ctx, 0);
+    scale_ctx.link(0, &mut out_ctx, 0);
+
+    graph.validate().context("failed to configure vaapi gpu filtergraph")?;
+
+    let out_ctx = graph
+        .get("out")
+        .context("vaapi gpu filtergraph missing its \"out\" buffersink after validation")?;
+    // Same care as build_pipeline: borrowed, not owned -- take a fresh ref
+    // for the encoder, never unref this one directly (see the comment in
+    // create_vaapi_encoder).
+    let frames_ref = unsafe { ffi::av_buffersink_get_hw_frames_ctx(out_ctx.as_ptr()) };
+    if frames_ref.is_null() {
+        anyhow::bail!("scale_vaapi did not produce a hardware frames context");
+    }
+
+    let encoder = create_vaapi_encoder(config, frames_ref)?;
+
+    Ok((input_frames_ref, graph, encoder))
 }
 
 /// Allocates a filter instance in `graph` without initializing it (unlike
@@ -420,6 +815,7 @@ mod tests {
             keyframe_interval,
             encoder_backend: super::super::EncoderBackend::Vaapi,
             vaapi_device: "/dev/dri/renderD128".to_string(),
+            gpu_frames: false,
         };
         VaapiEncoder::new(config, tx).expect("failed to construct VaapiEncoder")
     }
@@ -440,6 +836,57 @@ mod tests {
     fn submit(encoder: &mut VaapiEncoder, force_keyframe: bool) -> Vec<EncodedPacket> {
         encoder
             .submit(CapturedFrame::Cpu(make_raw_frame()), 0.0, force_keyframe)
+            .expect("submit failed")
+    }
+
+    fn make_gpu_encoder(tx: std::sync::mpsc::Sender<Vec<u8>>, keyframe_interval: u32) -> VaapiEncoder {
+        let config = EncoderConfig {
+            width: TEST_SIZE,
+            height: TEST_SIZE,
+            framerate: 30,
+            rate_control: RateControl::Bitrate(500_000),
+            keyframe_interval,
+            encoder_backend: super::super::EncoderBackend::Vaapi,
+            vaapi_device: "/dev/dri/renderD128".to_string(),
+            gpu_frames: true,
+        };
+        VaapiEncoder::new(config, tx).expect("failed to construct VaapiEncoder")
+    }
+
+    /// Allocates a dmabuf the same way `GlCompositor`'s GBM target pool does
+    /// (Argb8888, `Modifier::Invalid`, see `GlCompositor::ensure_sized`).
+    fn make_gpu_dmabuf(width: u32, height: u32) -> Dmabuf {
+        use smithay::backend::allocator::{
+            dmabuf::AsDmabuf,
+            gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
+            Allocator, Fourcc, Modifier,
+        };
+
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/dri/renderD128")
+            .expect("failed to open render node");
+        let gbm = GbmDevice::new(file).expect("failed to create GBM device");
+        let mut allocator = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
+        let buffer = allocator
+            .create_buffer(width, height, Fourcc::Argb8888, &[Modifier::Invalid])
+            .expect("failed to allocate a GBM buffer");
+        buffer.export().expect("failed to export GBM buffer as a dmabuf")
+    }
+
+    fn submit_gpu(encoder: &mut VaapiEncoder, dmabuf: Dmabuf, force_keyframe: bool) -> Vec<EncodedPacket> {
+        encoder
+            .submit(
+                CapturedFrame::Gpu {
+                    dmabuf,
+                    width: TEST_SIZE,
+                    height: TEST_SIZE,
+                    capture_instant: std::time::Instant::now(),
+                },
+                0.0,
+                force_keyframe,
+            )
             .expect("submit failed")
     }
 
@@ -567,5 +1014,283 @@ mod tests {
 
         drop(encoder);
         println!("resized, re-encoded, and dropped cleanly");
+    }
+
+    /// **Feasibility spike for hardware-acceleration-plan.md Phase B.5**
+    /// (zero-copy dmabuf -> VAAPI import). Deliberately bypasses
+    /// `GlCompositor`/`CapturedFrame::Gpu` entirely -- allocates a dmabuf the
+    /// same way `GlCompositor`'s GBM target pool does (Argb8888,
+    /// `Modifier::Invalid`, see `GlCompositor::ensure_sized`) and asks this
+    /// driver to derive a VAAPI surface directly from it via
+    /// `av_hwframe_map`. Isolates "does this GPU/driver accept the dmabuf
+    /// shape the GL compositor actually produces" from every other moving
+    /// part (shared fallback flag, `GlCompositor` producing `Gpu` frames,
+    /// `scale_vaapi` wiring) before investing in the full integration.
+    #[test]
+    #[ignore = "needs a real VAAPI render node with H264 encode support"]
+    fn dmabuf_can_be_mapped_into_a_vaapi_surface() {
+        use smithay::backend::allocator::{
+            dmabuf::AsDmabuf,
+            gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
+            Allocator, Buffer, Fourcc, Modifier,
+        };
+        use std::fs::File;
+        use std::os::fd::AsRawFd;
+
+        ffmpeg::init().unwrap();
+
+        let device_path = "/dev/dri/renderD128";
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(device_path)
+            .expect("failed to open render node");
+        let gbm = GbmDevice::new(file).expect("failed to create GBM device");
+        let mut allocator = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
+        let buffer = allocator
+            .create_buffer(TEST_SIZE, TEST_SIZE, Fourcc::Argb8888, &[Modifier::Invalid])
+            .expect("failed to allocate a GBM buffer");
+        let dmabuf = buffer.export().expect("failed to export GBM buffer as a dmabuf");
+        assert_eq!(dmabuf.num_planes(), 1, "single-plane Argb8888 should have exactly one plane");
+
+        let mut device_ref = create_device(device_path).expect("failed to create VAAPI device");
+
+        // --- Describe the dmabuf as an AV_PIX_FMT_DRM_PRIME source frame ---
+        let format = dmabuf.format();
+        let fd = dmabuf.handles().next().expect("dmabuf has no plane fds");
+        let offset = dmabuf.offsets().next().unwrap();
+        let stride = dmabuf.strides().next().unwrap();
+        // dma_buf fds report their real backing size via fstat (the kernel
+        // sets the file's size at creation) -- dup the fd (we don't own the
+        // original, `dmabuf` does) just to query it without touching the
+        // dmabuf's actual handle.
+        let object_size = File::from(fd.try_clone_to_owned().expect("failed to dup dmabuf fd"))
+            .metadata()
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+
+        let descriptor = Box::into_raw(Box::new(ffi::AVDRMFrameDescriptor {
+            nb_objects: 1,
+            objects: [
+                ffi::AVDRMObjectDescriptor {
+                    fd: fd.as_raw_fd(),
+                    size: object_size,
+                    format_modifier: u64::from(format.modifier),
+                },
+                unsafe { std::mem::zeroed() },
+                unsafe { std::mem::zeroed() },
+                unsafe { std::mem::zeroed() },
+            ],
+            nb_layers: 1,
+            layers: [
+                ffi::AVDRMLayerDescriptor {
+                    format: format.code as u32,
+                    nb_planes: 1,
+                    planes: [
+                        ffi::AVDRMPlaneDescriptor {
+                            object_index: 0,
+                            offset: offset as isize,
+                            pitch: stride as isize,
+                        },
+                        unsafe { std::mem::zeroed() },
+                        unsafe { std::mem::zeroed() },
+                        unsafe { std::mem::zeroed() },
+                    ],
+                },
+                unsafe { std::mem::zeroed() },
+                unsafe { std::mem::zeroed() },
+                unsafe { std::mem::zeroed() },
+            ],
+        }));
+
+        // Keeps `dmabuf` (and so the plane fd the descriptor above points at)
+        // alive for as long as ffmpeg might still reference it; freed via
+        // av_buffer_create's callback below, alongside the descriptor box.
+        struct DrmFrameOwner {
+            descriptor: *mut ffi::AVDRMFrameDescriptor,
+            _dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+        }
+        unsafe extern "C" fn free_drm_frame_owner(opaque: *mut std::ffi::c_void, _data: *mut u8) {
+            let owner = unsafe { Box::from_raw(opaque as *mut DrmFrameOwner) };
+            unsafe { drop(Box::from_raw(owner.descriptor)) };
+        }
+        let owner_ptr = Box::into_raw(Box::new(DrmFrameOwner {
+            descriptor,
+            _dmabuf: dmabuf,
+        })) as *mut std::ffi::c_void;
+
+        let mut src = unsafe { ffi::av_frame_alloc() };
+        assert!(!src.is_null(), "av_frame_alloc returned null");
+        unsafe {
+            (*src).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+            (*src).width = TEST_SIZE as i32;
+            (*src).height = TEST_SIZE as i32;
+            (*src).data[0] = descriptor as *mut u8;
+            (*src).buf[0] = ffi::av_buffer_create(
+                descriptor as *mut u8,
+                std::mem::size_of::<ffi::AVDRMFrameDescriptor>(),
+                Some(free_drm_frame_owner),
+                owner_ptr,
+                0,
+            );
+            assert!(!(*src).buf[0].is_null(), "av_buffer_create returned null");
+        }
+
+        // --- Build the destination VAAPI-format frame ---
+        let mut vaapi_frames_ref = unsafe { ffi::av_hwframe_ctx_alloc(device_ref) };
+        assert!(!vaapi_frames_ref.is_null(), "av_hwframe_ctx_alloc returned null");
+        unsafe {
+            let ctx = (*vaapi_frames_ref).data as *mut ffi::AVHWFramesContext;
+            (*ctx).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+            // Matches the byte order `GlCompositor`'s Argb8888 GBM targets
+            // are already treated as elsewhere in this codebase (see
+            // `create_input_frame`/B.3's real-hardware byte-order check).
+            (*ctx).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_BGRA;
+            (*ctx).width = TEST_SIZE as i32;
+            (*ctx).height = TEST_SIZE as i32;
+        }
+        let init_ret = unsafe { ffi::av_hwframe_ctx_init(vaapi_frames_ref) };
+        assert!(
+            init_ret >= 0,
+            "av_hwframe_ctx_init failed: {}",
+            ffmpeg::Error::from(init_ret)
+        );
+
+        let mut dst = unsafe { ffi::av_frame_alloc() };
+        assert!(!dst.is_null(), "av_frame_alloc returned null");
+        unsafe {
+            (*dst).hw_frames_ctx = ffi::av_buffer_ref(vaapi_frames_ref);
+            (*dst).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
+        }
+
+        let map_ret = unsafe {
+            ffi::av_hwframe_map(
+                dst,
+                src,
+                (ffi::AV_HWFRAME_MAP_READ as i32) | (ffi::AV_HWFRAME_MAP_DIRECT as i32),
+            )
+        };
+
+        unsafe {
+            ffi::av_frame_free(&mut dst);
+            ffi::av_frame_free(&mut src);
+            ffi::av_buffer_unref(&mut vaapi_frames_ref);
+            ffi::av_buffer_unref(&mut device_ref);
+        }
+
+        assert!(
+            map_ret >= 0,
+            "av_hwframe_map(DRM_PRIME -> VAAPI) failed: {} -- this driver does not support \
+             zero-copy import of the dmabuf shape GlCompositor produces; Phase B.5 should ship \
+             CPU-readback only",
+            ffmpeg::Error::from(map_ret)
+        );
+        println!("dmabuf -> VAAPI surface zero-copy mapping succeeded");
+    }
+
+    /// End-to-end regression test for the Phase B.5 zero-copy path (mirrors
+    /// `force_keyframe_actually_forces_an_idr`, just submitting
+    /// `CapturedFrame::Gpu` instead of `Cpu`): every dmabuf goes through
+    /// `encode_gpu_frame`'s `av_hwframe_map` -> `scale_vaapi=nv12` ->
+    /// `h264_vaapi` pipeline with no CPU pixel copy, and forced keyframes
+    /// still work the same way they do on the `Cpu` path (tagging the frame,
+    /// not a `forced_idr` AVOption -- see that test's doc comment).
+    #[test]
+    #[ignore = "needs a real VAAPI render node with H264 encode support"]
+    fn gpu_frame_zero_copy_path_encodes_and_forces_keyframe() {
+        ffmpeg::init().unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut encoder = make_gpu_encoder(tx, 1000);
+
+        let packets = submit_gpu(&mut encoder, make_gpu_dmabuf(TEST_SIZE, TEST_SIZE), false);
+        assert!(
+            packets.iter().any(|p| p.is_keyframe),
+            "first frame of a GOP should be a keyframe"
+        );
+
+        for _ in 0..3 {
+            let packets = submit_gpu(&mut encoder, make_gpu_dmabuf(TEST_SIZE, TEST_SIZE), false);
+            assert!(
+                packets.iter().all(|p| !p.is_keyframe),
+                "frame without a keyframe request should not be an IDR"
+            );
+        }
+
+        let packets = submit_gpu(&mut encoder, make_gpu_dmabuf(TEST_SIZE, TEST_SIZE), true);
+        assert!(
+            packets.iter().any(|p| p.is_keyframe),
+            "force_keyframe should make this frame an IDR"
+        );
+
+        drop(encoder);
+        println!("GPU zero-copy path encoded and dropped cleanly");
+    }
+
+    /// `GlCompositor`'s GBM target pool round-robins just 2 buffers (see
+    /// `SizedState::targets`), so in real use the *same* dmabuf comes back
+    /// around and gets mapped into a fresh VAAPI surface again every other
+    /// frame. Confirms repeatedly re-mapping one dmabuf doesn't leak or
+    /// crash (each `av_hwframe_map` call creates a new VA surface wrapping
+    /// the same underlying buffer -- this is exercising that churn, not
+    /// surface reuse).
+    #[test]
+    #[ignore = "needs a real VAAPI render node with H264 encode support"]
+    fn same_dmabuf_can_be_mapped_repeatedly() {
+        ffmpeg::init().unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut encoder = make_gpu_encoder(tx, 1000);
+
+        let dmabuf = make_gpu_dmabuf(TEST_SIZE, TEST_SIZE);
+        for i in 0..5 {
+            let packets = submit_gpu(&mut encoder, dmabuf.clone(), false);
+            assert!(
+                i != 0 || packets.iter().any(|p| p.is_keyframe),
+                "first frame of a GOP should be a keyframe"
+            );
+        }
+
+        drop(encoder);
+        println!("same dmabuf mapped repeatedly without leaking or crashing");
+    }
+
+    /// Mirrors `resize_reinitializes_encoder_without_corruption` for the
+    /// Phase B.5 zero-copy path. `reinitialize` tears down and rebuilds the
+    /// `Gpu` pipeline (including the input-side `frames_ref`) -- a resize
+    /// that doesn't corrupt anything, followed by a normal frame at the new
+    /// size, is the regression coverage for that rebuild path.
+    #[test]
+    #[ignore = "needs a real VAAPI render node with H264 encode support"]
+    fn gpu_path_resize_reinitializes_encoder_without_corruption() {
+        ffmpeg::init().unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut encoder = make_gpu_encoder(tx, 1000);
+
+        let packets = submit_gpu(&mut encoder, make_gpu_dmabuf(TEST_SIZE, TEST_SIZE), false);
+        assert!(packets.iter().any(|p| p.is_keyframe), "first frame of a GOP should be a keyframe");
+
+        let (new_width, new_height) = (TEST_SIZE * 2, TEST_SIZE / 2);
+        encoder.reinitialize(new_width, new_height).expect("reinitialize failed");
+        assert_eq!(encoder.width(), new_width);
+        assert_eq!(encoder.height(), new_height);
+
+        let packets = encoder
+            .submit(
+                CapturedFrame::Gpu {
+                    dmabuf: make_gpu_dmabuf(new_width, new_height),
+                    width: new_width,
+                    height: new_height,
+                    capture_instant: std::time::Instant::now(),
+                },
+                0.0,
+                false,
+            )
+            .expect("submit failed");
+        assert!(
+            packets.iter().any(|p| p.is_keyframe),
+            "reinitializing should reset the GOP, so the first frame at the new size should be a keyframe"
+        );
+
+        drop(encoder);
+        println!("GPU path resized, re-encoded, and dropped cleanly");
     }
 }

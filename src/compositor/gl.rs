@@ -24,12 +24,15 @@ use crate::encoder::{CapturedFrame, RawFrame};
 use super::Compositor;
 use super::state::WaylandWebStreamState;
 
-/// GPU compositor (hardware-acceleration-plan.md Phase B, stage 1): renders
-/// the `Space` with smithay's `GlesRenderer` into an offscreen GBM/dmabuf
-/// target instead of the manual SHM memcpy `WaylandWebStreamState::render`
-/// does, then reads the result back to the CPU so it can still be handed to
-/// either encoder backend unchanged (`CapturedFrame::Gpu`/zero-copy VAAPI
-/// import is Phase B.5, not built yet).
+/// GPU compositor (hardware-acceleration-plan.md Phase B): renders the
+/// `Space` with smithay's `GlesRenderer` into an offscreen GBM/dmabuf target
+/// instead of the manual SHM memcpy `WaylandWebStreamState::render` does.
+/// What happens to that target then depends on `produce_gpu_frames`: read
+/// back to the CPU as `CapturedFrame::Cpu` (works with either encoder
+/// backend), or handed straight on as `CapturedFrame::Gpu` for
+/// `VaapiEncoder` to import with no CPU round-trip (Phase B.5, zero-copy --
+/// proven on real hardware against this exact dmabuf shape, see
+/// `vaapi::tests::dmabuf_can_be_mapped_into_a_vaapi_surface`).
 ///
 /// EGL/GBM setup happens once in `new` and outlives every resize; the dmabuf
 /// target pool and damage tracker are size-dependent and built lazily on the
@@ -54,6 +57,12 @@ pub struct GlCompositor {
     // on hardware: see the deviation note on `WaylandWebStreamState::
     // enable_dmabuf`).
     main_device: u64,
+    // Whether `render_gl` hands the rendered dmabuf straight to the encoder
+    // (`CapturedFrame::Gpu`, Phase B.5) instead of reading it back to the
+    // CPU. Fixed at construction (mirrors `EncoderConfig::gpu_frames`, which
+    // `main.rs` sets from the same decision) -- never toggled at runtime,
+    // since the paired encoder backend doesn't change mid-run either.
+    produce_gpu_frames: bool,
 }
 
 /// Everything that depends on the current output size, rebuilt on resize.
@@ -72,8 +81,9 @@ impl GlCompositor {
     /// Opens `device_path` (a DRM render node, e.g. `/dev/dri/renderD128`)
     /// and brings up a headless, surfaceless GBM/EGL/GLES stack. No
     /// `EGLSurface` is ever created -- omitting one is what makes the
-    /// context surfaceless, there's no separate flag to set.
-    pub fn new(device_path: &str) -> Result<Self> {
+    /// context surfaceless, there's no separate flag to set. `produce_gpu_frames`
+    /// is forwarded straight to the `produce_gpu_frames` field -- see its doc.
+    pub fn new(device_path: &str, produce_gpu_frames: bool) -> Result<Self> {
         let file = File::options()
             .read(true)
             .write(true)
@@ -111,6 +121,7 @@ impl GlCompositor {
             gbm,
             sized: None,
             main_device,
+            produce_gpu_frames,
         })
     }
 
@@ -195,6 +206,12 @@ impl GlCompositor {
         let target_idx = sized.next_target;
         sized.next_target = (sized.next_target + 1) % sized.targets.len();
         let target = &mut sized.targets[target_idx];
+        // Cloned upfront (a cheap Arc bump, not a copy) rather than after
+        // binding: `Bind::bind`'s returned `Framebuffer<'_>` keeps `target`
+        // mutably borrowed for as long as it's alive (it has a `Drop` impl,
+        // so NLL can't shorten that), which would make a borrow taken after
+        // `render_output` conflict with it.
+        let dmabuf_for_gpu = self.produce_gpu_frames.then(|| target.clone());
 
         let mut renderer = self.renderer.borrow_mut();
         let renderer = &mut *renderer;
@@ -206,10 +223,28 @@ impl GlCompositor {
         let elements = space_render_elements(renderer, [&state.space], &state.output, 1.0)
             .context("failed to collect space render elements")?;
 
-        sized
+        let render_result = sized
             .damage_tracker
             .render_output(renderer, &mut framebuffer, 0, &elements, Color32F::BLACK)
             .map_err(|e| anyhow::anyhow!("render_output failed: {e:?}"))?;
+        // Block until the GPU has actually finished writing `target` --
+        // load-bearing for the `Gpu` arm below, which hands the same dmabuf
+        // straight to a different API (VAAPI) that has no reason to respect
+        // *this* GL context's own implicit ordering. `ExportMem` readback
+        // (the `Cpu` arm) happened to work without this (a same-context
+        // readback serializes naturally), but waiting unconditionally costs
+        // nothing extra in this fully-synchronous render loop and removes
+        // any doubt for either path.
+        render_result.sync.wait().context("waiting on the GL render fence failed")?;
+
+        if let Some(dmabuf) = dmabuf_for_gpu {
+            return Ok(CapturedFrame::Gpu {
+                dmabuf,
+                width,
+                height,
+                capture_instant,
+            });
+        }
 
         let region = Rectangle::<i32, BufferCoord>::from_size((width as i32, height as i32).into());
         let mapping = renderer

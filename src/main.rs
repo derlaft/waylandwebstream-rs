@@ -133,14 +133,23 @@ async fn main() -> Result<()> {
             config.max_bitrate
         );
     }
-    // Backend selection. `--compositor gl` (hardware-acceleration-plan.md
-    // Phase B, stage 1: GL render + CPU readback, no zero-copy yet) falls
-    // back to `sw` with a warning rather than refusing to start if GL/EGL/
-    // GBM init fails on this machine -- same guard-rail philosophy as the
-    // missing-backend fallback Phase 0 established.
+    // Backend selection. `--compositor gl` falls back to `sw` with a warning
+    // rather than refusing to start if GL/EGL/GBM init fails on this machine
+    // -- same guard-rail philosophy as the missing-backend fallback Phase 0
+    // established.
+    //
+    // `gpu_frames_requested` decides whether `GlCompositor` should skip its
+    // CPU readback and hand dmabufs straight to `VaapiEncoder`
+    // (hardware-acceleration-plan.md Phase B.5, zero-copy) -- only sound
+    // when both halves of the (gl, vaapi) pair are actually in play, so it's
+    // computed from `--encoder` here and only kept as `true` below if GL
+    // construction actually succeeds (a `sw` fallback can never produce a
+    // `Gpu` frame, regardless of what was requested).
+    let gpu_frames_requested = matches!(config.encoder, EncoderBackendArg::Vaapi);
+    let mut gpu_frames_enabled = false;
     let mut compositor_backend: Box<dyn Compositor> = match config.compositor {
         CompositorBackendArg::Sw => Box::new(SwCompositor),
-        CompositorBackendArg::Gl => match GlCompositor::new(&config.vaapi_device) {
+        CompositorBackendArg::Gl => match GlCompositor::new(&config.vaapi_device, gpu_frames_requested) {
             Ok(c) => {
                 // Advertise `linux-dmabuf` to clients now that there's a
                 // renderer to import them into (hardware-acceleration-plan.md
@@ -151,6 +160,7 @@ async fn main() -> Result<()> {
                 if let Err(e) = state.enable_dmabuf(&display.handle(), c.renderer_handle(), c.main_device()) {
                     warn!("Failed to advertise linux-dmabuf to clients ({e:#}); dmabuf-only clients won't be able to attach buffers, SHM clients are unaffected");
                 }
+                gpu_frames_enabled = gpu_frames_requested;
                 Box::new(c)
             }
             Err(e) => {
@@ -172,6 +182,7 @@ async fn main() -> Result<()> {
         keyframe_interval,
         encoder_backend,
         vaapi_device: config.vaapi_device.clone(),
+        gpu_frames: gpu_frames_enabled,
     };
 
     // Current WebCodecs codec string (profile/level), surfaced to clients

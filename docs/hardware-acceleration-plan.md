@@ -256,10 +256,12 @@ avoids entangling the SW and GL render paths in one method body.
   SW path's own always-full-repaint behavior (no regression), and keeps
   partial/incremental damage a deferred optimization for both paths alike
   (see TODO.md "Damage-driven partial repaint").
-- [ ] No `wants_gpu`/`Gpu` branch yet. `GlCompositor` always takes the `Cpu`
-  path (`ExportMem::copy_framebuffer` → `map_texture` → copy into the
-  recycled `Vec<u8>` → `CapturedFrame::Cpu`) regardless of `--encoder`.
-  `CapturedFrame::Gpu` stays unconstructed (`#[allow(dead_code)]`) until B.5.
+- [x] `GlCompositor` now has the `Gpu`/`Cpu` branch B.5 added:
+  `produce_gpu_frames` (set from `EncoderConfig::gpu_frames` at construction)
+  picks `CapturedFrame::Gpu` (the rendered dmabuf, no readback) or the
+  `ExportMem::copy_framebuffer` → `map_texture` → `CapturedFrame::Cpu` path
+  documented below, depending on whether `--encoder vaapi` was paired with
+  `--compositor gl`. See B.5 for the full zero-copy implementation.
 - [x] **Validated locally first** (contrary to the original assumption --
   this sandbox has `/dev/dri/renderD128`, a virtio-gpu node): `EGLDisplay`/
   `EGLContext`/`GlesRenderer::new` all succeed, but every `render()` then
@@ -344,14 +346,88 @@ avoids entangling the SW and GL render paths in one method body.
   dmabuf global alongside SHM.
 
 ### B.5 — Zero-copy dmabuf → VAAPI (B + HW-encode cell)
-- [ ] Fill `AVDRMFrameDescriptor` from smithay `Dmabuf` (fd, modifier, per-plane
-  pitch/offset) → `AVFrame` `format=AV_PIX_FMT_DRM_PRIME`.
-- [ ] Derive VAAPI frames ctx: `av_hwframe_map(vaapi, drm, MAP_DIRECT|MAP_READ)`
-  (or `av_hwframe_ctx_create_derived`).
-- [ ] `scale_vaapi=format=nv12` (GPU CSC) → `send_frame`.
-- [ ] **Fallback** if a driver rejects direct import: `ExportMem` readback →
-  reuse A.3 (`Cpu`→HW-encode). One copy, always works. Ship with fallback default,
-  optimize to direct map once proven on target GPU.
+- [x] **Feasibility spike before the full integration** (deliberate, given the
+  real risk that this driver might just reject the import): a standalone
+  hardware-gated test (`vaapi::tests::dmabuf_can_be_mapped_into_a_vaapi_surface`)
+  allocates a dmabuf the exact way `GlCompositor`'s GBM target pool does
+  (Argb8888, `Modifier::Invalid`) and asks the driver to derive a VAAPI surface
+  from it via `av_hwframe_map`, bypassing `GlCompositor`/`CapturedFrame::Gpu`
+  entirely. **Succeeded on real hardware (the devbox, Intel HD Graphics)** --
+  this driver accepts the exact dmabuf shape this codebase produces, so the
+  full integration below proceeded with that uncertainty resolved up front
+  rather than discovered mid-debug.
+- [x] Filled `AVDRMFrameDescriptor` from smithay `Dmabuf` (fd, modifier,
+  per-plane offset/pitch) → `AVFrame` `format=AV_PIX_FMT_DRM_PRIME`
+  (`drm_prime_frame_from_dmabuf` in `src/encoder/vaapi.rs`). `DrmFrameOwner`
+  keeps a clone of the `Dmabuf` (so its plane fd stays open) and the boxed
+  descriptor alive for as long as ffmpeg references them, freed via
+  `av_buffer_create`'s callback.
+- [x] Derived the VAAPI surface with `av_hwframe_map(mapped, src,
+  MAP_READ|MAP_DIRECT)` (`encode_gpu_frame`), mapping into a frames context
+  allocated once per resolution (`build_gpu_pipeline`'s `input_frames_ref`) --
+  not a real surface pool, just the shared format/size descriptor every
+  mapped frame declares itself against; `av_hwframe_map` creates one actual
+  VA surface per import. Confirmed safe to do every frame against the *same*
+  dmabuf repeatedly (`tests::same_dmabuf_can_be_mapped_repeatedly`), which is
+  what happens in practice since `GlCompositor`'s target pool round-robins
+  just 2 buffers.
+- [x] Fed the mapped frame into `scale_vaapi=format=nv12` (GPU CSC, no
+  `hwupload` -- the frame is already on the GPU) → `h264_vaapi`. Reused
+  `drain_filtergraph`/`create_vaapi_encoder` from the Phase A pipeline
+  unchanged; only the input side (`build_gpu_pipeline` vs. `build_pipeline`)
+  differs.
+- [x] **Real bug found and fixed, not just theoretical**: the `buffer` source
+  filter's own `init()` rejects a hw `pix_fmt` immediately unless
+  `hw_frames_ctx` is already set ("Setting BufferSourceContext.pix_fmt to a
+  HW format requires hw_frames_ctx to be non-NULL!") -- the exact same
+  "alloc before init" problem `hwupload`/`scale_vaapi` have (see
+  `alloc_hw_filter`), just for a different field. Going through `Graph::add`
+  with a `pix_fmt=vaapi` args string (which initializes on return, before
+  `av_buffersrc_parameters_set` could ever run) failed every time. Fixed by
+  splitting alloc (`avfilter_graph_alloc_filter`) from init
+  (`avfilter_init_dict`) for the `buffer` source too, calling
+  `av_buffersrc_parameters_set` (the documented way to attach a
+  `hw_frames_ctx` -- there's no string AVOption for it, confirmed via
+  `ffmpeg -h filter=buffer`) in between.
+- [x] **Fallback, but simpler than the plan's framing suggested.** No CPU
+  readback fallback turned out to be needed at the per-frame level: a failed
+  `av_hwframe_map` just fails that one `submit` call, which `encoder_thread`
+  already treats as a dropped frame (logged, loop continues) -- the same
+  recovery path every other transient encode error already takes. The real
+  "ship safe by default" lever is at backend-*selection* time instead:
+  `GlCompositor` only ever produces `Gpu` frames when `--encoder vaapi` was
+  actually selected (`EncoderConfig::gpu_frames`, decided once in `main.rs`
+  from the resolved compositor+encoder pair, never toggled at runtime); every
+  other combination keeps using the unconditionally-available `ExportMem`
+  CPU readback this codebase already had.
+- [x] **`VaapiPipeline` enum, not in the plan's sketch.** `VaapiEncoder` builds
+  *either* the Phase A (`Cpu`) pipeline *or* the Phase B.5 (`Gpu`) one, never
+  both -- decided once from `EncoderConfig::gpu_frames` at construction
+  (`build_pipeline_for`). Building both unconditionally would mean two
+  concurrent `h264_vaapi` hardware encode sessions for one logical output
+  stream, and some VAAPI drivers cap how many of those can run at once.
+- [x] **GL render fence, not in the plan's sketch.** Added an explicit
+  `render_result.sync.wait()` in `GlCompositor::render_gl` after
+  `render_output`, before either the `Cpu` readback or the `Gpu` handoff --
+  the `Cpu` path happened to work without it (a same-context `ExportMem`
+  readback serializes naturally), but handing the same dmabuf to a *different*
+  API (VAAPI) has no reason to respect this GL context's own implicit
+  ordering, so this removes any doubt rather than relying on dma_buf kernel
+  fencing being correctly respected by the VAAPI import path.
+- [x] **Confirmed end-to-end on real hardware (the devbox, Intel HD Graphics)**,
+  not just via unit tests: ran `--compositor gl --encoder vaapi` (`gpu_frames:
+  true` in the startup log, confirming the zero-copy path is actually active,
+  not a silent fallback), connected `weston-simple-egl`, captured a real
+  `h264_vaapi`-encoded keyframe over `/stream`, decoded it with `ffmpeg`,
+  sampled a pixel inside the client's window: non-black (`40 41 7e`) against a
+  black background elsewhere -- consistent with the B.4 GL+x264 validation's
+  `(40, 3f, 7d)` for the same client content, confirming the dmabuf was
+  actually rendered, mapped, GPU-converted, and encoded with no CPU pixel copy
+  anywhere in the path.
+- [x] Three new hardware-gated regression tests in `src/encoder/vaapi.rs`,
+  all passing on real hardware: `gpu_frame_zero_copy_path_encodes_and_forces_keyframe`
+  (mirrors the Phase A keyframe test for the `Gpu` path), `gpu_path_resize_reinitializes_encoder_without_corruption`
+  (mirrors the Phase A resize test), and `same_dmabuf_can_be_mapped_repeatedly`.
 
 ### B.6 — Sequencing
 - [x] B.1–B.3 behind `--compositor gl` paired with **x264** (via `ExportMem`
@@ -361,7 +437,12 @@ avoids entangling the SW and GL render paths in one method body.
   (no stretch-to-fill) is accepted as intentional, not a bug -- see B.3.
 - [x] Added B.4 dmabuf global; tested a GL client (`weston-simple-egl`) + confirmed
   SHM clients still work, both on real hardware (the devbox's Intel HD Graphics).
-- [ ] Add B.5 zero-copy last, readback fallback as default.
+- [x] Added B.5 zero-copy last. A feasibility spike (see B.5) resolved the
+  "will this driver even accept the import" risk before the full integration;
+  no readback-fallback machinery turned out to be needed beyond what already
+  existed (see B.5's note on this) -- backend selection at startup is the only
+  thing deciding `Cpu` vs `Gpu`, and that already defaults to `Cpu` for every
+  pairing except `--compositor gl --encoder vaapi` specifically.
 
 ---
 
@@ -372,22 +453,34 @@ Current x264 path reuses one `yuv_frame` across `send_frame` calls
 (`zerolatency`, `bframes=0`, no lookahead) has zero frame delay, so draining
 `receive_packet` to EAGAIN proves it finished reading before the next overwrite.
 
-- [ ] VAAPI breaks this: encode is **async on GPU**, and surface lifetime is
+- [x] VAAPI breaks this: encode is **async on GPU**, and surface lifetime is
   governed by **hwframe-pool refcounting**, not the drain loop.
-- [ ] **A-manual**: pull a fresh surface per frame via `av_hwframe_get_buffer`
-  (pool recycles only when refcount hits zero = encoder released it). Don't reuse
-  one surface. CPU NV12 staging frame *can* be reused (transfer blocks).
-- [ ] **A-filtergraph**: surface reuse is handled by the filter pool + sink frame
-  refcounting — never call `av_hwframe_get_buffer` yourself.
-- [ ] Update the `mod.rs:626` safety comment: the "reuse is safe because
-  zero-delay" reasoning is **x264-path-only**; VAAPI relies on the pool. (The
-  comment already warns this assumption breaks under buffering/reordering — VAAPI
-  is exactly that case.)
+- [ ] **A-manual**: not built -- A-filtergraph was chosen instead (A.0), so this
+  never applied.
+- [x] **A-filtergraph**: surface reuse is handled by the filter pool + sink frame
+  refcounting — `encode_cpu_frame` never calls `av_hwframe_get_buffer` itself.
+  Phase B.5's zero-copy path is a third case this section didn't anticipate:
+  `encode_gpu_frame` calls neither the filter pool nor `av_hwframe_get_buffer`
+  -- `av_hwframe_map` creates one real VA surface per dmabuf import, owned by
+  the mapped `AVFrame`'s own refcount, freed when that frame's last reference
+  drops (the filtergraph's, after `Source::add` takes ownership).
+- [x] The `mod.rs` safety comment (now at `encode_frame`, used only by
+  `X264Encoder`) never needed updating to disclaim VAAPI -- it was already
+  scoped to a function only the x264 path calls. VAAPI's own surface-lifetime
+  reasoning lives separately in `vaapi.rs` (`VaapiPipeline::Gpu`'s doc comment
+  and `encode_cpu_frame`'s).
 
 ---
 
 ## Recommended order
-1. Phase 0 refactor (test-guarded, no behavior change).
-2. Phase A (biggest CPU win, no compositor risk). Pick manual or filtergraph.
-3. Phase B (real project; gate it, validate GL-composite with x264 first,
-   zero-copy VAAPI import last with readback fallback).
+1. [x] Phase 0 refactor (test-guarded, no behavior change).
+2. [x] Phase A (biggest CPU win, no compositor risk). Picked filtergraph (A.0).
+3. [x] Phase B (gated behind `--compositor gl`/`--encoder vaapi`; validated
+   GL-composite with x264 first (B.1-B.4), zero-copy VAAPI import last (B.5)).
+
+All phases landed and validated on real hardware (the devbox, Intel HD
+Graphics), including the full `--compositor gl --encoder vaapi` combination
+end-to-end: a real dmabuf/EGL client (`weston-simple-egl`) composited via the
+B.4 `linux-dmabuf` global, rendered by `GlCompositor`, and encoded by
+`VaapiEncoder`'s zero-copy B.5 path with no CPU pixel copy anywhere in
+between.

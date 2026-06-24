@@ -23,16 +23,15 @@ pub struct RawFrame {
 }
 
 /// A frame handed from a `Compositor` to a `VideoEncoder`, in whichever
-/// memory the compositor produced it in. Today only `Cpu` is ever
-/// constructed (the manual memcpy compositor); `Gpu` exists so a future GL
-/// compositor (hardware-acceleration-plan.md Phase B) can hand a dmabuf
-/// straight to a VAAPI encoder without a CPU round-trip.
+/// memory the compositor produced it in. `SwCompositor` only ever produces
+/// `Cpu`. `GlCompositor` produces `Gpu` when paired with `--encoder vaapi`
+/// (`EncoderConfig::gpu_frames`, hardware-acceleration-plan.md Phase B.5),
+/// letting `VaapiEncoder` import the dmabuf straight into a VAAPI surface
+/// with no CPU round-trip; otherwise (`--encoder x264`, which can't accept a
+/// `Gpu` frame) it still produces `Cpu` via GL readback.
 #[derive(Clone)]
 pub enum CapturedFrame {
     Cpu(RawFrame),
-    // Not constructed until a GL compositor exists to produce one --
-    // expected to be dead code until then.
-    #[allow(dead_code)]
     Gpu {
         dmabuf: Dmabuf,
         width: u32,
@@ -125,6 +124,16 @@ pub struct EncoderConfig {
     pub encoder_backend: EncoderBackend,
     /// DRM render node opened by `EncoderBackend::Vaapi`. Unused by `X264`.
     pub vaapi_device: String,
+    /// Whether the render loop will hand `EncoderBackend::Vaapi` frames as
+    /// `CapturedFrame::Gpu` (hardware-acceleration-plan.md Phase B.5,
+    /// zero-copy dmabuf import) rather than `CapturedFrame::Cpu`. Set when
+    /// `--compositor gl` actually initialized (see `main.rs`) -- decided
+    /// once at startup, never toggled at runtime, since the compositor
+    /// backend itself doesn't change mid-run. `VaapiEncoder` uses this to
+    /// build only the pipeline it'll actually need instead of opening two
+    /// concurrent hardware encode sessions; ignored by `X264`, which can
+    /// never accept a `Gpu` frame regardless.
+    pub gpu_frames: bool,
 }
 
 impl Default for EncoderConfig {
@@ -137,6 +146,7 @@ impl Default for EncoderConfig {
             keyframe_interval: 60, // 2 seconds at 30fps
             encoder_backend: EncoderBackend::X264,
             vaapi_device: "/dev/dri/renderD128".to_string(),
+            gpu_frames: false,
         }
     }
 }
@@ -856,6 +866,7 @@ mod tests {
             keyframe_interval: 1000,
             encoder_backend: EncoderBackend::X264,
             vaapi_device: "/dev/dri/renderD128".to_string(),
+            gpu_frames: false,
         };
         let (codec_tx, _codec_rx) = watch::channel(String::new());
         let (mut handle, _buffer_return_rx, _join_handle) =
@@ -910,6 +921,7 @@ mod tests {
             keyframe_interval: 1000,
             encoder_backend: EncoderBackend::X264,
             vaapi_device: "/dev/dri/renderD128".to_string(),
+            gpu_frames: false,
         };
         let (codec_tx, mut codec_rx) = watch::channel(String::new());
         let (mut handle, _buffer_return_rx, _join_handle) =
