@@ -14,7 +14,10 @@ use smithay::{
     desktop::space::space_render_elements,
     utils::{Buffer as BufferCoord, Rectangle},
 };
+use std::cell::RefCell;
 use std::fs::File;
+use std::os::unix::fs::MetadataExt;
+use std::rc::Rc;
 
 use crate::encoder::{CapturedFrame, RawFrame};
 
@@ -33,10 +36,24 @@ use super::state::WaylandWebStreamState;
 /// first `render()` call (and rebuilt whenever the output is resized), the
 /// same "rebuild wholesale on resize" pattern `vaapi::build_pipeline` uses
 /// for the VAAPI filtergraph/encoder.
+///
+/// `renderer` is `Rc<RefCell<_>>`, not owned outright, so `WaylandWebStreamState`
+/// can hold a clone of the same handle for `linux-dmabuf` import
+/// (`DmabufHandler::dmabuf_imported`, hardware-acceleration-plan.md Phase
+/// B.4) without this struct's render path and the dmabuf-import callback
+/// fighting over two different `GlesRenderer`s. Single-threaded by
+/// construction (the compositor render loop owns this on one thread), so
+/// `Rc`/`RefCell` rather than `Arc`/`Mutex`.
 pub struct GlCompositor {
-    renderer: GlesRenderer,
+    renderer: Rc<RefCell<GlesRenderer>>,
     gbm: GbmAllocator<File>,
     sized: Option<SizedState>,
+    // `st_rdev` of the DRM render node, for the dmabuf feedback's
+    // `main_device` (Phase B.4) -- without it, Mesa's wayland-egl platform
+    // can't tell which device to open and falls back to no-op/zink (proven
+    // on hardware: see the deviation note on `WaylandWebStreamState::
+    // enable_dmabuf`).
+    main_device: u64,
 }
 
 /// Everything that depends on the current output size, rebuilt on resize.
@@ -62,6 +79,10 @@ impl GlCompositor {
             .write(true)
             .open(device_path)
             .with_context(|| format!("failed to open DRM render node {device_path:?}"))?;
+        let main_device = file
+            .metadata()
+            .with_context(|| format!("failed to stat {device_path:?}"))?
+            .rdev();
         // `GbmDevice<File>` isn't `Clone` (`File` isn't) but the allocator
         // and the EGL display each need their own owned device wrapping the
         // same underlying fd -- `try_clone` dup()s the fd instead.
@@ -86,10 +107,25 @@ impl GlCompositor {
         let gbm = GbmAllocator::new(gbm_device, GbmBufferFlags::RENDERING);
 
         Ok(Self {
-            renderer,
+            renderer: Rc::new(RefCell::new(renderer)),
             gbm,
             sized: None,
+            main_device,
         })
+    }
+
+    /// Clones the handle to this compositor's `GlesRenderer`, for
+    /// `WaylandWebStreamState::enable_dmabuf` to import client dmabufs into
+    /// (Phase B.4) -- the same renderer this struct renders frames with, not
+    /// a second one.
+    pub fn renderer_handle(&self) -> Rc<RefCell<GlesRenderer>> {
+        self.renderer.clone()
+    }
+
+    /// `st_rdev` of the DRM render node this compositor was opened against,
+    /// for `WaylandWebStreamState::enable_dmabuf`'s dmabuf feedback.
+    pub fn main_device(&self) -> u64 {
+        self.main_device
     }
 
     /// (Re)builds the size-dependent target pool and damage tracker if `size`
@@ -160,26 +196,26 @@ impl GlCompositor {
         sized.next_target = (sized.next_target + 1) % sized.targets.len();
         let target = &mut sized.targets[target_idx];
 
-        let mut framebuffer = self
-            .renderer
+        let mut renderer = self.renderer.borrow_mut();
+        let renderer = &mut *renderer;
+
+        let mut framebuffer = renderer
             .bind(target)
             .context("failed to bind dmabuf render target")?;
 
-        let elements = space_render_elements(&mut self.renderer, [&state.space], &state.output, 1.0)
+        let elements = space_render_elements(renderer, [&state.space], &state.output, 1.0)
             .context("failed to collect space render elements")?;
 
         sized
             .damage_tracker
-            .render_output(&mut self.renderer, &mut framebuffer, 0, &elements, Color32F::BLACK)
+            .render_output(renderer, &mut framebuffer, 0, &elements, Color32F::BLACK)
             .map_err(|e| anyhow::anyhow!("render_output failed: {e:?}"))?;
 
         let region = Rectangle::<i32, BufferCoord>::from_size((width as i32, height as i32).into());
-        let mapping = self
-            .renderer
+        let mapping = renderer
             .copy_framebuffer(&framebuffer, region, Fourcc::Argb8888)
             .context("failed to copy GL framebuffer to a CPU-readable mapping")?;
-        let bytes = self
-            .renderer
+        let bytes = renderer
             .map_texture(&mapping)
             .context("failed to map the copied framebuffer")?;
 

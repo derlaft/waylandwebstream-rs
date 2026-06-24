@@ -141,7 +141,18 @@ async fn main() -> Result<()> {
     let mut compositor_backend: Box<dyn Compositor> = match config.compositor {
         CompositorBackendArg::Sw => Box::new(SwCompositor),
         CompositorBackendArg::Gl => match GlCompositor::new(&config.vaapi_device) {
-            Ok(c) => Box::new(c),
+            Ok(c) => {
+                // Advertise `linux-dmabuf` to clients now that there's a
+                // renderer to import them into (hardware-acceleration-plan.md
+                // Phase B.4). `enable_dmabuf` stores a clone of the same
+                // renderer handle `c` renders with -- not a second renderer.
+                // Failure here only means no dmabuf global gets advertised;
+                // GL rendering and SHM clients are unaffected.
+                if let Err(e) = state.enable_dmabuf(&display.handle(), c.renderer_handle(), c.main_device()) {
+                    warn!("Failed to advertise linux-dmabuf to clients ({e:#}); dmabuf-only clients won't be able to attach buffers, SHM clients are unaffected");
+                }
+                Box::new(c)
+            }
             Err(e) => {
                 warn!("--compositor gl failed to initialize ({e:#}); falling back to sw");
                 Box::new(SwCompositor)

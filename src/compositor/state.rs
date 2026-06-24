@@ -1,11 +1,13 @@
 // Complete compositor state implementation with full Wayland protocol support
 
+use anyhow::{Context, Result};
 use smithay::{
     backend::{
+        allocator::dmabuf::Dmabuf,
         input::{Axis, AxisSource, ButtonState, KeyState, TouchSlot},
-        renderer::utils::with_renderer_surface_state,
+        renderer::{gles::GlesRenderer, utils::with_renderer_surface_state, ImportDma},
     },
-    delegate_compositor, delegate_output, delegate_seat, delegate_shm,
+    delegate_compositor, delegate_dmabuf, delegate_output, delegate_seat, delegate_shm,
     delegate_xdg_shell,
     desktop::{Space, Window},
     input::{
@@ -21,7 +23,7 @@ use smithay::{
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::{wl_seat, wl_surface::WlSurface},
-            Display,
+            Display, DisplayHandle,
         },
     },
     utils::{Clock, Logical, Monotonic, Point, Rectangle, Transform, SERIAL_COUNTER},
@@ -30,6 +32,7 @@ use smithay::{
         compositor::{
             CompositorClientState, CompositorState as SmithayCompositorState,
         },
+        dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         output::{OutputManagerState, OutputHandler},
         shell::xdg::{
             XdgShellState, ToplevelSurface,
@@ -38,7 +41,9 @@ use smithay::{
         seat::WaylandFocus,
     },
 };
-use tracing::{info, trace};
+use std::cell::RefCell;
+use std::rc::Rc;
+use tracing::{info, trace, warn};
 
 pub struct WaylandWebStreamState {
     // Core Smithay states
@@ -68,6 +73,15 @@ pub struct WaylandWebStreamState {
 
     // Counts calls to `render()`, used to throttle its debug/trace logging.
     frame_counter: u32,
+
+    // `linux-dmabuf` (hardware-acceleration-plan.md Phase B.4). Both `None`
+    // until `enable_dmabuf` registers the global -- only meaningful with the
+    // `gl` compositor backend, since `SwCompositor`'s SHM-only render path
+    // has no renderer to import a client's dmabuf into. `dmabuf_renderer` is
+    // a clone of the same handle `GlCompositor` renders with (see
+    // `GlCompositor::renderer_handle`), not a second renderer.
+    dmabuf_state: Option<DmabufState>,
+    dmabuf_renderer: Option<Rc<RefCell<GlesRenderer>>>,
 }
 
 impl WaylandWebStreamState {
@@ -135,7 +149,48 @@ impl WaylandWebStreamState {
             clock: Clock::new(),
             damage: Some(Rectangle::new((0, 0).into(), (width as i32, height as i32).into())),
             frame_counter: 0,
+            dmabuf_state: None,
+            dmabuf_renderer: None,
         }
+    }
+
+    /// Registers the `zwp_linux_dmabuf_v1` global, advertising `renderer`'s
+    /// supported dmabuf formats, and remembers `renderer` so
+    /// `DmabufHandler::dmabuf_imported` can actually import client buffers
+    /// into it. `renderer` is the same handle `GlCompositor` renders with
+    /// (`GlCompositor::renderer_handle`); `main_device` is its DRM render
+    /// node's `st_rdev` (`GlCompositor::main_device`). Only called when
+    /// `--compositor gl` initializes successfully; the `sw` backend has no
+    /// renderer to import into, so no global is advertised and SHM-only
+    /// clients are unaffected either way.
+    ///
+    /// **Deviation from the plan's literal checklist** (which named the
+    /// formats-only v3 global, `DmabufState::create_global`): verified on
+    /// real hardware that v3 doesn't actually work for a GL client. Mesa's
+    /// wayland-egl platform needs the dmabuf feedback's `main_device` event
+    /// to know which DRM device to open -- v3 has no feedback mechanism at
+    /// all, so without it Mesa can't find a device (`failed to get driver
+    /// name for fd -1`, falls back to zink/software, which then also fails
+    /// with no usable Vulkan ICD). Reproduced with `weston-simple-egl`
+    /// against this server; switching to the feedback-based v4/v5 global
+    /// (`create_global_with_default_feedback`) fixed it. A single render
+    /// node and no scan-out planes means there's nothing to put in a
+    /// preference tranche, so the feedback carries just the main tranche.
+    pub fn enable_dmabuf(
+        &mut self,
+        display: &DisplayHandle,
+        renderer: Rc<RefCell<GlesRenderer>>,
+        main_device: u64,
+    ) -> Result<()> {
+        let formats = renderer.borrow().dmabuf_formats();
+        let feedback = DmabufFeedbackBuilder::new(main_device, formats)
+            .build()
+            .context("failed to build dmabuf feedback")?;
+        let mut dmabuf_state = DmabufState::new();
+        dmabuf_state.create_global_with_default_feedback::<Self>(display, &feedback);
+        self.dmabuf_state = Some(dmabuf_state);
+        self.dmabuf_renderer = Some(renderer);
+        Ok(())
     }
 
     /// Returns whether the rendered picture may have changed since the last
@@ -613,6 +668,7 @@ delegate_xdg_shell!(WaylandWebStreamState);
 delegate_shm!(WaylandWebStreamState);
 delegate_seat!(WaylandWebStreamState);
 delegate_output!(WaylandWebStreamState);
+delegate_dmabuf!(WaylandWebStreamState);
 
 // XDG Shell handler for window management
 impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
@@ -733,6 +789,32 @@ impl BufferHandler for WaylandWebStreamState {
 
 // Output handler
 impl OutputHandler for WaylandWebStreamState {}
+
+// `linux-dmabuf` handler (hardware-acceleration-plan.md Phase B.4). Only
+// reachable once `enable_dmabuf` has run (`gl` compositor backend); the
+// global itself isn't advertised otherwise, so `dmabuf_imported` only fires
+// when `dmabuf_renderer` is actually `Some`.
+impl DmabufHandler for WaylandWebStreamState {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        self.dmabuf_state.as_mut().expect("dmabuf_imported fired without a registered global")
+    }
+
+    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
+        let imported = self
+            .dmabuf_renderer
+            .as_ref()
+            .map(|renderer| renderer.borrow_mut().import_dmabuf(&dmabuf, None).is_ok())
+            .unwrap_or(false);
+
+        if imported {
+            if let Err(e) = notifier.successful::<Self>() {
+                warn!("Failed to create wl_buffer for imported dmabuf: {e}");
+            }
+        } else {
+            notifier.failed();
+        }
+    }
+}
 
 // Seat handler for input
 impl smithay::input::SeatHandler for WaylandWebStreamState {

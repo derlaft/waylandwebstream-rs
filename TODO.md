@@ -15,8 +15,6 @@ constraints each item has to respect.
 - **On-screen (virtual) keyboard for touch devices.** Physical-keyboard
   forwarding is fully wired (browser `KeyboardEvent.code` → evdev → seat), but
   there's no on-screen keyboard for phones/tablets with no hardware keyboard.
-- **Hardware encoding (VAAPI/NVENC).** Software x264 only. Would need encoder
-  selection/fallback in `src/encoder/mod.rs`.
 
 ## Multi-client (currently single-controller in practice)
 

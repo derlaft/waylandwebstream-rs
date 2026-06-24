@@ -297,11 +297,51 @@ avoids entangling the SW and GL render paths in one method body.
   (cosmetic SW-only placeholder, not reproduced in GL) -- accepted, not a bug.
 
 ### B.4 — Advertise dmabuf to clients
-- [ ] `DmabufState` + `create_global::<State>(&display, renderer.dmabuf_formats())`.
-- [ ] Implement `DmabufHandler::dmabuf_imported` → `renderer.import_dmabuf(...)` →
-  `notifier.successful()/.failed()`. `delegate_dmabuf!`.
-- [ ] Confirm **software (SHM) clients still render** (texture-upload path) — no
-  client change, no fallback to SW compositor.
+- [x] `DmabufState` registered in `WaylandWebStreamState::enable_dmabuf`
+  (`src/compositor/state.rs`), called from `main.rs` right after `GlCompositor::new`
+  succeeds -- `sw` backend never calls it, so no global is advertised and SHM-only
+  clients are unaffected either way (no renderer exists to import into).
+- [x] **Deviation from the plan's literal checklist.** The plan named the
+  formats-only v3 global (`DmabufState::create_global`, no feedback). Verified on
+  real hardware (the devbox's Intel HD Graphics) that v3 doesn't actually let a
+  real GL client work: `weston-simple-egl` failed immediately with `libEGL
+  warning: failed to get driver name for fd -1` → fell back to zink → died with
+  `VK_ERROR_INCOMPATIBLE_DRIVER`. Root cause: Mesa's wayland-egl platform needs
+  the dmabuf feedback's `main_device` event to know which DRM device to open; v3
+  has no feedback mechanism at all. Fixed by switching to the feedback-based
+  v4/v5 global (`DmabufFeedbackBuilder::new(main_device, formats).build()` +
+  `DmabufState::create_global_with_default_feedback`), where `main_device` is the
+  render node's `st_rdev` (`GlCompositor::main_device`, captured via
+  `file.metadata()?.rdev()` when the device is opened). Confirmed fixed:
+  `wayland-info` shows `version: 5` with the correct `main_device`, and
+  `weston-simple-egl` then connects and paints with no warnings.
+- [x] **Renderer sharing, not in the plan's sketch.** `DmabufHandler::dmabuf_imported`
+  needs a `&mut GlesRenderer` to call `import_dmabuf` on, but the renderer lives
+  inside `GlCompositor` (boxed as `dyn Compositor`, owned by `main.rs`'s loop),
+  not in `WaylandWebStreamState`. Rather than merging the two types, `GlCompositor`
+  now holds `renderer: Rc<RefCell<GlesRenderer>>` and exposes
+  `renderer_handle()` (a clone of the same `Rc`); `main.rs` passes that clone to
+  `state.enable_dmabuf` once at GL-backend construction. Single-threaded by
+  construction (the compositor loop owns everything on one thread), so
+  `Rc`/`RefCell` rather than `Arc`/`Mutex`. `render_gl` now does one
+  `self.renderer.borrow_mut()` per frame instead of holding `&mut self.renderer`
+  directly -- no behavior change, `Bind::bind`'s `&mut self` borrow doesn't
+  outlive the call so this doesn't fight with the later `space_render_elements`/
+  `render_output` calls in the same frame.
+- [x] Implemented `DmabufHandler::dmabuf_imported` → `renderer.import_dmabuf(&dmabuf,
+  None)` → `notifier.successful::<Self>()`/`.failed()`. `delegate_dmabuf!`.
+- [x] **Confirmed end-to-end on real hardware**, not just protocol-level: ran
+  `--compositor gl --encoder x264`, connected `weston-simple-egl` (an EGL/dmabuf
+  client, not SHM), captured a frame over `/stream` (same hand-rolled stdlib-only
+  WS client approach as B.3), decoded with `ffmpeg`, sampled a pixel inside the
+  client's window: non-black (`40 3f 7d`) against a black background elsewhere --
+  proves the dmabuf-backed surface was actually imported, composited, and encoded,
+  not just that the protocol handshake succeeded.
+- [x] Confirmed **software (SHM) clients still render** unaffected: ran
+  `wayland-test-client` (the existing SHM test client) against the same
+  dmabuf-enabled `gl` server, captured a frame, sampled `(253, 0, 0)` -- identical
+  byte-level result to the B.3 validation, no regression from advertising the
+  dmabuf global alongside SHM.
 
 ### B.5 — Zero-copy dmabuf → VAAPI (B + HW-encode cell)
 - [ ] Fill `AVDRMFrameDescriptor` from smithay `Dmabuf` (fd, modifier, per-plane
@@ -319,8 +359,8 @@ avoids entangling the SW and GL render paths in one method body.
   against SW compositor. Done on the devbox's Intel HD Graphics: byte-order
   confirmed correct via real decoded pixels; the one behavioral diff found
   (no stretch-to-fill) is accepted as intentional, not a bug -- see B.3.
-- [ ] Add B.4 dmabuf global; test a GL client (`weston-simple-egl`/wgpu) + confirm
-  SHM clients still work.
+- [x] Added B.4 dmabuf global; tested a GL client (`weston-simple-egl`) + confirmed
+  SHM clients still work, both on real hardware (the devbox's Intel HD Graphics).
 - [ ] Add B.5 zero-copy last, readback fallback as default.
 
 ---
