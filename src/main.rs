@@ -133,10 +133,10 @@ async fn main() -> Result<()> {
             config.max_bitrate
         );
     }
-    // Backend selection: `gl`/`vaapi` aren't implemented yet
-    // (docs/hardware-acceleration-plan.md Phases A/B), so requesting either
-    // falls back to today's sw/x264 path with a warning rather than
-    // refusing to start.
+    // Backend selection: `--compositor gl` isn't implemented yet
+    // (docs/hardware-acceleration-plan.md Phase B), so requesting it falls
+    // back to today's sw path with a warning rather than refusing to start.
+    // `--encoder vaapi` (Phase A) is real -- see encoder::vaapi.
     let mut compositor_backend: Box<dyn Compositor> = match config.compositor {
         CompositorBackendArg::Sw => Box::new(SwCompositor),
         CompositorBackendArg::Gl => {
@@ -156,6 +156,7 @@ async fn main() -> Result<()> {
         rate_control,
         keyframe_interval,
         encoder_backend,
+        vaapi_device: config.vaapi_device.clone(),
     };
 
     // Current WebCodecs codec string (profile/level), surfaced to clients

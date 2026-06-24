@@ -11,9 +11,9 @@ pub enum CompositorBackendArg {
 }
 
 /// Which `VideoEncoder` backend encodes captured frames. `Vaapi`
-/// (hardware-acceleration-plan.md Phase A) isn't implemented yet --
-/// selecting it falls back to `X264` with a warning instead of failing to
-/// start.
+/// (hardware-acceleration-plan.md Phase A) does H.264 encode on the GPU via
+/// `hwupload,scale_vaapi=format=nv12` + `h264_vaapi`; needs `--vaapi-device`
+/// to point at a render node that actually has VAAPI H.264 encode support.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum EncoderBackendArg {
@@ -97,15 +97,15 @@ pub struct Config {
     #[arg(long, value_enum, default_value = "sw")]
     pub compositor: CompositorBackendArg,
 
-    /// Video encoder backend. `vaapi` (hardware H.264 encode) is not
-    /// implemented yet -- selecting it logs a warning and falls back to
-    /// `x264`. See docs/hardware-acceleration-plan.md Phase A.
+    /// Video encoder backend. `vaapi` does hardware H.264 encode --
+    /// requires a render node with VAAPI H.264 EncSlice support (check with
+    /// `vainfo`). See docs/hardware-acceleration-plan.md Phase A.
     #[arg(long, value_enum, default_value = "x264")]
     pub encoder: EncoderBackendArg,
 
     /// DRM render node used by `--encoder vaapi` (and, once implemented,
-    /// `--compositor gl`, which defaults to the same node so both share a
-    /// GPU). Inert until those backends exist.
+    /// `--compositor gl`, which will default to the same node so both share
+    /// a GPU).
     #[arg(long, default_value = "/dev/dri/renderD128")]
     pub vaapi_device: String,
 

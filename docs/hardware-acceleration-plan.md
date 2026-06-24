@@ -93,61 +93,104 @@ Pure refactor, no behavior change; existing test suite is the guard.
 New module `src/encoder/vaapi.rs`. SW compositor unchanged.
 
 ### A.0 — Decide variant
-- [ ] Pick **A-manual** (swscale CSC on CPU + manual surface pool) or
-  **A-filtergraph** (GPU CSC, filter owns pool). Recommendation: start manual for
-  control, or filtergraph since it's proven. Both share device setup below.
+- [x] Picked **A-filtergraph**: CPU offload is the entire point of this
+  phase, and A-manual's swscale BGRA→NV12 step keeps a full-frame colour
+  conversion on the CPU, undercutting that. Landed in `src/encoder/vaapi.rs`.
 
 ### A.1 — VAAPI device + hwframe pool
-- [ ] `av_hwdevice_ctx_create(&mut dev, AV_HWDEVICE_TYPE_VAAPI, c"/dev/dri/renderD128", null, 0)`
-  once at thread start; check `ret < 0`.
-- [ ] Per resolution: `av_hwframe_ctx_alloc(dev)` → cast `(*ref).data as *mut AVHWFramesContext`;
-  set `format = AV_PIX_FMT_VAAPI` (**not** `VAAPI_VLD`), `sw_format = AV_PIX_FMT_NV12`,
-  `width`, `height`, `initial_pool_size` (≥ async_depth + filter buffering + in-flight;
-  20 is safe for the filter path); `av_hwframe_ctx_init(ref)`; check `< 0`.
+- [x] `av_hwdevice_ctx_create` once per `VaapiEncoder` (not per resolution) --
+  `create_device`. Outlives every `graph`/`encoder` rebuild.
+- [ ] **Deviation from the plan**: no separate manually-allocated hwframe
+  pool. `scale_vaapi` derives its own output `hw_frames_ctx` during
+  `graph.validate()`; that derived context is the canonical one (see A.2) --
+  allocating a second, independent one would just create two competing
+  pools. `initial_pool_size` tuning, if ever needed, would mean passing pool
+  options to the filter rather than to a manual `av_hwframe_ctx_alloc`.
 
-### A.2 — Encoder creation (modify `create_encoder`)
-- [ ] `encoder::find_by_name("h264_vaapi")`.
-- [ ] Before `open_with`, on `as_mut_ptr()`: `pix_fmt = AV_PIX_FMT_VAAPI`,
-  `hw_frames_ctx = av_buffer_ref(frames_ref)`.
-- [ ] Options (NOT 1:1 with x264): `async_depth=1`, `bf=0`, `g=<keyint>`,
-  optionally `low_power=1` (validate baseline support on target GPU).
-- [ ] Rate-control mapping for the existing `RateControl` enum:
-  - `Bitrate(b)` → `rc_mode=CBR`, `bit_rate=b`, `maxrate=b` (HRD buffer is
-    driver-managed; document the ~250 ms intent that `vbv-bufsize` gave x264).
-  - `Quality(crf)` → `rc_mode=CQP`, `global_quality=crf` (VAAPI QP ≈ but ≠ x264
-    CRF — document the remap).
-- [ ] **Forced keyframe**: set `forced_idr=1` **and** tag frame `pict_type=I`.
-  Without `forced_idr`, VAAPI ignores the I request (analogue of the existing
-  x264 keyframe bug). Extend `force_keyframe_actually_forces_an_idr` to VAAPI.
-- [ ] Reuse `select_h264_level` / `h264_codec_string` unchanged (still Annex-B
-  baseline `avc1.42E0xx`). `profile=constrained_baseline`.
+### A.2 — Encoder creation (`create_vaapi_encoder`)
+- [x] `encoder::find_by_name("h264_vaapi")`.
+- [x] Before `open_with`, on `as_mut_ptr()`: `pix_fmt = AV_PIX_FMT_VAAPI`,
+  `hw_frames_ctx = av_buffer_ref(frames_ref)` -- **the `av_buffer_ref` here
+  is load-bearing, not defensive copying**. See the heap-corruption note
+  under A.4.
+- [x] Options: `async_depth=1`, `max_b_frames=0` (typed setter, not a string
+  option), `g=<keyint>` (typed setter). `low_power` left unset (default
+  off) -- not validated on this GPU, plan flagged it as optional.
+- [x] Rate-control mapping:
+  - `Bitrate(b)` → `rc_mode=CBR`, `bit_rate=b` (typed setter). No `maxrate`
+    equivalent set -- VAAPI's HRD buffer is driver-managed and there's no
+    AVOption exposing the x264 `vbv-bufsize` ~250ms-buffer knob.
+  - `Quality(crf)` → `rc_mode=CQP`, `qp=<crf>`. Used the private `qp`
+    AVOption directly (confirmed present via `ffmpeg -h encoder=h264_vaapi`)
+    rather than the generic `global_quality` field, since `qp` is the one
+    this build's h264_vaapi actually documents for CQP.
+- [x] **Forced keyframe — bigger deviation than expected**: this build's
+  `h264_vaapi` has **no `forced_idr` AVOption at all** (checked via
+  `ffmpeg -h encoder=h264_vaapi` on the target hardware; it exists on some
+  *other* hwaccel encoders, not this one). Tagging the frame
+  `pict_type = AV_PICTURE_TYPE_I` is the only mechanism available --
+  verified sufficient by `vaapi::tests::force_keyframe_actually_forces_an_idr`
+  (mirrors the x264 test, run with `--ignored` on real hardware).
+- [x] Reused `select_h264_level` / `h264_codec_string` unchanged.
+  `profile=constrained_baseline`.
 
 ### A.3a — Per-frame submit (A-manual)
-- [ ] `swscale` BGRA → NV12 into a **single reused** CPU staging frame (safe:
-  `av_hwframe_transfer_data` blocks until upload staged).
-- [ ] **Fresh** pooled surface every frame: `av_hwframe_get_buffer(frames_ref, surf, 0)`
-  (NOT a single reused surface — see Safety §).
-- [ ] `av_hwframe_transfer_data(surf, nv12_stage, 0)`; set pts/pict_type; `send_frame(surf)`.
-- [ ] Drain `receive_packet` → `EncodedPacket` (unchanged); return the `Cpu` BGRA
-  buffer to the recycler.
+- [ ] Not implemented -- A-filtergraph was chosen instead (A.0).
 
 ### A.3b — Per-frame submit (A-filtergraph)
-- [ ] Build graph once per resolution: `buffer` (pix_fmt=BGRA, video_size, time_base)
-  → parse `hwupload,scale_vaapi=format=nv12` → `buffersink`.
-- [ ] Set `hw_device_ctx = av_buffer_ref(dev)` on each node via `as_mut_ptr()`:
-  `in`, `Parsed_hwupload_0`, `Parsed_scale_vaapi_1`, `out`. **Assert node names
-  exist** after parse (fragile).
-- [ ] Per frame: feed BGRA `RawFrame` into `in` source; drain `out` sink into a
-  fresh `frame::Video::empty()` (refcounting owns surface reuse); `send_frame` it.
-- [ ] No manual `av_hwframe_get_buffer` — filter owns the pool.
+- [x] Build graph once per resolution: `buffer` (pix_fmt=bgra, video_size,
+  time_base) → `hwupload` → `scale_vaapi=format=nv12` → `buffersink`.
+- [ ] **The plan's wiring here doesn't work as written.** `hwupload` and
+  `scale_vaapi` both check `hw_device_ctx` inside their own `init()`
+  callback (confirmed on hardware: omitting this fails immediately with
+  *"A hardware device reference is required to upload frames to"*). Setting
+  `hw_device_ctx` on the `Parsed_*` nodes *after* `Graph::parse()` is too
+  late -- parsing already allocates *and initializes* each filter
+  (`avfilter_graph_create_filter`'s own doc comment confirms this and names
+  the fix). Landed instead: `alloc_hw_filter` splits allocation
+  (`avfilter_graph_alloc_filter`) from init (`avfilter_init_dict`), setting
+  `hw_device_ctx` in between, for `hwupload`/`scale_vaapi` only --
+  `buffer`/`buffersink` don't need it and still go through `Graph::add`.
+  Nodes are named directly (`"hwupload"`, `"scale_vaapi"`) instead of
+  relying on autogenerated `Parsed_<filter>_<n>` names, which also makes the
+  "filter-node wiring is fragile" risk below moot -- there's no parse-string
+  position to get wrong anymore.
+- [x] Per frame: feed BGRA `RawFrame` into `in` source (`Source::add`,
+  copies synchronously since the frame isn't refcounted); drain `out` sink
+  into a fresh `frame::Video::empty()`; `send_frame` it.
+- [x] No manual `av_hwframe_get_buffer` -- filter owns the pool.
 
 ### A.4 — Lifecycle + validation
-- [ ] `av_buffer_unref` device + frames ctx (+ filter graph) on encoder drop and
-  on every `reinitialize_for_resolution` rebuild.
-- [ ] `vainfo` shows `VAEntrypointEncSlice` for H264 on target host.
-- [ ] Run `--encoder vaapi`; confirm a browser client decodes; confirm
-  `encoding_ms` in latency logs drops sharply (proof of offload).
-- [ ] Keyframe regression test passes for VAAPI (`forced_idr`).
+- [x] **Real bug found and fixed, not just theoretical risk**:
+  `av_buffersink_get_hw_frames_ctx` has no doc comment in upstream FFmpeg at
+  all, and its actual implementation (`libavfilter/buffersink.c`) returns
+  the link's `hw_frames_ctx` pointer directly -- borrowed, not ref-counted.
+  It's easy to confuse with its documented, similarly-named sibling
+  `avfilter_link_get_hw_frames_ctx` (`avfilter.h`), which *does*
+  `av_buffer_ref` internally and is genuinely an owned copy -- that sibling's
+  contract is what got (wrongly) assumed here at first. Treating the
+  buffersink accessor's return value as owned and unreffing it (verified via
+  bisection on hardware, captured as
+  `vaapi::tests::graph_plus_frames_ref_no_encoder`'s history) corrupts
+  whatever the filtergraph still tracks internally for that link -- surfaces
+  as a double-free/heap-corruption abort, sometimes not until process exit
+  (glibc detects it lazily, so the abort site is often unrelated code). Fix:
+  take a *fresh* `av_buffer_ref(frames_ref)` for the encoder's
+  `hw_frames_ctx` and never touch the original `frames_ref` again.
+- [x] `av_buffer_unref` on the device ref happens in `VaapiEncoder::drop`;
+  `graph`/`encoder` free their own refs (including the corrected
+  `hw_frames_ctx` ref above) via their own `Drop` impls.
+- [x] `vainfo` on the target hardware shows `VAProfileH264ConstrainedBaseline:
+  VAEntrypointEncSlice` (and `EncSliceLP`) on `/dev/dri/renderD128`.
+- [x] Ran `--encoder vaapi`, including through 6 adaptive-bitrate-driven
+  rebuilds and graceful shutdown, no crashes. Captured real output bytes:
+  first packet is `00 00 00 01 67 42 40 20 ...` -- valid Annex-B, SPS NAL,
+  profile_idc 0x42 (Baseline), matching the configured
+  `constrained_baseline` profile. (Browser/WebCodecs decode not exercised --
+  no client was connected during validation; the byte-level check above is
+  the proof of a correctly-formed stream.)
+- [x] Keyframe regression test ported and passing on hardware --
+  `vaapi::tests::force_keyframe_actually_forces_an_idr`.
 
 ---
 

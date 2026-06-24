@@ -4,6 +4,8 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
+mod vaapi;
+
 /// Raw frame data to be encoded
 #[derive(Clone)]
 pub struct RawFrame {
@@ -55,10 +57,10 @@ impl CapturedFrame {
     }
 }
 
-/// Which codec implementation the encoder thread drives. `Vaapi` is accepted
-/// on the CLI ahead of the actual hardware-acceleration-plan.md Phase A work
-/// landing -- `build_video_encoder` falls back to `X264` with a warning
-/// until then, rather than failing to start.
+/// Which codec implementation the encoder thread drives. `Vaapi` is the
+/// hardware-acceleration-plan.md Phase A backend (`vaapi::VaapiEncoder`):
+/// `hwupload,scale_vaapi=format=nv12` does BGRA->NV12 on the GPU, then
+/// `h264_vaapi` encodes the result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum EncoderBackend {
     #[default]
@@ -121,6 +123,8 @@ pub struct EncoderConfig {
     pub rate_control: RateControl,
     pub keyframe_interval: u32,
     pub encoder_backend: EncoderBackend,
+    /// DRM render node opened by `EncoderBackend::Vaapi`. Unused by `X264`.
+    pub vaapi_device: String,
 }
 
 impl Default for EncoderConfig {
@@ -132,6 +136,7 @@ impl Default for EncoderConfig {
             rate_control: RateControl::Bitrate(2_000_000), // 2 Mbps
             keyframe_interval: 60, // 2 seconds at 30fps
             encoder_backend: EncoderBackend::X264,
+            vaapi_device: "/dev/dri/renderD128".to_string(),
         }
     }
 }
@@ -383,16 +388,14 @@ impl VideoEncoder for X264Encoder {
 }
 
 /// Builds the `VideoEncoder` backend selected by `config.encoder_backend`.
-/// `Vaapi` isn't implemented yet (hardware-acceleration-plan.md Phase A) --
-/// falls back to `X264Encoder` with a warning instead of failing to start.
 fn build_video_encoder(
     config: &EncoderConfig,
     buffer_return_tx: std::sync::mpsc::Sender<Vec<u8>>,
 ) -> Result<Box<dyn VideoEncoder>> {
-    if config.encoder_backend == EncoderBackend::Vaapi {
-        warn!("--encoder vaapi is not implemented yet; falling back to x264");
+    match config.encoder_backend {
+        EncoderBackend::X264 => Ok(Box::new(X264Encoder::new(config.clone(), buffer_return_tx)?)),
+        EncoderBackend::Vaapi => Ok(Box::new(vaapi::VaapiEncoder::new(config.clone(), buffer_return_tx)?)),
     }
-    Ok(Box::new(X264Encoder::new(config.clone(), buffer_return_tx)?))
 }
 
 /// Drain and apply any pending control messages without blocking. Split out
@@ -579,7 +582,7 @@ const H264_LEVELS: &[(u8, u32, u32)] = &[
 /// level 3.1). Falls back to the highest known level if even that's exceeded
 /// (e.g. resolutions well past 4K@60) rather than silently encoding a level
 /// the stream can't possibly conform to.
-fn select_h264_level(width: u32, height: u32, framerate: u32) -> u8 {
+pub(crate) fn select_h264_level(width: u32, height: u32, framerate: u32) -> u8 {
     let mbs_per_frame = width.div_ceil(16) * height.div_ceil(16);
     let mbps = mbs_per_frame * framerate;
     H264_LEVELS
@@ -597,7 +600,7 @@ fn select_h264_level(width: u32, height: u32, framerate: u32) -> u8 {
 
 /// Formats a level_idc as the dotted string x264's `level` option expects,
 /// e.g. 31 -> "3.1", 40 -> "4".
-fn h264_level_option(level_idc: u8) -> String {
+pub(crate) fn h264_level_option(level_idc: u8) -> String {
     if level_idc % 10 == 0 {
         (level_idc / 10).to_string()
     } else {
@@ -701,7 +704,7 @@ fn create_scaler(config: &EncoderConfig) -> Result<ffmpeg::software::scaling::Co
 /// points its `data[0]`/`linesize[0]` directly at each `RawFrame`'s buffer
 /// instead of copying into it, so this never needs (and must never get)
 /// an owned buffer via `alloc()`.
-fn create_input_frame(width: u32, height: u32) -> ffmpeg::frame::Video {
+pub(crate) fn create_input_frame(width: u32, height: u32) -> ffmpeg::frame::Video {
     let mut frame = ffmpeg::frame::Video::empty();
     frame.set_format(ffmpeg::format::Pixel::BGRA);
     frame.set_width(width);
@@ -769,6 +772,18 @@ fn encode_frame(
     // config ever gains buffering/reordering (B-frames, lookahead), this
     // assumption breaks and yuv_frame would need to go back to being
     // allocated fresh per call (or use av_frame_make_writable first).
+    drain_packets(encoder, next_frame_id, capture_to_encode_ms)
+}
+
+/// Drains every packet currently available from `encoder` (looping until
+/// EAGAIN), tagging each with the per-frame timing fields the caller already
+/// knows. Shared by the x264 and VAAPI submit paths -- the only difference
+/// between them is how the frame got encoded, not how packets come back out.
+pub(crate) fn drain_packets(
+    encoder: &mut ffmpeg::encoder::Video,
+    next_frame_id: &mut u32,
+    capture_to_encode_ms: f64,
+) -> Result<Vec<EncodedPacket>> {
     let mut packets = Vec::new();
     loop {
         let mut encoded_packet = ffmpeg::Packet::empty();
@@ -840,6 +855,7 @@ mod tests {
             // must come from an explicit ForceKeyframe.
             keyframe_interval: 1000,
             encoder_backend: EncoderBackend::X264,
+            vaapi_device: "/dev/dri/renderD128".to_string(),
         };
         let (codec_tx, _codec_rx) = watch::channel(String::new());
         let (mut handle, _buffer_return_rx, _join_handle) =
@@ -893,6 +909,7 @@ mod tests {
             rate_control: RateControl::Bitrate(2_000_000),
             keyframe_interval: 1000,
             encoder_backend: EncoderBackend::X264,
+            vaapi_device: "/dev/dri/renderD128".to_string(),
         };
         let (codec_tx, mut codec_rx) = watch::channel(String::new());
         let (mut handle, _buffer_return_rx, _join_handle) =
