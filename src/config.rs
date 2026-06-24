@@ -91,9 +91,10 @@ pub struct Config {
     #[arg(long, default_value = "wayland-wws-0")]
     pub display_name: String,
 
-    /// Rendering backend. `gl` (GPU compositing via smithay's GlesRenderer)
-    /// is not implemented yet -- selecting it logs a warning and falls back
-    /// to `sw`. See docs/hardware-acceleration-plan.md Phase B.
+    /// Rendering backend. `gl` (GPU compositing via smithay's GlesRenderer,
+    /// reading the result back to the CPU -- no zero-copy GPU encode path
+    /// yet) falls back to `sw` with a warning if GL/EGL/GBM initialization
+    /// fails. See docs/hardware-acceleration-plan.md Phase B.
     #[arg(long, value_enum, default_value = "sw")]
     pub compositor: CompositorBackendArg,
 

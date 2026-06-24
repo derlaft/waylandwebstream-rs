@@ -11,7 +11,7 @@ authors = []
 
 [dependencies]
 # Compositor
-smithay = { version = "0.7", default-features = false, features = ["wayland_frontend", "renderer_pixman", "desktop"] }
+smithay = { version = "0.7", default-features = false, features = ["wayland_frontend", "renderer_pixman", "desktop", "renderer_gl", "backend_egl", "backend_gbm"] }
 
 # Video encoding
 ffmpeg-next = "8.1"

@@ -1,6 +1,8 @@
+pub mod gl;
 pub mod state;
 
 use crate::encoder::{CapturedFrame, RawFrame};
+pub use gl::GlCompositor;
 pub use state::CompositorState;
 use state::WaylandWebStreamState;
 
@@ -10,10 +12,11 @@ use state::WaylandWebStreamState;
 /// protocol dispatch, input injection, resize, etc.) -- a backend only ever
 /// borrows it for the duration of one `render` call.
 ///
-/// Today only `SwCompositor` exists, wrapping the manual memcpy compositor
-/// in `WaylandWebStreamState::render`. A future `GlCompositor`
-/// (hardware-acceleration-plan.md Phase B) replaces that render path with
-/// smithay's `GlesRenderer`, behind the same trait.
+/// `SwCompositor` wraps the manual memcpy compositor in
+/// `WaylandWebStreamState::render`. `GlCompositor`
+/// (hardware-acceleration-plan.md Phase B, stage 1) renders the same `Space`
+/// with smithay's `GlesRenderer` instead, reading the result back to the CPU
+/// -- zero-copy GPU encode (no CPU round-trip) is a later stage.
 pub trait Compositor {
     fn render(&mut self, state: &mut WaylandWebStreamState, reuse: Option<Vec<u8>>) -> Option<CapturedFrame>;
 }

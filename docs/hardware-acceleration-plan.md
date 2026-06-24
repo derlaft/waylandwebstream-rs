@@ -196,39 +196,105 @@ New module `src/encoder/vaapi.rs`. SW compositor unchanged.
 
 ## Phase B — GPU compositing (smithay GlesRenderer)
 
-Replaces the manual memcpy compositor (`src/compositor/state.rs:249 render()`).
 Large; gate behind `--compositor gl`. Validate against SW compositor first.
 
+**Deviation from the plan's framing**: rather than rewriting
+`WaylandWebStreamState::render()` in place, stage 1 (B.1-B.3) landed as a new,
+fully independent `GlCompositor` (`src/compositor/gl.rs`) implementing the
+same `Compositor` trait `SwCompositor` does. `WaylandWebStreamState::render()`
+(the manual memcpy path) is untouched. This fits the Phase 0 trait design
+better -- each backend is its own type behind `Box<dyn Compositor>` -- and
+avoids entangling the SW and GL render paths in one method body.
+
 ### B.1 — Cargo features
-- [ ] ```toml
-  smithay = { version = "0.7", default-features = false, features = [
-    "wayland_frontend", "desktop", "renderer_pixman",   # keep SW path
-    "renderer_gl", "backend_egl", "backend_gbm",
-  ]}
-  ```
-  (No `backend_drm`/session — headless render node needs no DRM master.)
+- [x] Landed as planned: `renderer_gl`, `backend_egl`, `backend_gbm` added
+  alongside the existing `wayland_frontend`, `renderer_pixman` (kept for the
+  SW path), `desktop`. `backend_gbm` pulls in `backend_drm` transitively
+  (smithay's own feature graph requires it for the `GbmBuffer`/`DrmNode`
+  types), but nothing here touches DRM master/KMS -- still no session/udev
+  features, headless render node only.
 
 ### B.2 — Headless renderer init
-- [ ] `/dev/dri/renderD128` → `GbmDevice` → `EGLDisplay::new(gbm)` →
-  `EGLContext::new(display)` (surfaceless) → `GlesRenderer::new(context)`.
-- [ ] `GbmAllocator::new(gbm, RENDERING)` for the offscreen target.
-- [ ] Pick node via `EGLDevice::enumerate()`; prefer one whose `render_device_path()`
-  matches the VAAPI device (so B + HW-encode share a GPU).
+- [x] `/dev/dri/renderD128` (via the shared `--vaapi-device` flag) → `File` →
+  `GbmDevice` → `EGLDisplay::new(gbm)` → `EGLContext::new(&display)`
+  (configless/surfaceless -- no `EGLSurface` ever created, no separate flag)
+  → `unsafe { GlesRenderer::new(context) }`. `GbmAllocator::new(gbm,
+  GbmBufferFlags::RENDERING)` for the offscreen target pool.
+- [ ] **Deviation**: no `EGLDevice::enumerate()`/node-matching step.
+  `GbmDevice<A>` implements `EGLNativeDisplay` directly
+  (`smithay-0.7.0/src/backend/egl/native.rs:147`), so the already-configured
+  `--vaapi-device` path is used to build the GBM device directly, which in
+  turn is the EGL native display -- no separate enumeration/matching needed
+  to guarantee B and HW-encode share a GPU, since both already read the same
+  CLI flag.
+- [x] **Real issue found, not just theoretical**: `GbmDevice<File>` isn't
+  `Clone` (`File` isn't), but the allocator and the `EGLDisplay` each need
+  their own owned device. Fixed with `File::try_clone()` (dup()s the fd) to
+  build two independent `GbmDevice`s over the same underlying fd, rather than
+  trying to share one.
 
 ### B.3 — Rewrite `render()` to the smithay element pipeline (bulk of the work)
-- [ ] Offscreen target pool: `GbmAllocator::create_buffer(w,h,Argb8888,modifiers)`
-  → `AsDmabuf::export()` → `Dmabuf` (pool of a few — encoder/readback may still
-  hold last frame's; same reasoning as VAAPI surface pool).
-- [ ] `renderer.bind(&mut dmabuf)` (`Bind<Dmabuf>`).
-- [ ] Build elements from `Space` (`space.elements()` → `WaylandSurfaceRenderElement`).
-  **This deletes the manual `with_buffer_contents` + scaling loop** — the element
-  importer handles SHM (texture upload) and dmabuf (import) automatically.
-- [ ] Replace manual `damage: Option<Rectangle>` with `OutputDamageTracker`
-  (preserves the "skip unchanged frame" optimization, correct against GL).
-- [ ] Branch on `wants_gpu`:
-  - `Gpu`: send the bound `Dmabuf` as `CapturedFrame::Gpu`.
-  - `Cpu`: `ExportMem::copy_framebuffer(&fb, region, Argb8888)` → `map_texture()`
-    → copy into recycled `Vec<u8>` → `CapturedFrame::Cpu`.
+- [x] Offscreen target pool: `GbmAllocator::create_buffer(w,h,Argb8888,
+  &[Modifier::Invalid])` → `AsDmabuf::export()` → `Dmabuf`. Pool of 2,
+  round-robin. Rebuilt (along with the damage tracker) lazily on the first
+  `render()` call and whenever the output's resized -- the same
+  "rebuild wholesale on resize" pattern `vaapi::build_pipeline` uses.
+- [x] `renderer.bind(target)` (`Bind<Dmabuf>`).
+- [x] Build elements via `space_render_elements(&mut renderer, [&state.space],
+  &state.output, 1.0)` -- deletes the manual `with_buffer_contents` +
+  scaling loop entirely for the GL path; the element importer handles SHM
+  texture upload automatically (`Window: AsRenderElements<R> for R: Renderer
+  + ImportAll`).
+- [ ] **Deviation**: did *not* replace the existing `damage:
+  Option<Rectangle>` (`state.rs`'s `take_dirty`/`add_damage`) with
+  `OutputDamageTracker` -- that mechanism is backend-agnostic (gates "should
+  we render *at all* this tick", used by both `SwCompositor` and
+  `GlCompositor` unchanged) and stays exactly as-is. `GlCompositor` has its
+  *own* `OutputDamageTracker`, required by `render_output`'s API, but calls
+  it with **`age` hardcoded to `0`** (always-full-damage/redraw) rather than
+  wiring real buffer-age tracking across the 2-target pool. This matches the
+  SW path's own always-full-repaint behavior (no regression), and keeps
+  partial/incremental damage a deferred optimization for both paths alike
+  (see TODO.md "Damage-driven partial repaint").
+- [ ] No `wants_gpu`/`Gpu` branch yet. `GlCompositor` always takes the `Cpu`
+  path (`ExportMem::copy_framebuffer` → `map_texture` → copy into the
+  recycled `Vec<u8>` → `CapturedFrame::Cpu`) regardless of `--encoder`.
+  `CapturedFrame::Gpu` stays unconstructed (`#[allow(dead_code)]`) until B.5.
+- [x] **Validated locally first** (contrary to the original assumption --
+  this sandbox has `/dev/dri/renderD128`, a virtio-gpu node): `EGLDisplay`/
+  `EGLContext`/`GlesRenderer::new` all succeed, but every `render()` then
+  fails at `GbmAllocator::create_buffer` (`Permission denied`, libgbm's
+  `DRM_IOCTL_MODE_CREATE_DUMB` fallback also `EACCES`) -- this sandboxed node
+  can't actually allocate buffers. No panic: each failure logs a `WARN` and
+  returns `None`, server keeps running. Confirms device-open → GBM → EGL →
+  GLES bring-up is correct independent of buffer allocation rights.
+- [x] **Validated on real hardware (the devbox, Intel HD Graphics).** Ran
+  `--compositor gl --encoder x264`, connected `wayland-test-client` (paints
+  an 800x600 bright-red `0xFFFF0000` ARGB SHM buffer): zero `render failed`
+  warnings, zero panics, x264 encoded real frames. Captured an actual
+  keyframe over `/stream` (hand-rolled stdlib-only WS client, no new
+  dependencies installed), decoded it with `ffmpeg`, sampled pixels:
+  `(253, 0, 0)` -- confirms the `Fourcc::Argb8888` byte-order assumption is
+  correct (a channel-swap bug would show blue, not red; the `253` vs `255`
+  is just YUV420 round-trip loss, expected).
+- [x] **Behavioral difference found vs. SW, deliberately not replicated.**
+  Pixel-sampled the decoded frame outside the client's 800x600 region (e.g.
+  `(960, 540)` on the 1280x720 output) and got black, not red. The SW
+  compositor's `render()` *stretches* a non-matching client buffer to fill
+  the configured output (`state.rs`'s scaling loop); `space_render_elements`
+  renders `Window` at its native buffer size, positioned by `Space`, with no
+  such stretch. **Decision**: this is intentional, not a gap to close. SW's
+  stretch is a compatibility hack for clients that never resize to the
+  configured viewport (the `wayland-test-client` used for this validation is
+  exactly that -- a fixed 800x600 buffer, no resize handling at all); the
+  correct behavior is the client resizing in response to the `xdg_toplevel`
+  configure it's already sent (`configure_toplevel_fullscreen`), at which
+  point it fills the screen natively with no compositor-side distortion
+  needed. If a client doesn't resize, showing it at native size/position
+  (today's `gl` behavior) is preferable to SW's forced, non-uniform
+  (aspect-distorting) stretch. No code change from this finding.
+- [ ] No cursor/"root weave" stipple parity for the `window_count == 0` case
+  (cosmetic SW-only placeholder, not reproduced in GL) -- accepted, not a bug.
 
 ### B.4 — Advertise dmabuf to clients
 - [ ] `DmabufState` + `create_global::<State>(&display, renderer.dmabuf_formats())`.
@@ -248,9 +314,11 @@ Large; gate behind `--compositor gl`. Validate against SW compositor first.
   optimize to direct map once proven on target GPU.
 
 ### B.6 — Sequencing
-- [ ] B.1–B.3 behind `--compositor gl` paired with **x264** (via `ExportMem`
+- [x] B.1–B.3 behind `--compositor gl` paired with **x264** (via `ExportMem`
   readback) first — isolates "is GL compositing correct?" from VAAPI. Diff output
-  against SW compositor.
+  against SW compositor. Done on the devbox's Intel HD Graphics: byte-order
+  confirmed correct via real decoded pixels; the one behavioral diff found
+  (no stretch-to-fill) is accepted as intentional, not a bug -- see B.3.
 - [ ] Add B.4 dmabuf global; test a GL client (`weston-simple-egl`/wgpu) + confirm
   SHM clients still work.
 - [ ] Add B.5 zero-copy last, readback fallback as default.

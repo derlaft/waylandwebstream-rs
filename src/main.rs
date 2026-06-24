@@ -21,7 +21,7 @@ mod session;
 mod web;
 
 use adaptive_bitrate::{AdaptiveBitrateConfig, AdaptiveBitrateController, BitrateEvent};
-use compositor::{Compositor, CompositorState, SwCompositor};
+use compositor::{Compositor, CompositorState, GlCompositor, SwCompositor};
 use config::{CompositorBackendArg, EncoderBackendArg};
 use encoder::{EncoderBackend, EncoderConfig, RateControl, spawn_encoder};
 use input::mouse::MouseHandler;
@@ -133,16 +133,20 @@ async fn main() -> Result<()> {
             config.max_bitrate
         );
     }
-    // Backend selection: `--compositor gl` isn't implemented yet
-    // (docs/hardware-acceleration-plan.md Phase B), so requesting it falls
-    // back to today's sw path with a warning rather than refusing to start.
-    // `--encoder vaapi` (Phase A) is real -- see encoder::vaapi.
+    // Backend selection. `--compositor gl` (hardware-acceleration-plan.md
+    // Phase B, stage 1: GL render + CPU readback, no zero-copy yet) falls
+    // back to `sw` with a warning rather than refusing to start if GL/EGL/
+    // GBM init fails on this machine -- same guard-rail philosophy as the
+    // missing-backend fallback Phase 0 established.
     let mut compositor_backend: Box<dyn Compositor> = match config.compositor {
         CompositorBackendArg::Sw => Box::new(SwCompositor),
-        CompositorBackendArg::Gl => {
-            warn!("--compositor gl is not implemented yet; falling back to sw");
-            Box::new(SwCompositor)
-        }
+        CompositorBackendArg::Gl => match GlCompositor::new(&config.vaapi_device) {
+            Ok(c) => Box::new(c),
+            Err(e) => {
+                warn!("--compositor gl failed to initialize ({e:#}); falling back to sw");
+                Box::new(SwCompositor)
+            }
+        },
     };
     let encoder_backend = match config.encoder {
         EncoderBackendArg::X264 => EncoderBackend::X264,
