@@ -21,8 +21,9 @@ mod session;
 mod web;
 
 use adaptive_bitrate::{AdaptiveBitrateConfig, AdaptiveBitrateController, BitrateEvent};
-use compositor::CompositorState;
-use encoder::{EncoderConfig, RateControl, spawn_encoder};
+use compositor::{Compositor, CompositorState, SwCompositor};
+use config::{CompositorBackendArg, EncoderBackendArg};
+use encoder::{EncoderBackend, EncoderConfig, RateControl, spawn_encoder};
 use input::mouse::MouseHandler;
 use input::touch::TouchHandler;
 use server::{SignalingServer, SignalingState};
@@ -132,14 +133,31 @@ async fn main() -> Result<()> {
             config.max_bitrate
         );
     }
+    // Backend selection: `gl`/`vaapi` aren't implemented yet
+    // (docs/hardware-acceleration-plan.md Phases A/B), so requesting either
+    // falls back to today's sw/x264 path with a warning rather than
+    // refusing to start.
+    let mut compositor_backend: Box<dyn Compositor> = match config.compositor {
+        CompositorBackendArg::Sw => Box::new(SwCompositor),
+        CompositorBackendArg::Gl => {
+            warn!("--compositor gl is not implemented yet; falling back to sw");
+            Box::new(SwCompositor)
+        }
+    };
+    let encoder_backend = match config.encoder {
+        EncoderBackendArg::X264 => EncoderBackend::X264,
+        EncoderBackendArg::Vaapi => EncoderBackend::Vaapi,
+    };
+
     let encoder_config = EncoderConfig {
         width,
         height,
         framerate: config.framerate,
         rate_control,
         keyframe_interval,
+        encoder_backend,
     };
-    
+
     // Current WebCodecs codec string (profile/level), surfaced to clients
     // over `/ws` so a resolution-driven level change reaches the decoder --
     // see `encoder::h264_codec_string`.
@@ -500,16 +518,9 @@ async fn main() -> Result<()> {
             let new_client = force_render.swap(false, Ordering::Relaxed);
             let stale = ticks_since_render >= keyframe_interval;
             if screen_dirty || new_client || stale {
-                if let Some(framebuffer) = state.render(spare_buffers.pop()) {
-                    let raw_frame = encoder::RawFrame {
-                        data: framebuffer,
-                        width: state.width,
-                        height: state.height,
-                        capture_instant: std::time::Instant::now(),
-                    };
-
+                if let Some(captured_frame) = compositor_backend.render(&mut state, spare_buffers.pop()) {
                     // Send frame to encoder (non-blocking)
-                    match frame_sender.try_send(raw_frame) {
+                    match frame_sender.try_send(captured_frame) {
                         Ok(()) => {
                             ticks_since_render = 0;
                         }

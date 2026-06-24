@@ -50,35 +50,41 @@ encoder. Do the refactor first, then A, then B.
 
 Pure refactor, no behavior change; existing test suite is the guard.
 
-- [ ] Introduce the frame enum on the encoder channel:
+- [x] Introduce the frame enum on the encoder channel:
   ```rust
   enum CapturedFrame {
       Cpu(RawFrame),                          // BGRA in system memory (today)
       Gpu { dmabuf: Dmabuf, width: u32, height: u32, capture_instant: Instant },
   }
   ```
-- [ ] Keep `RawFrame` + `BufferReturnReceiver` recycling for the `Cpu` arm.
-- [ ] Define traits:
+  Landed in `src/encoder/mod.rs`. `Gpu` is `#[allow(dead_code)]` until a GL
+  compositor exists to construct one.
+- [x] Keep `RawFrame` + `BufferReturnReceiver` recycling for the `Cpu` arm.
+- [x] Define traits — landed with one change from the sketch: both traits
+  take the data they actually need (`Compositor::render` takes
+  `&mut WaylandWebStreamState`; `VideoEncoder` also gained `reinitialize`,
+  `change_bitrate`, `codec_string`, `width`/`height` so `encoder_thread`
+  could stop touching concrete x264 types):
   ```rust
-  trait Compositor { fn render(&mut self, reuse: Option<Vec<u8>>) -> Option<CapturedFrame>; }
-  trait VideoEncoder { fn submit(&mut self, frame: CapturedFrame) -> Result<Vec<EncodedPacket>>; }
+  trait Compositor { fn render(&mut self, state: &mut WaylandWebStreamState, reuse: Option<Vec<u8>>) -> Option<CapturedFrame>; }
+  trait VideoEncoder { fn submit(&mut self, frame: CapturedFrame, capture_to_encode_ms: f64, force_keyframe: bool) -> Result<Vec<EncodedPacket>>; /* + reinitialize/change_bitrate/codec_string/width/height */ }
   ```
-- [ ] **Conversion-placement rule** (the key design decision):
-  - Upload (CPU→GPU) lives in the **HW encoder** (it owns the VAAPI device).
-  - Readback (GPU→CPU) lives in the **compositor** (it owns the GlesRenderer).
-  - SW encoder consumes `Cpu` only. HW encoder consumes both arms. HW compositor
-    emits `Gpu` by default, or `Cpu` (via `ExportMem`) when told `wants_gpu=false`.
-- [ ] Wrap today's `WaylandWebStreamState::render` as `SwCompositor` (returns `Cpu`).
-- [ ] Wrap today's `encoder_thread` body as `X264Encoder` (accepts `Cpu`).
-- [ ] Box `dyn Compositor` / `dyn VideoEncoder` in `src/main.rs` render loop
-  (~line 500) and the encoder thread.
-- [ ] CLI in `src/config.rs` (defaults preserve current behavior):
+- [ ] **Conversion-placement rule** (the key design decision) — not yet
+  applicable: no HW encoder or HW compositor exists yet to place upload/
+  readback in. Revisit when Phase A/B land.
+- [x] Wrap today's `WaylandWebStreamState::render` as `SwCompositor` (returns `Cpu`).
+- [x] Wrap today's `encoder_thread` body as `X264Encoder` (accepts `Cpu`).
+- [x] Box `dyn Compositor` / `dyn VideoEncoder` in `src/main.rs` render loop
+  and the encoder thread.
+- [x] CLI in `src/config.rs` (defaults preserve current behavior):
   - `--compositor sw|gl` (default `sw`)
   - `--encoder x264|vaapi` (default `x264`)
   - `--vaapi-device <path>` (default `/dev/dri/renderD128`)
-- [ ] Guard rails: `gl`+`vaapi` default GBM and VAAPI to the **same render node**.
-  Missing `/dev/dri/*` or no VAAPI driver → log + fall back to `sw`/`x264`, don't abort.
-- [ ] Run full test suite — must pass unchanged.
+- [x] Guard rails: missing backends (`gl`/`vaapi`, since neither is
+  implemented yet) log a warning and fall back to `sw`/`x264` rather than
+  aborting. The "default GBM and VAAPI to the same render node" part of this
+  item is deferred -- there's no GBM/VAAPI device handle yet to default.
+- [x] Run full test suite — must pass unchanged (`cargo test`, all green).
 
 ---
 

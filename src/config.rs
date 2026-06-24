@@ -1,4 +1,25 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// Which `Compositor` backend renders the output. `Gl`
+/// (hardware-acceleration-plan.md Phase B) isn't implemented yet -- selecting
+/// it falls back to `Sw` with a warning instead of failing to start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum CompositorBackendArg {
+    Sw,
+    Gl,
+}
+
+/// Which `VideoEncoder` backend encodes captured frames. `Vaapi`
+/// (hardware-acceleration-plan.md Phase A) isn't implemented yet --
+/// selecting it falls back to `X264` with a warning instead of failing to
+/// start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum EncoderBackendArg {
+    X264,
+    Vaapi,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "waylandwebstream")]
@@ -69,6 +90,24 @@ pub struct Config {
     /// Wayland display name
     #[arg(long, default_value = "wayland-wws-0")]
     pub display_name: String,
+
+    /// Rendering backend. `gl` (GPU compositing via smithay's GlesRenderer)
+    /// is not implemented yet -- selecting it logs a warning and falls back
+    /// to `sw`. See docs/hardware-acceleration-plan.md Phase B.
+    #[arg(long, value_enum, default_value = "sw")]
+    pub compositor: CompositorBackendArg,
+
+    /// Video encoder backend. `vaapi` (hardware H.264 encode) is not
+    /// implemented yet -- selecting it logs a warning and falls back to
+    /// `x264`. See docs/hardware-acceleration-plan.md Phase A.
+    #[arg(long, value_enum, default_value = "x264")]
+    pub encoder: EncoderBackendArg,
+
+    /// DRM render node used by `--encoder vaapi` (and, once implemented,
+    /// `--compositor gl`, which defaults to the same node so both share a
+    /// GPU). Inert until those backends exist.
+    #[arg(long, default_value = "/dev/dri/renderD128")]
+    pub vaapi_device: String,
 
     /// Command to run as the session's client app, e.g.
     /// `waylandwebstream -- foot -e vim`. Everything after `--` is passed
