@@ -59,13 +59,14 @@ compositor's input pipeline.
 - **Client-reported latency feedback** -- the browser reports encode/network/
   decode timing back over `/ws` so the server can be tuned against real
   glass-to-glass latency
-- **Touch-first input** -- multi-touch events relayed from the browser and
-  injected directly into the compositor (no uinput kernel round-trip)
+- **Touch-first input** -- multi-touch, pointer, and physical-keyboard events
+  relayed from the browser and injected directly into the compositor (no
+  uinput kernel round-trip)
 - **WebSocket + WebCodecs transport** -- one binary WebSocket per frame, no
   SDP/ICE negotiation; the browser's native `VideoDecoder` does the decoding
 - **Built-in HTTP/WebSocket server** -- serves the web client, the binary
   video stream, and the input/control channel from a single built-in server;
-  no external signaling or STUN/TURN infrastructure needed
+  no separate signaling server or external infrastructure needed
 - **Dynamic resolution** -- viewport size is negotiated per-client and can be
   changed mid-session; the compositor output, encoder, and stream adapt on
   the fly without reconnecting
@@ -99,8 +100,8 @@ compositor's input pipeline.
 - Linux (Wayland is Linux-only)
 - FFmpeg shared libraries
 - No GPU required (software rendering + software encoding)
-- A reachable TCP port for the HTTP/WebSocket server (no UDP, STUN, or TURN
-  needed -- it's a plain WebSocket connection)
+- A reachable TCP port for the HTTP/WebSocket server (plain WebSocket over
+  TCP -- no UDP or NAT traversal needed)
 
 ## Building
 
@@ -128,13 +129,17 @@ on the next `cargo build`/`cargo run`.
 ## Usage
 
 ```sh
-# Start the server (default: 1280x720, port 8080 for signaling)
+# Start the server (defaults: 1280x720 @ 60fps, listening on 0.0.0.0:8080)
 ./waylandwebstream
 
-# Options (planned)
-#   --initial-resolution 1280x720   (default for new clients)
-#   --max-resolution 3840x2160      (upper bound for client-requested resize)
-#   --port 8080
+# Common options (run with --help for the full list):
+#   --initial-resolution 1280x720   default resolution for new clients
+#   --max-resolution 3840x2160      upper bound for client-requested resize
+#   --framerate 60                  target capture/encode framerate
+#   --bitrate 2000000               starting bitrate (adaptive by default)
+#   --crf 23                        constant-quality mode instead of a bitrate
+#   --port 8080                     HTTP/WebSocket port
+#   --listen-addr 0.0.0.0           bind address (127.0.0.1 for proxy-only)
 ```
 
 Then open `http://<server-ip>:8080` in a browser.
@@ -159,9 +164,10 @@ still be launched manually against `--display-name` as before.
 ## Deployment Notes
 
 - The server just needs its HTTP port reachable from the client -- ordinary
-  WebSocket traffic, no NAT traversal, ICE, STUN, or TURN required.
-- Put it behind a reverse proxy (e.g. for TLS/`wss://` or authentication) the
-  same way you would any other web service.
+  WebSocket traffic over TCP, no NAT traversal required.
+- Authentication and TLS/`wss://` are out of scope by design: put it behind a
+  reverse proxy (nginx, Caddy, etc.) the same way you would any other web
+  service, and use `--listen-addr 127.0.0.1` so only the proxy can reach it.
 
 ## Testing
 
@@ -176,15 +182,6 @@ cd tests && npm install && cd ..
 ```
 
 The test suite validates the entire pipeline: compositor startup, Wayland client rendering, WebSocket/WebCodecs streaming, and screenshot validation.
-
-### Development Guidelines
-
-**Important notes for AI assistants and contributors:**
-
-* **When you need a common system tool, ask the user to install it** (instead of giving up instantly, trying 10 other tools, then giving up and writing a script/tool yourself)
-* **Avoid this situation specifically:** changing tooling from the best option just because something did not work or took too long the first time you tried
-* Be patient with package installations (like puppeteer downloading Chrome) - they may take time but are necessary
-* Use the right tool for the job, even if it requires user intervention to install dependencies
 
 ## License
 
