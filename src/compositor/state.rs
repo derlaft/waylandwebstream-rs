@@ -8,8 +8,8 @@ use smithay::{
         renderer::{gles::GlesRenderer, utils::with_renderer_surface_state, ImportDma},
     },
     delegate_compositor, delegate_dmabuf, delegate_output, delegate_pointer_constraints,
-    delegate_seat, delegate_shm, delegate_single_pixel_buffer, delegate_viewporter,
-    delegate_xdg_shell,
+    delegate_presentation, delegate_seat, delegate_shm, delegate_single_pixel_buffer,
+    delegate_viewporter, delegate_xdg_shell,
     desktop::{Space, Window},
     input::{
         Seat, SeatState,
@@ -43,6 +43,7 @@ use smithay::{
         viewporter::ViewporterState,
         seat::WaylandFocus,
         pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState},
+        presentation::PresentationState,
     },
 };
 use std::cell::RefCell;
@@ -62,6 +63,8 @@ pub struct WaylandWebStreamState {
     pub viewporter_state: ViewporterState,
     #[allow(dead_code)]
     pub pointer_constraints_state: PointerConstraintsState,
+    #[allow(dead_code)]
+    pub presentation_state: PresentationState,
     pub seat_state: SeatState<Self>,
 
     // Desktop management
@@ -121,6 +124,7 @@ impl WaylandWebStreamState {
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
         let pointer_constraints_state = PointerConstraintsState::new::<Self>(&dh);
+        let presentation_state = PresentationState::new::<Self>(&dh, 1 /* CLOCK_MONOTONIC */);
         // Registers the wl_output/xdg-output globals as a side effect; the
         // returned handle itself is never read afterwards.
         OutputManagerState::new_with_xdg_output::<Self>(&dh);
@@ -165,6 +169,7 @@ impl WaylandWebStreamState {
             single_pixel_buffer_state,
             viewporter_state,
             pointer_constraints_state,
+            presentation_state,
             seat_state,
             space,
             seat,
@@ -717,6 +722,7 @@ delegate_seat!(WaylandWebStreamState);
 delegate_output!(WaylandWebStreamState);
 delegate_dmabuf!(WaylandWebStreamState);
 delegate_pointer_constraints!(WaylandWebStreamState);
+delegate_presentation!(WaylandWebStreamState);
 
 // XDG Shell handler for window management
 impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
