@@ -7,9 +7,10 @@ use smithay::{
         input::{Axis, AxisSource, ButtonState, KeyState, TouchSlot},
         renderer::{gles::GlesRenderer, utils::with_renderer_surface_state, ImportDma},
     },
-    delegate_compositor, delegate_dmabuf, delegate_output, delegate_pointer_constraints,
-    delegate_presentation, delegate_seat, delegate_shm, delegate_single_pixel_buffer,
-    delegate_viewporter, delegate_xdg_shell,
+    delegate_compositor, delegate_dmabuf, delegate_keyboard_shortcuts_inhibit, delegate_output,
+    delegate_pointer_constraints, delegate_presentation, delegate_seat, delegate_shm,
+    delegate_single_pixel_buffer, delegate_viewporter, delegate_xdg_shell,
+    delegate_xdg_toplevel_icon,
     desktop::{Space, Window},
     input::{
         Seat, SeatState,
@@ -44,6 +45,11 @@ use smithay::{
         seat::WaylandFocus,
         pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState},
         presentation::PresentationState,
+        keyboard_shortcuts_inhibit::{
+            KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState,
+            KeyboardShortcutsInhibitor,
+        },
+        xdg_toplevel_icon::{XdgToplevelIconHandler, XdgToplevelIconManager},
     },
 };
 use std::cell::RefCell;
@@ -65,6 +71,10 @@ pub struct WaylandWebStreamState {
     pub pointer_constraints_state: PointerConstraintsState,
     #[allow(dead_code)]
     pub presentation_state: PresentationState,
+    #[allow(dead_code)]
+    pub keyboard_shortcuts_inhibit_state: KeyboardShortcutsInhibitState,
+    #[allow(dead_code)]
+    pub xdg_toplevel_icon_manager: XdgToplevelIconManager,
     pub seat_state: SeatState<Self>,
 
     // Desktop management
@@ -125,6 +135,8 @@ impl WaylandWebStreamState {
         let viewporter_state = ViewporterState::new::<Self>(&dh);
         let pointer_constraints_state = PointerConstraintsState::new::<Self>(&dh);
         let presentation_state = PresentationState::new::<Self>(&dh, 1 /* CLOCK_MONOTONIC */);
+        let keyboard_shortcuts_inhibit_state = KeyboardShortcutsInhibitState::new::<Self>(&dh);
+        let xdg_toplevel_icon_manager = XdgToplevelIconManager::new::<Self>(&dh);
         // Registers the wl_output/xdg-output globals as a side effect; the
         // returned handle itself is never read afterwards.
         OutputManagerState::new_with_xdg_output::<Self>(&dh);
@@ -170,6 +182,8 @@ impl WaylandWebStreamState {
             viewporter_state,
             pointer_constraints_state,
             presentation_state,
+            keyboard_shortcuts_inhibit_state,
+            xdg_toplevel_icon_manager,
             seat_state,
             space,
             seat,
@@ -723,6 +737,8 @@ delegate_output!(WaylandWebStreamState);
 delegate_dmabuf!(WaylandWebStreamState);
 delegate_pointer_constraints!(WaylandWebStreamState);
 delegate_presentation!(WaylandWebStreamState);
+delegate_keyboard_shortcuts_inhibit!(WaylandWebStreamState);
+delegate_xdg_toplevel_icon!(WaylandWebStreamState);
 
 // XDG Shell handler for window management
 impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
@@ -938,6 +954,18 @@ impl PointerConstraintsHandler for WaylandWebStreamState {
         _location: smithay::utils::Point<f64, smithay::utils::Logical>,
     ) {}
 }
+
+impl KeyboardShortcutsInhibitHandler for WaylandWebStreamState {
+    fn keyboard_shortcuts_inhibit_state(&mut self) -> &mut KeyboardShortcutsInhibitState {
+        &mut self.keyboard_shortcuts_inhibit_state
+    }
+
+    fn new_inhibitor(&mut self, inhibitor: KeyboardShortcutsInhibitor) {
+        inhibitor.activate();
+    }
+}
+
+impl XdgToplevelIconHandler for WaylandWebStreamState {}
 
 // Client state to store per-client data
 pub struct ClientState {
