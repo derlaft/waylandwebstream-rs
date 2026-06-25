@@ -8,7 +8,7 @@ use smithay::{
         renderer::{gles::GlesRenderer, utils::with_renderer_surface_state, ImportDma},
     },
     delegate_compositor, delegate_dmabuf, delegate_output, delegate_seat, delegate_shm,
-    delegate_xdg_shell,
+    delegate_single_pixel_buffer, delegate_xdg_shell,
     desktop::{Space, Window},
     input::{
         Seat, SeatState,
@@ -38,6 +38,7 @@ use smithay::{
             XdgShellState, ToplevelSurface,
         },
         shm::{ShmState, ShmHandler},
+        single_pixel_buffer::SinglePixelBufferState,
         seat::WaylandFocus,
     },
 };
@@ -51,6 +52,10 @@ pub struct WaylandWebStreamState {
     pub compositor_state: SmithayCompositorState,
     pub xdg_shell_state: XdgShellState,
     pub shm_state: ShmState,
+    // Holds the wp_single_pixel_buffer_manager_v1 global alive; never read
+    // directly — the delegate macro wires its Dispatch impls.
+    #[allow(dead_code)]
+    pub single_pixel_buffer_state: SinglePixelBufferState,
     pub seat_state: SeatState<Self>,
 
     // Desktop management
@@ -107,6 +112,7 @@ impl WaylandWebStreamState {
         let compositor_state = SmithayCompositorState::new_v6::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
+        let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
         // Registers the wl_output/xdg-output globals as a side effect; the
         // returned handle itself is never read afterwards.
         OutputManagerState::new_with_xdg_output::<Self>(&dh);
@@ -148,6 +154,7 @@ impl WaylandWebStreamState {
             compositor_state,
             xdg_shell_state,
             shm_state,
+            single_pixel_buffer_state,
             seat_state,
             space,
             seat,
@@ -342,7 +349,7 @@ impl WaylandWebStreamState {
                     if let Some(buffer) = state.buffer() {
                         // Buffer derefs to WlBuffer, so we can use it directly with with_buffer_contents
                         // Access SHM buffer contents
-                        let _result = smithay::wayland::shm::with_buffer_contents(
+                        let shm_result = smithay::wayland::shm::with_buffer_contents(
                             &*buffer,
                         |ptr, len, buffer_data| {
                             let buffer_width = buffer_data.width as u32;
@@ -408,11 +415,30 @@ impl WaylandWebStreamState {
                             }
                         }
                     );
+
+                        if matches!(shm_result, Err(smithay::wayland::shm::BufferAccessError::NotManaged)) {
+                            if let Ok(spb) = smithay::wayland::single_pixel_buffer::get_single_pixel_buffer(&*buffer) {
+                                let [r, g, b, a] = spb.rgba8888();
+                                let target_width = self.width.saturating_sub(window_pos_x);
+                                let target_height = self.height.saturating_sub(window_pos_y);
+                                for dest_y in 0..target_height {
+                                    for dest_x in 0..target_width {
+                                        let dest_idx = (((window_pos_y + dest_y) * self.width + (window_pos_x + dest_x)) * 4) as usize;
+                                        if dest_idx + 3 < render_buffer.len() {
+                                            render_buffer[dest_idx]     = b;
+                                            render_buffer[dest_idx + 1] = g;
+                                            render_buffer[dest_idx + 2] = r;
+                                            render_buffer[dest_idx + 3] = a;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 });
             }
         }
-        
+
         // If no windows, show the classic Xorg "root weave" stipple: a 4x4
         // basket-weave bitmap (X11's default root window pattern before any
         // window manager or client connects), rendered in black and white.
@@ -675,6 +701,7 @@ impl WaylandWebStreamState {
 delegate_compositor!(WaylandWebStreamState);
 delegate_xdg_shell!(WaylandWebStreamState);
 delegate_shm!(WaylandWebStreamState);
+delegate_single_pixel_buffer!(WaylandWebStreamState);
 delegate_seat!(WaylandWebStreamState);
 delegate_output!(WaylandWebStreamState);
 delegate_dmabuf!(WaylandWebStreamState);
