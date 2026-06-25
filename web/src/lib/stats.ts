@@ -20,6 +20,14 @@ export interface StreamStats {
   /// Current encoder target bitrate reported by the server over `/ws`. 0
   /// means "not yet known" or "not applicable" (constant-quality/CRF mode).
   bitrateBps: number;
+  /// Average time from feeding a chunk to `decoder.decode()` until its frame
+  /// surfaces in the `output` callback (decoder work only, blit excluded).
+  decodeAvgMs: number;
+  /// Average wall-clock cost of `ctx.drawImage(VideoFrame)` alone.
+  blitAvgMs: number;
+  /// 95th-percentile blit cost; catches occasional expensive blits a mean
+  /// would smooth away (e.g. the first frame after a tab-refocus).
+  blitP95Ms: number;
 }
 
 const initialStats: StreamStats = {
@@ -33,6 +41,9 @@ const initialStats: StreamStats = {
   maxDecodeQueue: 0,
   maxFrameBytes: 0,
   bitrateBps: 0,
+  decodeAvgMs: 0,
+  blitAvgMs: 0,
+  blitP95Ms: 0,
 };
 
 export const streamStats = writable<StreamStats>(initialStats);
@@ -51,6 +62,19 @@ export function reportEndToEndLatency(ms: number): void {
 
 export function setBitrate(bps: number): void {
   streamStats.update((s) => ({ ...s, bitrateBps: bps }));
+}
+
+export function reportDecodeStats(stats: {
+  decodeAvgMs: number;
+  blitAvgMs: number;
+  blitP95Ms: number;
+}): void {
+  streamStats.update((s) => ({
+    ...s,
+    decodeAvgMs: stats.decodeAvgMs,
+    blitAvgMs: stats.blitAvgMs,
+    blitP95Ms: stats.blitP95Ms,
+  }));
 }
 
 export function reportArrivalStats(stats: {

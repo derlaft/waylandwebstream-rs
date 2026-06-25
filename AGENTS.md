@@ -145,6 +145,30 @@ browser input → /ws WS → mpsc → compositor seat injection
   are sub-16-aligned (`/16`) for H.264.
 - Reconnect (auto, with backoff) is in `backoff.ts` + the socket handlers;
   `onclose` schedules it (never `onerror`, which always precedes close).
+- **`decodeQueueSize > N` fires on harmless bursts.** A tab being refocused
+  releases a flood of buffered frames all at once; a network clump delivers
+  several P-frames within a millisecond. Both spike `decodeQueueSize` briefly
+  and then drain on their own — but a naïve `> 2` threshold resyncs on both,
+  freezing the picture for `KEYFRAME_FORCE_COOLDOWN` ms each time. Use a
+  `BacklogTracker` with a sustained-threshold (e.g. 150ms above a soft limit)
+  plus a separate hard limit for genuinely catastrophic spikes; don't resync
+  on a transient that drains itself.
+- **Do not request `hardwareAcceleration: 'prefer-hardware'` blindly.** On
+  machines without HW decode it makes `VideoDecoder.configure()` throw, which
+  hits the error callback → `recoverDecoder` → re-configure → infinite loop.
+  The safe pattern: probe `VideoDecoder.isConfigSupported` for both
+  `prefer-hardware` and `prefer-software` against the *real coded dimensions*
+  from the first decoded frame, then upgrade the live decoder only if HW is
+  confirmed. This also avoids a `no-preference` silent SW fallback — Firefox
+  demonstrably picks SW intermittently under `no-preference`, giving ~70ms
+  decodes for a codec+size the GPU can handle in <5ms.
+- **`drawImage(VideoFrame)` can be the bottleneck, not the decoder.** On
+  Firefox, a `VideoFrame → 2D canvas` blit can involve a GPU→CPU→GPU round-
+  trip (readback then re-upload) and take 30–80ms — dwarfing the actual
+  decode. Stamp `performance.now()` *before* `drawImage` to isolate decoder
+  work from blit work; measuring after blends both into "decode latency" and
+  hides the real bottleneck. Track blit time in a separate sample array and
+  surface it in both the UI and the server's latency report.
 
 ## Build & test
 

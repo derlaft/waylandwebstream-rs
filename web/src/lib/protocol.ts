@@ -64,6 +64,10 @@ export type ClientMessage =
       // this window -- see VideoStream.flushDiagnostics and the server's
       // SignalingMessage::Latency::burst_count doc.
       burst_count?: number;
+      // Average wall-clock cost of ctx.drawImage(VideoFrame) alone, isolated
+      // from the decode itself by stamping performance.now() before and after
+      // the call. On Firefox this path can be a GPU→CPU→GPU round-trip.
+      blit_ms?: number;
     };
 
 /// Messages the server pushes to the client over `/ws`.

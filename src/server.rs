@@ -111,6 +111,12 @@ pub enum SignalingMessage {
         /// up.
         #[serde(default)]
         burst_count: u32,
+        /// Average wall-clock cost of `ctx.drawImage(VideoFrame)` in the
+        /// browser, isolated from decode time. On Firefox this can be a
+        /// GPU→CPU→GPU round-trip; a high value here means the blit is the
+        /// bottleneck, not the decoder. Absent when the window had no frames.
+        #[serde(default)]
+        blit_ms: Option<f64>,
     },
     /// Round-trip latency probe: echoed back on whichever `/stream` frame
     /// next leaves the encoder (see `encode_video_frame`'s `ping_echo_*`
@@ -388,10 +394,10 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                         // ping a couple seconds later picks it up instead.
                         let _ = state.pending_ping_tx.try_send(client_ts);
                     }
-                    SignalingMessage::Latency { encoding_ms, network_ms, jitter_buffer_ms, decoding_ms, total_ms, burst_count } => {
+                    SignalingMessage::Latency { encoding_ms, network_ms, jitter_buffer_ms, decoding_ms, total_ms, burst_count, blit_ms } => {
                         info!(
-                            "Received latency report from client: network {:.1}ms decode {:.1}ms total {:.1}ms",
-                            network_ms.unwrap_or(0.0), decoding_ms.unwrap_or(0.0), total_ms
+                            "Received latency report from client: network {:.1}ms decode {:.1}ms blit {:.1}ms total {:.1}ms",
+                            network_ms.unwrap_or(0.0), decoding_ms.unwrap_or(0.0), blit_ms.unwrap_or(0.0), total_ms
                         );
                         // Only decode latency throttles bitrate growth here --
                         // network/RTT delays aren't evidence the encoder's
@@ -418,6 +424,7 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                             report.network_ms = network_ms;
                             report.jitter_buffer_ms = jitter_buffer_ms;
                             report.decoding_ms = decoding_ms;
+                            report.decode_to_display_ms = blit_ms;
                             report.total_ms = total_ms;
 
                             if let Err(e) = latency_tx.send(report).await {

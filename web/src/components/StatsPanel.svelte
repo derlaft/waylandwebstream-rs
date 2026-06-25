@@ -31,6 +31,12 @@
 
   <dt>Max decode queue</dt>
   <dd>{$streamStats.maxDecodeQueue}</dd>
+
+  <dt>Decode avg</dt>
+  <dd>{$streamStats.decodeAvgMs.toFixed(1)} ms</dd>
+
+  <dt>Blit avg / p95</dt>
+  <dd>{$streamStats.blitAvgMs.toFixed(1)} / {$streamStats.blitP95Ms.toFixed(1)} ms</dd>
 </dl>
 
 <style>

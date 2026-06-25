@@ -9,7 +9,7 @@ import {
   parseStreamFrameHeader,
   type ClientMessage,
 } from './protocol';
-import { reportArrivalStats, reportEndToEndLatency, setResolution } from './stats';
+import { reportArrivalStats, reportDecodeStats, reportEndToEndLatency, setResolution } from './stats';
 
 // VideoDecoder's internal decode queue has no cap of its own: if frames
 // arrive faster than they can be decoded (bursty/slow remote network,
@@ -76,6 +76,7 @@ export class VideoStream {
   private maxQueueSeenInWindow = 0;
   private maxFrameBytesInWindow = 0;
   private decodeLatencySamples: number[] = [];
+  private blitLatencySamples: number[] = [];
   private diagnosticsTimer: ReturnType<typeof setInterval> | null = null;
 
   // Round-trip latency samples, one per echoed ping (see `sendPing` and the
@@ -191,8 +192,15 @@ export class VideoStream {
     if (ensureCanvasSize(this.canvas, frame.displayWidth, frame.displayHeight)) {
       setResolution(frame.displayWidth, frame.displayHeight);
     }
+    // Stamp before drawImage so decode latency excludes the blit. `timestamp`
+    // is the performance.now()*1000 set on the chunk in `onStreamMessage`.
+    const decodeDoneMs = performance.now();
+    this.decodeLatencySamples.push(decodeDoneMs - frame.timestamp / 1000);
     this.ctx.drawImage(frame, 0, 0);
-    this.decodeLatencySamples.push(performance.now() - frame.timestamp / 1000);
+    // On Firefox, VideoFrame→2D-canvas involves a synchronous GPU→CPU→GPU
+    // readback; a large value here means the blit is the bottleneck, not the
+    // decoder.
+    this.blitLatencySamples.push(performance.now() - decodeDoneMs);
     frame.close();
   }
 
@@ -336,10 +344,23 @@ export class VideoStream {
       this.rttSamples = [];
     }
 
+    let blitAvgMs = 0;
+    let blitP95Ms = 0;
+    if (this.blitLatencySamples.length > 0) {
+      const sorted = [...this.blitLatencySamples].sort((a, b) => a - b);
+      const n = sorted.length;
+      blitAvgMs = this.blitLatencySamples.reduce((a, b) => a + b, 0) / n;
+      blitP95Ms = sorted[Math.floor(n * 0.95)];
+      this.blitLatencySamples = [];
+    }
+
     if (this.decodeLatencySamples.length === 0) return;
+    const decodeN = this.decodeLatencySamples.length;
     const decodeAvgMs =
-      this.decodeLatencySamples.reduce((a, b) => a + b, 0) / this.decodeLatencySamples.length;
+      this.decodeLatencySamples.reduce((a, b) => a + b, 0) / decodeN;
     this.decodeLatencySamples = [];
+
+    reportDecodeStats({ decodeAvgMs, blitAvgMs, blitP95Ms });
 
     // Glass-to-glass: ping round-trip (network + capture→encode→send on the
     // server, all folded in -- see the wire format doc in protocol.ts) plus
@@ -352,6 +373,7 @@ export class VideoStream {
       decoding_ms: decodeAvgMs,
       total_ms: totalMs,
       burst_count: this.lastBurstCount,
+      blit_ms: blitAvgMs > 0 ? blitAvgMs : undefined,
     });
   }
 }
