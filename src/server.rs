@@ -127,6 +127,33 @@ pub enum SignalingMessage {
     Ping { client_ts: f64 },
 }
 
+/// Cursor state pushed from the compositor to `/ws` clients. The browser
+/// uses this to render a client-side cursor overlay, eliminating cursor
+/// round-trip latency.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum CursorUpdate {
+    /// No app cursor set; browser shows its own default cursor.
+    #[serde(rename = "default")]
+    Default,
+    /// Client explicitly hid the cursor.
+    #[serde(rename = "hidden")]
+    Hidden,
+    /// Named CSS cursor (from `wp_cursor_shape_v1`).
+    #[serde(rename = "named")]
+    Named { name: String },
+    /// Custom cursor surface from `wl_pointer.set_cursor`.
+    #[serde(rename = "surface")]
+    Surface {
+        width: u32,
+        height: u32,
+        hotspot_x: i32,
+        hotspot_y: i32,
+        /// Base64-encoded RGBA (not BGRA) pixel data, width × height × 4 bytes.
+        rgba: String,
+    },
+}
+
 /// Messages the server pushes to the client over `/ws`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -139,6 +166,10 @@ pub enum ServerMessage {
     /// see `encoder::h264_codec_string`.
     #[serde(rename = "codec")]
     Codec { codec: String },
+    /// Current cursor shape from the compositor. Pushed on connect and on
+    /// every cursor change.
+    #[serde(rename = "cursor")]
+    Cursor { cursor: CursorUpdate },
 }
 
 /// Shared state for the server
@@ -204,6 +235,11 @@ pub struct SignalingState {
     /// Broadcasts Opus-encoded audio packets to `/audio` WebSocket clients.
     /// `None` when the PipeWire audio capture failed to start at launch.
     audio_tx: Option<broadcast::Sender<AudioPacket>>,
+    /// Current cursor state from the compositor. Each `/ws` connection
+    /// subscribes to this watch channel and pushes updates as
+    /// `ServerMessage::Cursor` messages. A new client also receives the
+    /// current cursor immediately on connect.
+    cursor_rx: watch::Receiver<CursorUpdate>,
 }
 
 impl SignalingState {
@@ -222,6 +258,7 @@ impl SignalingState {
         shutdown_rx: watch::Receiver<bool>,
         session: SessionManager,
         audio_tx: Option<broadcast::Sender<AudioPacket>>,
+        cursor_rx: watch::Receiver<CursorUpdate>,
     ) -> Self {
         let (video_tx, _) = broadcast::channel(3);
         // Backdated so the very first `RequestKeyframe` after startup is
@@ -246,6 +283,7 @@ impl SignalingState {
             session,
             last_keyframe_force: Arc::new(Mutex::new(last_keyframe_force)),
             audio_tx,
+            cursor_rx,
         }
     }
 
@@ -316,6 +354,7 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
     let (mut sender, mut receiver) = socket.split();
     let mut bitrate_rx = state.bitrate_rx.clone();
     let mut codec_rx = state.codec_rx.clone();
+    let mut cursor_rx = state.cursor_rx.clone();
     let mut shutdown_rx = state.shutdown_rx.clone();
 
     // Push the current bitrate right away -- otherwise a client connecting
@@ -332,6 +371,13 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
     // front, not just on the next change.
     let initial_codec = codec_rx.borrow().clone();
     if send_server_message(&mut sender, &ServerMessage::Codec { codec: initial_codec }).await.is_err() {
+        return;
+    }
+
+    // Push the current cursor state so the client renders the right cursor
+    // immediately (e.g. reconnecting while an app is running).
+    let initial_cursor = cursor_rx.borrow().clone();
+    if send_server_message(&mut sender, &ServerMessage::Cursor { cursor: initial_cursor }).await.is_err() {
         return;
     }
 
@@ -458,6 +504,15 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
                 }
                 let codec = codec_rx.borrow().clone();
                 if send_server_message(&mut sender, &ServerMessage::Codec { codec }).await.is_err() {
+                    break;
+                }
+            }
+            changed = cursor_rx.changed() => {
+                if changed.is_err() {
+                    continue;
+                }
+                let cursor = cursor_rx.borrow().clone();
+                if send_server_message(&mut sender, &ServerMessage::Cursor { cursor }).await.is_err() {
                     break;
                 }
             }
@@ -727,6 +782,7 @@ mod tests {
         let (pending_ping_tx, _) = mpsc::channel(4);
         let (_, bitrate_rx) = watch::channel(2_000_000usize);
         let (_, codec_rx) = watch::channel(String::new());
+        let (_, cursor_rx) = watch::channel(CursorUpdate::Default);
         let force_render = Arc::new(AtomicBool::new(false));
         SignalingState::new(
             resize_tx,
@@ -743,6 +799,7 @@ mod tests {
             shutdown_rx,
             SessionManager::new(Vec::new(), String::new(), shutdown_tx),
             audio_tx,
+            cursor_rx,
         )
     }
 
@@ -754,6 +811,7 @@ mod tests {
         let (_, codec_rx) = watch::channel(String::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let force_render = Arc::new(AtomicBool::new(false));
+        let (_, cursor_rx) = watch::channel(CursorUpdate::Default);
         let state = SignalingState::new(
             mpsc::channel(4).0,
             mpsc::channel(4).0,
@@ -767,6 +825,7 @@ mod tests {
             shutdown_rx,
             SessionManager::new(Vec::new(), String::new(), shutdown_tx),
             None,
+            cursor_rx,
         );
         let video_tx = state.get_video_sender();
         let server = SignalingServer::new(state);

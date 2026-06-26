@@ -3,11 +3,14 @@
   import { AudioStream } from '../lib/audio';
   import { ControlChannel } from '../lib/control';
   import { attachInput } from '../lib/input';
-  import type { ClientMessage } from '../lib/protocol';
+  import type { ClientMessage, CursorUpdate } from '../lib/protocol';
   import { VideoStream } from '../lib/stream';
   import { Viewport } from '../lib/viewport';
 
   let canvas: HTMLCanvasElement;
+  // CSS cursor value applied to the canvas element. Starts hidden; updated
+  // whenever the compositor sends a cursor change over the control channel.
+  let cursorCss = 'none';
 
   let control: ControlChannel | null = null;
   let stream: VideoStream | null = null;
@@ -17,6 +20,35 @@
 
   function sendControl(msg: ClientMessage): void {
     control?.send(msg);
+  }
+
+  /// Converts a compositor CursorUpdate to a CSS cursor string. For surface
+  /// cursors the pixels are drawn into an off-screen canvas and exported as
+  /// a data URL so the browser renders them without a network round-trip.
+  function applyCursor(update: CursorUpdate): void {
+    switch (update.kind) {
+      case 'default':
+        cursorCss = 'auto';
+        break;
+      case 'hidden':
+        cursorCss = 'none';
+        break;
+      case 'named':
+        cursorCss = update.name;
+        break;
+      case 'surface': {
+        const raw = atob(update.rgba);
+        const bytes = new Uint8ClampedArray(raw.length);
+        for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+        const imgData = new ImageData(bytes, update.width, update.height);
+        const offscreen = document.createElement('canvas');
+        offscreen.width = update.width;
+        offscreen.height = update.height;
+        offscreen.getContext('2d')!.putImageData(imgData, 0, 0);
+        cursorCss = `url(${offscreen.toDataURL()}) ${update.hotspot_x} ${update.hotspot_y}, auto`;
+        break;
+      }
+    }
   }
 
   function teardown(): void {
@@ -33,7 +65,10 @@
   }
 
   onMount(() => {
-    control = new ControlChannel({ onCodec: (codec) => stream?.setCodec(codec) });
+    control = new ControlChannel({
+      onCodec: (codec) => stream?.setCodec(codec),
+      onCursor: applyCursor,
+    });
     control.connect();
 
     stream = new VideoStream({ canvas, sendControl });
@@ -64,7 +99,7 @@
 </script>
 
 <div class="stage">
-  <canvas bind:this={canvas} tabindex="0"></canvas>
+  <canvas bind:this={canvas} tabindex="0" style="cursor: {cursorCss}"></canvas>
 </div>
 
 <style>

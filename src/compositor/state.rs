@@ -15,7 +15,7 @@ use smithay::{
     input::{
         Seat, SeatState,
         keyboard::FilterResult,
-        pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent as PointerMotionEvent},
+        pointer::{AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, MotionEvent as PointerMotionEvent},
         touch::{DownEvent, MotionEvent, UpEvent},
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
@@ -24,7 +24,7 @@ use smithay::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason, ObjectId},
-            protocol::{wl_seat, wl_surface::WlSurface},
+            protocol::{wl_seat, wl_shm, wl_surface::WlSurface},
             Display, DisplayHandle, Resource,
         },
     },
@@ -32,14 +32,14 @@ use smithay::{
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            CompositorClientState, CompositorState as SmithayCompositorState,
+            CompositorClientState, CompositorState as SmithayCompositorState, with_states,
         },
         dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         output::{OutputManagerState, OutputHandler},
         shell::xdg::{
             XdgShellState, ToplevelSurface,
         },
-        shm::{ShmState, ShmHandler},
+        shm::{ShmState, ShmHandler, with_buffer_contents},
         single_pixel_buffer::SinglePixelBufferState,
         viewporter::ViewporterState,
         seat::WaylandFocus,
@@ -56,6 +56,23 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 use tracing::{info, trace, warn};
+
+/// Cursor update extracted from a Wayland client's `wl_pointer.set_cursor` call.
+/// Pixels in the `Surface` variant are already RGBA (Canvas-ready); the
+/// BGRA↔RGBA swap happens inside `read_cursor_pixels`.
+#[derive(Debug, Clone)]
+pub enum CursorPending {
+    Hidden,
+    Named(String),
+    Surface {
+        width: u32,
+        height: u32,
+        hotspot_x: i32,
+        hotspot_y: i32,
+        /// Raw RGBA bytes (not base64), width × height × 4.
+        rgba: Vec<u8>,
+    },
+}
 
 pub struct WaylandWebStreamState {
     // Core Smithay states
@@ -112,6 +129,15 @@ pub struct WaylandWebStreamState {
     // configure -- see `commit`'s call to `configure_toplevel_fullscreen`
     // below. Cleared per-surface in `toplevel_destroyed`.
     kicked_toplevels: HashSet<ObjectId>,
+
+    // Current cursor surface + hotspot set by the focused client via
+    // `wl_pointer.set_cursor`. Updated in `cursor_image()` and re-extracted
+    // on every commit to the cursor surface (for animated cursors).
+    cursor_surface: Option<(WlSurface, Point<i32, Logical>)>,
+    // Pending cursor update for the main loop to pick up and forward to
+    // WebSocket clients. Set by `try_extract_cursor` and consumed by
+    // `take_cursor_pending`.
+    cursor_pending: Option<CursorPending>,
 }
 
 impl WaylandWebStreamState {
@@ -196,6 +222,8 @@ impl WaylandWebStreamState {
             dmabuf_state: None,
             dmabuf_renderer: None,
             kicked_toplevels: HashSet::new(),
+            cursor_surface: None,
+            cursor_pending: None,
         }
     }
 
@@ -704,6 +732,87 @@ impl WaylandWebStreamState {
         keyboard.set_focus(self, surface, serial);
     }
 
+    /// Consumes and returns any pending cursor update from the last
+    /// `cursor_image()` or cursor-surface commit. `None` when the cursor
+    /// hasn't changed since the last call.
+    pub fn take_cursor_pending(&mut self) -> Option<CursorPending> {
+        self.cursor_pending.take()
+    }
+
+    /// Reads the pixel data from the current cursor surface (if any) and
+    /// stores it in `cursor_pending`. Safe to call both from `cursor_image`
+    /// (when a new cursor is set) and from `commit` (for animated cursors).
+    fn try_extract_cursor(&mut self) {
+        // Clone so we don't hold a borrow on self while calling the methods below.
+        let Some((wl_surface, hotspot)) = self.cursor_surface.clone() else { return };
+        if let Some(pending) = Self::read_cursor_pixels(&wl_surface, hotspot) {
+            self.cursor_pending = Some(pending);
+        }
+    }
+
+    /// Reads RGBA pixel data from `wl_surface`'s committed SHM buffer.
+    /// Returns `None` if no buffer is committed yet or the format is unsupported.
+    fn read_cursor_pixels(wl_surface: &WlSurface, hotspot: Point<i32, Logical>) -> Option<CursorPending> {
+        let mut result: Option<CursorPending> = None;
+
+        with_renderer_surface_state(wl_surface, |rstate| {
+            let Some(buffer) = rstate.buffer() else { return };
+
+            let _ = with_buffer_contents(&**buffer, |ptr, len, data| {
+                let w = data.width as u32;
+                let h = data.height as u32;
+                let stride = data.stride as u32;
+                let offset = data.offset as isize;
+
+                // Only Argb8888 / Xrgb8888 (BGRA in memory on LE) are
+                // common for cursor surfaces. Everything else is skipped.
+                let is_bgra = matches!(
+                    data.format,
+                    wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888
+                );
+                if !is_bgra {
+                    return;
+                }
+
+                let expected = (stride * h) as usize;
+                if (offset as usize).saturating_add(expected) > len {
+                    return;
+                }
+
+                let pixels = unsafe {
+                    std::slice::from_raw_parts(ptr.offset(offset), expected)
+                };
+
+                let mut rgba = vec![0u8; (w * h * 4) as usize];
+                for y in 0..h {
+                    for x in 0..w {
+                        let src = (y * stride + x * 4) as usize;
+                        let dst = (y * w + x) as usize * 4;
+                        // Argb8888 LE in memory: [B, G, R, A] → RGBA: [R, G, B, A]
+                        rgba[dst]     = pixels[src + 2]; // R
+                        rgba[dst + 1] = pixels[src + 1]; // G
+                        rgba[dst + 2] = pixels[src];     // B
+                        rgba[dst + 3] = if data.format == wl_shm::Format::Xrgb8888 {
+                            255
+                        } else {
+                            pixels[src + 3]
+                        };
+                    }
+                }
+
+                result = Some(CursorPending::Surface {
+                    width: w,
+                    height: h,
+                    hotspot_x: hotspot.x,
+                    hotspot_y: hotspot.y,
+                    rgba,
+                });
+            });
+        });
+
+        result
+    }
+
     pub fn send_frames(&mut self) {
         // Send frame callbacks to all surfaces so they know when to render.
         //
@@ -814,6 +923,18 @@ impl smithay::wayland::compositor::CompositorHandler for WaylandWebStreamState {
         // Handle surface commits - apply pending state
         use smithay::backend::renderer::utils::on_commit_buffer_handler;
         on_commit_buffer_handler::<Self>(surface);
+
+        // If this is the current cursor surface being re-committed (animated
+        // cursor or the client committed its buffer after calling set_cursor),
+        // re-extract and forward the new pixels.
+        let is_cursor_surface = self
+            .cursor_surface
+            .as_ref()
+            .map(|(s, _)| s == surface)
+            .unwrap_or(false);
+        if is_cursor_surface {
+            self.try_extract_cursor();
+        }
 
         // `Window::bbox()` is a cache that only `Window::on_commit()` refreshes;
         // without this, it stays at its initial (0,0) forever and `surface_at`'s
@@ -940,8 +1061,32 @@ impl smithay::input::SeatHandler for WaylandWebStreamState {
         // Handle focus changes
     }
     
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {
-        // Handle cursor image changes
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        match image {
+            CursorImageStatus::Hidden => {
+                self.cursor_surface = None;
+                self.cursor_pending = Some(CursorPending::Hidden);
+            }
+            CursorImageStatus::Named(icon) => {
+                self.cursor_surface = None;
+                self.cursor_pending = Some(CursorPending::Named(cursor_icon_to_css(icon).to_owned()));
+            }
+            CursorImageStatus::Surface(wl_surface) => {
+                // Read the hotspot from the surface's compositor user-data.
+                let hotspot = with_states(&wl_surface, |states| {
+                    states
+                        .data_map
+                        .get::<CursorImageSurfaceData>()
+                        .map(|d| d.lock().unwrap().hotspot)
+                        .unwrap_or_default()
+                });
+                self.cursor_surface = Some((wl_surface, hotspot));
+                // Attempt to read pixels immediately; on success, sets
+                // cursor_pending.  If the buffer hasn't been committed yet,
+                // the commit() handler will pick it up later.
+                self.try_extract_cursor();
+            }
+        }
     }
 }
 
@@ -981,6 +1126,49 @@ impl ClientState {
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+
+/// Maps smithay's `CursorIcon` (from `wp_cursor_shape_v1`) to the corresponding
+/// CSS cursor name understood by browsers.
+fn cursor_icon_to_css(icon: smithay::input::pointer::CursorIcon) -> &'static str {
+    use smithay::input::pointer::CursorIcon;
+    match icon {
+        CursorIcon::Default => "default",
+        CursorIcon::ContextMenu => "context-menu",
+        CursorIcon::Help => "help",
+        CursorIcon::Pointer => "pointer",
+        CursorIcon::Progress => "progress",
+        CursorIcon::Wait => "wait",
+        CursorIcon::Cell => "cell",
+        CursorIcon::Crosshair => "crosshair",
+        CursorIcon::Text => "text",
+        CursorIcon::VerticalText => "vertical-text",
+        CursorIcon::Alias => "alias",
+        CursorIcon::Copy => "copy",
+        CursorIcon::Move => "move",
+        CursorIcon::NoDrop => "no-drop",
+        CursorIcon::NotAllowed => "not-allowed",
+        CursorIcon::Grab => "grab",
+        CursorIcon::Grabbing => "grabbing",
+        CursorIcon::EResize => "e-resize",
+        CursorIcon::NResize => "n-resize",
+        CursorIcon::NeResize => "ne-resize",
+        CursorIcon::NwResize => "nw-resize",
+        CursorIcon::SResize => "s-resize",
+        CursorIcon::SeResize => "se-resize",
+        CursorIcon::SwResize => "sw-resize",
+        CursorIcon::WResize => "w-resize",
+        CursorIcon::EwResize => "ew-resize",
+        CursorIcon::NsResize => "ns-resize",
+        CursorIcon::NeswResize => "nesw-resize",
+        CursorIcon::NwseResize => "nwse-resize",
+        CursorIcon::ColResize => "col-resize",
+        CursorIcon::RowResize => "row-resize",
+        CursorIcon::AllScroll => "all-scroll",
+        CursorIcon::ZoomIn => "zoom-in",
+        CursorIcon::ZoomOut => "zoom-out",
+        _ => "default",
+    }
 }
 
 // Re-export as CompositorState for compatibility

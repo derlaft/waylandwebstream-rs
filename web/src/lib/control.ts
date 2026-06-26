@@ -3,7 +3,7 @@
 // StatsPanel.svelte, and auto-reconnect with backoff on an unexpected
 // close.
 import { nextBackoffDelayMs } from './backoff';
-import type { ClientMessage, ServerMessage } from './protocol';
+import type { ClientMessage, CursorUpdate, ServerMessage } from './protocol';
 import { setBitrate, setConnectionState } from './stats';
 
 export interface ControlChannelOptions {
@@ -11,12 +11,16 @@ export interface ControlChannelOptions {
   /// ServerMessage), e.g. because a resolution change picked a different
   /// H.264 level. Lets the caller reconfigure its VideoDecoder to match.
   onCodec?: (codec: string) => void;
+  /// Called whenever the compositor changes the cursor (shape, hotspot, or
+  /// visibility). The caller applies it to the canvas's CSS cursor property.
+  onCursor?: (cursor: CursorUpdate) => void;
 }
 
 export class ControlChannel {
   private ws: WebSocket | null = null;
   private sendQueue: string[] = [];
   private readonly onCodec?: (codec: string) => void;
+  private readonly onCursor?: (cursor: CursorUpdate) => void;
 
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -27,6 +31,7 @@ export class ControlChannel {
 
   constructor(opts: ControlChannelOptions = {}) {
     this.onCodec = opts.onCodec;
+    this.onCursor = opts.onCursor;
   }
 
   connect(): void {
@@ -104,6 +109,8 @@ export class ControlChannel {
       setBitrate(msg.bps);
     } else if (msg.type === 'codec') {
       this.onCodec?.(msg.codec);
+    } else if (msg.type === 'cursor') {
+      this.onCursor?.(msg.cursor);
     }
   }
 }

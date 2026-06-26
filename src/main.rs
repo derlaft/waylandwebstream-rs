@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use base64::prelude::*;
 use clap::Parser;
 use smithay::reexports::{
     calloop::EventLoop,
@@ -23,12 +24,31 @@ mod web;
 
 use adaptive_bitrate::{AdaptiveBitrateConfig, AdaptiveBitrateController, BitrateEvent};
 use compositor::{Compositor, CompositorState, GlCompositor, SwCompositor};
+use compositor::state::CursorPending;
 use config::{CompositorBackendArg, EncoderBackendArg};
 use encoder::{EncoderBackend, EncoderConfig, EncoderControl, RateControl, spawn_encoder};
 use input::mouse::MouseHandler;
 use input::touch::TouchHandler;
-use server::{SignalingServer, SignalingState};
+use server::{CursorUpdate, SignalingServer, SignalingState};
 use session::SessionManager;
+
+/// Converts an internal `CursorPending` (raw RGBA bytes, no serde) to the
+/// wire-protocol `CursorUpdate` (base64-encoded) for the WebSocket channel.
+fn cursor_pending_to_update(pending: CursorPending) -> CursorUpdate {
+    match pending {
+        CursorPending::Hidden => CursorUpdate::Hidden,
+        CursorPending::Named(name) => CursorUpdate::Named { name },
+        CursorPending::Surface { width, height, hotspot_x, hotspot_y, rgba } => {
+            CursorUpdate::Surface {
+                width,
+                height,
+                hotspot_x,
+                hotspot_y,
+                rgba: BASE64_STANDARD.encode(rgba),
+            }
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -335,16 +355,25 @@ async fn main() -> Result<()> {
 
     // Start audio capture: PipeWire loopback virtual sink + Opus encoding.
     // Runs on a dedicated OS thread; the broadcast sender is consumed by /audio WS clients.
-    let audio_tx = match audio::spawn_audio_capture() {
-        Ok(tx) => {
-            info!("Audio capture started (PipeWire loopback + Opus 96 kbps)");
-            Some(tx)
-        }
-        Err(e) => {
-            warn!("Audio capture failed to start ({e:#}); /audio endpoint will be unavailable");
-            None
+    let audio_tx = if config.no_audio {
+        info!("Audio capture disabled via --no-audio");
+        None
+    } else {
+        match audio::spawn_audio_capture() {
+            Ok(tx) => {
+                info!("Audio capture started (PipeWire loopback + Opus 96 kbps)");
+                Some(tx)
+            }
+            Err(e) => {
+                warn!("Audio capture failed to start ({e:#}); /audio endpoint will be unavailable");
+                None
+            }
         }
     };
+
+    // Cursor updates: compositor → WebSocket clients. Watch channel so
+    // clients always see the latest cursor, not a backlog of stale ones.
+    let (cursor_tx, cursor_rx) = tokio::sync::watch::channel(CursorUpdate::Default);
 
     // Create signaling state and server
     let encoder_control_for_loop = encoder_control.clone();
@@ -363,6 +392,7 @@ async fn main() -> Result<()> {
         shutdown_rx.clone(),
         session.clone(),
         audio_tx,
+        cursor_rx,
     );
     let video_tx = signaling_state.get_video_sender();
     let signaling_server = SignalingServer::new(signaling_state);
@@ -543,6 +573,11 @@ async fn main() -> Result<()> {
 
         display.flush_clients()
             .context("Failed to flush Wayland clients")?;
+
+        // Forward any cursor update the compositor extracted this tick.
+        if let Some(pending) = state.take_cursor_pending() {
+            let _ = cursor_tx.send(cursor_pending_to_update(pending));
+        }
 
         // Render and send frame at target framerate. Frame callbacks are sent
         // from here too, at the same cadence, rather than every loop tick:

@@ -70,10 +70,27 @@ export type ClientMessage =
       blit_ms?: number;
     };
 
+/// Cursor state pushed from the compositor. The browser uses this to render
+/// a client-side cursor overlay on top of the video canvas.
+export type CursorUpdate =
+  | { kind: 'default' }
+  | { kind: 'hidden' }
+  | { kind: 'named'; name: string }
+  | {
+      kind: 'surface';
+      width: number;
+      height: number;
+      hotspot_x: number;
+      hotspot_y: number;
+      /** Base64-encoded RGBA pixel data (width × height × 4 bytes). */
+      rgba: string;
+    };
+
 /// Messages the server pushes to the client over `/ws`.
 export type ServerMessage =
   | { type: 'bitrate'; bps: number }
-  | { type: 'codec'; codec: string };
+  | { type: 'codec'; codec: string }
+  | { type: 'cursor'; cursor: CursorUpdate };
 
 /// `/stream` binary frame format, one WebSocket message per H.264 frame:
 ///   byte 0     : frame_type (0 = delta, 1 = key)

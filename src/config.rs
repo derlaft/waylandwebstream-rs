@@ -110,6 +110,11 @@ pub struct Config {
     #[arg(long, default_value = "/dev/dri/renderD128")]
     pub vaapi_device: String,
 
+    /// Disable PipeWire audio capture. The `/audio` WebSocket endpoint will
+    /// close immediately with "audio capture not available" when this is set.
+    #[arg(long)]
+    pub no_audio: bool,
+
     /// Command to run as the session's client app, e.g.
     /// `waylandwebstream -- foot -e vim`. Everything after `--` is passed
     /// through verbatim as the program and its arguments. The session is

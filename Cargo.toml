@@ -44,6 +44,7 @@ anyhow = "1"
 thiserror = "1.0"
 futures-util = "0.3"
 rust-embed = { version = "8.11.0", features = ["mime-guess"] }
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
