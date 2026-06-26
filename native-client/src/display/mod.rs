@@ -157,11 +157,39 @@ fn run_display_loop(
                 break;
             }
         };
+        if frames_drained > 0 {
+            // Reset the "no frames" timer whenever we successfully
+            // render. The stale-frame warning below uses this to
+            // distinguish "server is producing frames but renderer is
+            // stuck" (which would still hit frames_drained > 0 here)
+            // from "server is silent" (which never does).
+            state.last_render = Some(std::time::Instant::now());
+        }
 
         if let Some((w, h)) = state.pending_resize.take() {
             debug!("applying pending resize to {w}x{h}");
             if let Some(r) = state.renderer.as_mut() {
                 r.resize(w, h);
+            }
+        }
+
+        // Periodically warn if no frames have been rendered for >2s.
+        // This catches the "server has nothing to send" case
+        // (compositor idle, no Wayland clients attached) which
+        // otherwise looks indistinguishable from a renderer bug: the
+        // user sees a static picture and assumes the renderer is
+        // stuck, when actually the upstream is silent.
+        if let Some(last) = state.last_render {
+            let elapsed = last.elapsed();
+            if elapsed > std::time::Duration::from_secs(2) {
+                tracing::warn!(
+                    "no frame rendered in {:.1}s; is the server's compositor idle? \
+                     (attach a Wayland client -- e.g. wayland-test-client -- to \
+                     WAYLAND_DISPLAY={} to generate frames)",
+                    elapsed.as_secs_f32(),
+                    std::env::var("WAYLAND_DISPLAY").unwrap_or_default(),
+                );
+                state.last_render = Some(std::time::Instant::now()); // suppress repeat
             }
         }
 
@@ -185,10 +213,6 @@ fn run_display_loop(
             .blocking_dispatch(&mut state)
             .context("blocking_dispatch")?;
         event_queue.flush().context("flush")?;
-
-        if frames_drained > 0 {
-            debug!("rendered {frames_drained} frame(s) this tick");
-        }
     }
 
     Ok(())
@@ -212,6 +236,10 @@ struct DisplayState {
     /// next loop tick (after any in-flight render) so we never resize
     /// mid-blit. Stored here, drained at the top of each tick.
     pending_resize: Option<(u32, u32)>,
+    /// Wall-clock time of the last successful render. Used by the
+    /// "no frame in N seconds" warning below to distinguish a stuck
+    /// renderer from a silent upstream.
+    last_render: Option<std::time::Instant>,
 }
 
 impl DisplayState {
@@ -232,6 +260,7 @@ impl DisplayState {
             seat: None,
             renderer: None,
             pending_resize: None,
+            last_render: None,
         }
     }
 }
@@ -450,6 +479,7 @@ impl Dispatch<wl_buffer::WlBuffer, SlotId> for DisplayState {
         _: &QueueHandle<Self>,
     ) {
         if let wl_buffer::Event::Release = event {
+            tracing::info!("wl_buffer::Release for slot={slot_id}");
             if let Some(renderer) = state.renderer.as_mut() {
                 renderer.release_slot(*slot_id);
             }

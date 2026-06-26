@@ -242,6 +242,16 @@ impl ShmRenderer {
             self.slots[1].as_ref().map(|s| s.released).unwrap_or(false),
         ];
         let Some(idx) = pick_next_released(&released, self.next_idx) else {
+            // Both slots are held by the compositor. This happens
+            // briefly after a commit (the compositor hasn't released
+            // the previous buffer yet, usually <1 vsync). If this
+            // log line is spammed, the compositor is *not* sending
+            // wl_buffer::Release for our buffers -- which is the bug
+            // we hit before fixing dispatch_pending -> blocking_dispatch.
+            tracing::debug!(
+                "no released slot; dropping frame (slot_state={})",
+                self.slot_state()
+            );
             return Ok(false);
         };
 
@@ -267,7 +277,22 @@ impl ShmRenderer {
         self.surface.commit();
 
         self.next_idx = (idx + 1) % NUM_SLOTS;
+        tracing::info!(
+            "rendered slot={idx} {}x{} ({}x{} source)",
+            slot.width, slot.height, frame.width, frame.height
+        );
         Ok(true)
+    }
+
+    /// Diagnostic: report which slots are currently released. Useful
+    /// when the renderer appears stuck (no released slot -> no render
+    /// possible). Returns a string like `[released,held]`.
+    pub fn slot_state(&self) -> String {
+        format!(
+            "[{},{}]",
+            self.slots[0].as_ref().map(|s| s.released).unwrap_or(false),
+            self.slots[1].as_ref().map(|s| s.released).unwrap_or(false),
+        )
     }
 }
 
