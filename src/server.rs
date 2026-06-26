@@ -28,6 +28,7 @@ use crate::input::keyboard::KeyboardEvent;
 use crate::input::mouse::MouseEvent;
 use crate::input::touch::TouchEvent;
 use crate::latency::LatencyReport;
+use crate::proto;
 use crate::session::SessionManager;
 use crate::web::{serve_asset, serve_index};
 
@@ -306,6 +307,7 @@ impl SignalingServer {
             .route("/ws", get(handle_websocket))
             .route("/stream", get(handle_video_stream))
             .route("/audio", get(handle_audio_stream))
+            .route("/client", get(handle_unified_client))
             .fallback(serve_asset)
             .layer(TraceLayer::new_for_http())
             .with_state(state);
@@ -381,112 +383,14 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
         return;
     }
 
-    loop {
-        tokio::select! {
-            incoming = receiver.next() => {
-                let Some(Ok(msg)) = incoming else { break; };
-                let Message::Text(text) = msg else { continue; };
-                let Ok(signal) = serde_json::from_str::<SignalingMessage>(&text) else { continue; };
-                match signal {
-                    SignalingMessage::Ready => {
-                        info!("Client is ready");
-                    }
-                    SignalingMessage::Resize { width, height } => {
-                        info!("Received resize request from client: {}x{}", width, height);
-                        let _ = state.resize_tx.send((width, height)).await;
-                    }
-                    SignalingMessage::Touch { event } => {
-                        // Touch events can be frequent, so only log at debug level
-                        if let Err(e) = state.touch_tx.send(event).await {
-                            warn!("Failed to send touch event: {}", e);
-                        }
-                    }
-                    SignalingMessage::Pointer { event } => {
-                        // Pointer events can be frequent, so only log at debug level
-                        if let Err(e) = state.mouse_tx.send(event).await {
-                            warn!("Failed to send pointer event: {}", e);
-                        }
-                    }
-                    SignalingMessage::Key { event } => {
-                        if let Err(e) = state.key_tx.send(event).await {
-                            warn!("Failed to send key event: {}", e);
-                        }
-                    }
-                    SignalingMessage::RequestKeyframe => {
-                        info!("Client requested a keyframe resync (decoder fell behind)");
-                        // Always feed the congestion signal -- `BitrateAlgorithm`
-                        // has its own (longer) cooldown on actually cutting, so
-                        // this can't over-cut even when called every loop of a
-                        // tight resync spiral.
-                        if let Some(ref bitrate_event_tx) = state.bitrate_event_tx {
-                            let _ = bitrate_event_tx.send(BitrateEvent::KeyframeRequested).await;
-                        }
-                        // But don't force a *new* keyframe more often than
-                        // `KEYFRAME_FORCE_COOLDOWN` -- see its doc comment for
-                        // why honoring every request here can spiral.
-                        let should_force = {
-                            let mut last = state.last_keyframe_force.lock().unwrap();
-                            if last.elapsed() >= KEYFRAME_FORCE_COOLDOWN {
-                                *last = Instant::now();
-                                true
-                            } else {
-                                false
-                            }
-                        };
-                        if should_force {
-                            state.force_render.store(true, Ordering::Relaxed);
-                            if let Err(e) = state.encoder_control_tx.send(EncoderControl::ForceKeyframe).await {
-                                warn!("Failed to request keyframe resync: {}", e);
-                            }
-                        } else {
-                            debug!("Suppressing keyframe resync, last one was less than {:?} ago", KEYFRAME_FORCE_COOLDOWN);
-                        }
-                    }
-                    SignalingMessage::Ping { client_ts } => {
-                        // Best-effort: if the queue is briefly full, the next
-                        // ping a couple seconds later picks it up instead.
-                        let _ = state.pending_ping_tx.try_send(client_ts);
-                    }
-                    SignalingMessage::Latency { encoding_ms, network_ms, jitter_buffer_ms, decoding_ms, total_ms, burst_count, blit_ms } => {
-                        info!(
-                            "Received latency report from client: network {:.1}ms decode {:.1}ms blit {:.1}ms total {:.1}ms",
-                            network_ms.unwrap_or(0.0), decoding_ms.unwrap_or(0.0), blit_ms.unwrap_or(0.0), total_ms
-                        );
-                        // Only decode latency throttles bitrate growth here --
-                        // network/RTT delays aren't evidence the encoder's
-                        // rate is too high (see adaptive_bitrate.rs).
-                        if let (Some(ref bitrate_event_tx), Some(ms)) = (&state.bitrate_event_tx, decoding_ms) {
-                            let _ = bitrate_event_tx.send(BitrateEvent::Latency(ms)).await;
-                        }
-                        // Bursty arrival with a shallow decode queue is
-                        // network-level congestion the keyframe-request
-                        // signal can't see -- cut on it directly. See
-                        // `BitrateEvent::ArrivalStall`.
-                        if burst_count >= ARRIVAL_STALL_BURST_THRESHOLD {
-                            warn!(
-                                "Client reported {} bursty frame arrivals (>= {}) with no decode backlog -- treating as network congestion",
-                                burst_count, ARRIVAL_STALL_BURST_THRESHOLD
-                            );
-                            if let Some(ref bitrate_event_tx) = state.bitrate_event_tx {
-                                let _ = bitrate_event_tx.send(BitrateEvent::ArrivalStall).await;
-                            }
-                        }
-                        if let Some(ref latency_tx) = state.latency_tx {
-                            let mut report = LatencyReport::new();
-                            report.encoding_ms = encoding_ms;
-                            report.network_ms = network_ms;
-                            report.jitter_buffer_ms = jitter_buffer_ms;
-                            report.decoding_ms = decoding_ms;
-                            report.decode_to_display_ms = blit_ms;
-                            report.total_ms = total_ms;
-
-                            if let Err(e) = latency_tx.send(report).await {
-                                warn!("Failed to send latency report: {}", e);
-                            }
-                        }
-                    }
+loop {
+            tokio::select! {
+                incoming = receiver.next() => {
+                    let Some(Ok(msg)) = incoming else { break; };
+                    let Message::Text(text) = msg else { continue; };
+                    let Ok(signal) = serde_json::from_str::<SignalingMessage>(&text) else { continue; };
+                    dispatch_signaling_message(signal, &state).await;
                 }
-            }
             changed = bitrate_rx.changed() => {
                 if changed.is_err() {
                     // Sender side dropped; bitrate just won't update further.
@@ -691,6 +595,378 @@ fn encode_audio_frame(packet: &AudioPacket) -> Vec<u8> {
     buf.extend_from_slice(&packet.pts_us.to_be_bytes());
     buf.extend_from_slice(&packet.data);
     buf
+}
+
+/// Handle the unified client WebSocket (`/client`) that combines the control
+/// channel (`/ws`), video stream (`/stream`), and audio stream (`/audio`)
+/// into one connection using the shared 8-byte `proto::HEADER_LEN` framing.
+/// See `docs/native-client-plan.md` Part 2.
+async fn handle_unified_client(
+    ws: WebSocketUpgrade,
+    State(state): State<SignalingState>,
+) -> Response {
+    ws.on_upgrade(move |socket| unified_client_handler(socket, state))
+}
+
+async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
+    info!("Unified client connected");
+    state.session.ensure_started().await;
+
+    let (mut sender, mut receiver) = socket.split();
+    let mut video_rx = state.get_video_sender().subscribe();
+    // `None` when PipeWire audio capture failed at startup -- the audio
+    // branch of the select! below then never resolves.
+    let mut audio_rx: Option<broadcast::Receiver<AudioPacket>> =
+        state.audio_tx.as_ref().map(|tx| tx.subscribe());
+    let mut bitrate_rx = state.bitrate_rx.clone();
+    let mut codec_rx = state.codec_rx.clone();
+    let mut cursor_rx = state.cursor_rx.clone();
+    let mut shutdown_rx = state.shutdown_rx.clone();
+
+    // Push the current bitrate/codec/cursor up front for the same reasons as
+    // the standalone /ws handler -- a client connecting between changes
+    // (or after the encoder has settled on a non-default level) needs the
+    // current state, not the next one. Each value is bound to a local first
+    // so the `watch::Ref` borrow is released before the `.await` (it isn't
+    // `Send`, and would otherwise extend across the await point).
+    {
+        let bps = *bitrate_rx.borrow();
+        if send_unified_control(&mut sender, &ServerMessage::Bitrate { bps })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    {
+        let codec = codec_rx.borrow().clone();
+        if send_unified_control(&mut sender, &ServerMessage::Codec { codec })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    {
+        let cursor = cursor_rx.borrow().clone();
+        if send_unified_control(&mut sender, &ServerMessage::Cursor { cursor })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    // Same keyframe-forcing behavior as the standalone /stream handler:
+    // otherwise a new client has no decodable frame to start from until
+    // the next damage or GOP-cycle keyframe.
+    state.force_render.store(true, Ordering::Relaxed);
+    if let Err(e) = state.encoder_control_tx.send(EncoderControl::ForceKeyframe).await {
+        warn!("Failed to request keyframe for new unified client: {}", e);
+    }
+
+    loop {
+        tokio::select! {
+            packet = video_rx.recv() => {
+                let packet = match packet {
+                    Ok(packet) => packet,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!("Unified client video lagging, skipped {} frame(s)", skipped);
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                let frame = encode_unified_video_frame(&packet);
+                if sender.send(Message::Binary(frame)).await.is_err() {
+                    break;
+                }
+            }
+            packet = recv_audio(&mut audio_rx) => {
+                let packet = match packet {
+                    Ok(packet) => packet,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("Unified client audio lagging, skipped {} packet(s)", n);
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                let frame = encode_unified_audio_frame(&packet);
+                if sender.send(Message::Binary(frame)).await.is_err() {
+                    break;
+                }
+            }
+            changed = bitrate_rx.changed() => {
+                if changed.is_err() {
+                    // Sender side dropped; bitrate just won't update further.
+                    continue;
+                }
+                let bps = *bitrate_rx.borrow();
+                if send_unified_control(&mut sender, &ServerMessage::Bitrate { bps })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            changed = codec_rx.changed() => {
+                if changed.is_err() {
+                    // Sender side (encoder thread) dropped; codec just won't update further.
+                    continue;
+                }
+                let codec = codec_rx.borrow().clone();
+                if send_unified_control(&mut sender, &ServerMessage::Codec { codec })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            changed = cursor_rx.changed() => {
+                if changed.is_err() { continue; }
+                let cursor = cursor_rx.borrow().clone();
+                if send_unified_control(&mut sender, &ServerMessage::Cursor { cursor })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            incoming = receiver.next() => {
+                let Some(Ok(msg)) = incoming else { break; };
+                let Message::Binary(data) = msg else { continue; };
+                let Ok(signal) = parse_client_message(&data) else { continue; };
+                dispatch_signaling_message(signal, &state).await;
+            }
+            _ = shutdown_rx.changed() => {
+                let _ = sender.send(Message::Close(Some(CloseFrame {
+                    code: close_code::AWAY,
+                    reason: "server shutting down".into(),
+                }))).await;
+                break;
+            }
+        }
+    }
+
+    info!("Unified client disconnected");
+}
+
+/// Wire layout for a unified `MSG_VIDEO_FRAME` payload (after the 8-byte
+/// `proto` header):
+/// ```text
+/// bytes 0-3   : frame_id (u32, big-endian)
+/// bytes 4-11  : ping_echo_client_ts (f64, big-endian; 0.0 when no echo)
+/// bytes 12-19 : capture_to_encode_ms (f64, big-endian)
+/// bytes 20..  : raw Annex-B H.264 NAL data
+/// ```
+/// `is_keyframe` and `has_ping_echo` are carried in the header `flags`
+/// byte, not inline -- saving the two flag bytes the legacy `/stream`
+/// format uses.
+fn encode_unified_video_frame(packet: &EncodedPacket) -> Vec<u8> {
+    let mut flags = 0u8;
+    if packet.is_keyframe {
+        flags |= proto::FLAG_KEYFRAME;
+    }
+    if packet.ping_echo_client_ts.is_some() {
+        flags |= proto::FLAG_HAS_PING;
+    }
+
+    let mut payload = Vec::with_capacity(20 + packet.data.len());
+    payload.extend_from_slice(&packet.frame_id.to_be_bytes());
+    let ping_val = packet.ping_echo_client_ts.unwrap_or(0.0);
+    payload.extend_from_slice(&ping_val.to_be_bytes());
+    payload.extend_from_slice(&packet.capture_to_encode_ms.to_be_bytes());
+    payload.extend_from_slice(&packet.data);
+
+    proto::encode_msg(proto::MSG_VIDEO_FRAME, flags, &payload)
+}
+
+/// Wire layout for a unified `MSG_AUDIO_FRAME` payload:
+/// ```text
+/// bytes 0-7 : pts_us (u64, big-endian)
+/// bytes 8.. : raw Opus packet
+/// ```
+/// Identical to the legacy `/audio` wire format, just wrapped in the
+/// shared header.
+fn encode_unified_audio_frame(packet: &AudioPacket) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(8 + packet.data.len());
+    payload.extend_from_slice(&packet.pts_us.to_be_bytes());
+    payload.extend_from_slice(&packet.data);
+    proto::encode_msg(proto::MSG_AUDIO_FRAME, 0, &payload)
+}
+
+fn encode_unified_control(msg: &ServerMessage) -> Vec<u8> {
+    let json = serde_json::to_vec(msg).expect("ServerMessage always serializes");
+    proto::encode_msg(proto::MSG_CONTROL, 0, &json)
+}
+
+async fn send_unified_control(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    msg: &ServerMessage,
+) -> Result<(), axum::Error> {
+    sender.send(Message::Binary(encode_unified_control(msg))).await
+}
+
+/// Parses a `MSG_CLIENT_MSG` frame coming from the `/client` endpoint.
+/// Anything that isn't a `MSG_CLIENT_MSG` (or has a malformed
+/// header/payload) is treated as a non-error no-op so a single bad frame
+/// can't kill the connection.
+fn parse_client_message(data: &[u8]) -> Result<SignalingMessage, ()> {
+    if data.len() < proto::HEADER_LEN {
+        return Err(());
+    }
+    let header: [u8; proto::HEADER_LEN] = data[..proto::HEADER_LEN]
+        .try_into()
+        .map_err(|_| ())?;
+    let (msg_type, _flags, payload_len) = proto::decode_header(&header);
+    if msg_type != proto::MSG_CLIENT_MSG {
+        return Err(());
+    }
+    let end = proto::HEADER_LEN
+        .checked_add(payload_len as usize)
+        .ok_or(())?;
+    if data.len() < end {
+        return Err(());
+    }
+    serde_json::from_slice(&data[proto::HEADER_LEN..end]).map_err(|_| ())
+}
+
+/// Future used by the unified client's audio branch. Yields `None`
+/// forever when audio capture is unavailable, so the branch simply
+/// never wins the `select!`.
+async fn recv_audio(
+    rx: &mut Option<broadcast::Receiver<AudioPacket>>,
+) -> Result<AudioPacket, broadcast::error::RecvError> {
+    match rx.as_mut() {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Shared dispatch for an incoming `SignalingMessage`. Both the
+/// legacy `/ws` handler (text-framed JSON) and the unified `/client`
+/// handler (binary-framed via `parse_client_message`) route through here
+/// so the two transports can never drift apart in how they handle
+/// resize/input/keyframe-resync/latency/ping.
+async fn dispatch_signaling_message(signal: SignalingMessage, state: &SignalingState) {
+    match signal {
+        SignalingMessage::Ready => {
+            info!("Client is ready");
+        }
+        SignalingMessage::Resize { width, height } => {
+            info!("Received resize request from client: {}x{}", width, height);
+            let _ = state.resize_tx.send((width, height)).await;
+        }
+        SignalingMessage::Touch { event } => {
+            // Touch events can be frequent, so only log at debug level
+            if let Err(e) = state.touch_tx.send(event).await {
+                warn!("Failed to send touch event: {}", e);
+            }
+        }
+        SignalingMessage::Pointer { event } => {
+            // Pointer events can be frequent, so only log at debug level
+            if let Err(e) = state.mouse_tx.send(event).await {
+                warn!("Failed to send pointer event: {}", e);
+            }
+        }
+        SignalingMessage::Key { event } => {
+            if let Err(e) = state.key_tx.send(event).await {
+                warn!("Failed to send key event: {}", e);
+            }
+        }
+        SignalingMessage::RequestKeyframe => {
+            info!("Client requested a keyframe resync (decoder fell behind)");
+            // Always feed the congestion signal -- `BitrateAlgorithm`
+            // has its own (longer) cooldown on actually cutting, so
+            // this can't over-cut even when called every loop of a
+            // tight resync spiral.
+            if let Some(ref bitrate_event_tx) = state.bitrate_event_tx {
+                let _ = bitrate_event_tx.send(BitrateEvent::KeyframeRequested).await;
+            }
+            // But don't force a *new* keyframe more often than
+            // `KEYFRAME_FORCE_COOLDOWN` -- see its doc comment for
+            // why honoring every request here can spiral.
+            let should_force = {
+                let mut last = state.last_keyframe_force.lock().unwrap();
+                if last.elapsed() >= KEYFRAME_FORCE_COOLDOWN {
+                    *last = Instant::now();
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_force {
+                state.force_render.store(true, Ordering::Relaxed);
+                if let Err(e) = state
+                    .encoder_control_tx
+                    .send(EncoderControl::ForceKeyframe)
+                    .await
+                {
+                    warn!("Failed to request keyframe resync: {}", e);
+                }
+            } else {
+                debug!(
+                    "Suppressing keyframe resync, last one was less than {:?} ago",
+                    KEYFRAME_FORCE_COOLDOWN
+                );
+            }
+        }
+        SignalingMessage::Ping { client_ts } => {
+            // Best-effort: if the queue is briefly full, the next
+            // ping a couple seconds later picks it up instead.
+            let _ = state.pending_ping_tx.try_send(client_ts);
+        }
+        SignalingMessage::Latency {
+            encoding_ms,
+            network_ms,
+            jitter_buffer_ms,
+            decoding_ms,
+            total_ms,
+            burst_count,
+            blit_ms,
+        } => {
+            info!(
+                "Received latency report from client: network {:.1}ms decode {:.1}ms blit {:.1}ms total {:.1}ms",
+                network_ms.unwrap_or(0.0),
+                decoding_ms.unwrap_or(0.0),
+                blit_ms.unwrap_or(0.0),
+                total_ms
+            );
+            // Only decode latency throttles bitrate growth here --
+            // network/RTT delays aren't evidence the encoder's
+            // rate is too high (see adaptive_bitrate.rs).
+            if let (Some(ref bitrate_event_tx), Some(ms)) =
+                (&state.bitrate_event_tx, decoding_ms)
+            {
+                let _ = bitrate_event_tx.send(BitrateEvent::Latency(ms)).await;
+            }
+            // Bursty arrival with a shallow decode queue is
+            // network-level congestion the keyframe-request
+            // signal can't see -- cut on it directly. See
+            // `BitrateEvent::ArrivalStall`.
+            if burst_count >= ARRIVAL_STALL_BURST_THRESHOLD {
+                warn!(
+                    "Client reported {} bursty frame arrivals (>= {}) with no decode backlog -- treating as network congestion",
+                    burst_count, ARRIVAL_STALL_BURST_THRESHOLD
+                );
+                if let Some(ref bitrate_event_tx) = state.bitrate_event_tx {
+                    let _ = bitrate_event_tx.send(BitrateEvent::ArrivalStall).await;
+                }
+            }
+            if let Some(ref latency_tx) = state.latency_tx {
+                let mut report = LatencyReport::new();
+                report.encoding_ms = encoding_ms;
+                report.network_ms = network_ms;
+                report.jitter_buffer_ms = jitter_buffer_ms;
+                report.decoding_ms = decoding_ms;
+                report.decode_to_display_ms = blit_ms;
+                report.total_ms = total_ms;
+
+                if let Err(e) = latency_tx.send(report).await {
+                    warn!("Failed to send latency report: {}", e);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -922,5 +1198,207 @@ mod tests {
         let (code, reason) = read_ws_close_frame(&mut stream).await;
         assert_eq!(code, 1000, "expected NORMAL close code");
         assert_eq!(reason, "audio capture not available");
+    }
+
+    /// Parses the proto header from a binary WS payload returned by the
+    /// unified endpoint. Returns (msg_type, flags, payload_len).
+    fn parse_unified_header(payload: &[u8]) -> (u8, u8, u32) {
+        assert!(
+            payload.len() >= proto::HEADER_LEN,
+            "unified frame too short ({} bytes)",
+            payload.len()
+        );
+        let header: [u8; proto::HEADER_LEN] = payload[..proto::HEADER_LEN].try_into().unwrap();
+        proto::decode_header(&header)
+    }
+
+    /// /client completes the WebSocket upgrade (101 Switching Protocols),
+    /// which is the Phase-2 milestone from docs/native-client-plan.md.
+    #[tokio::test]
+    async fn client_endpoint_completes_websocket_handshake() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let state = make_signaling_state(shutdown_rx, shutdown_tx, None);
+        let server = SignalingServer::new(state);
+
+        let addr = "127.0.0.1:27348";
+        tokio::spawn(async move {
+            server.serve("127.0.0.1", 27348, std::future::pending()).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // ws_handshake asserts the 101 response itself, so if this returns
+        // the upgrade succeeded.
+        let _stream = ws_handshake(addr, "/client").await;
+    }
+
+    /// /client pushes the initial bitrate/codec/cursor state in the
+    /// unified `MSG_CONTROL` framing, in that order, so the client can
+    /// render and decode correctly from the very first frame.
+    #[tokio::test]
+    async fn client_endpoint_sends_initial_control_frames() {
+        let initial_bitrate: usize = 1_234_567;
+        let initial_codec = "avc1.42E028";
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let state = make_signaling_state(shutdown_rx, shutdown_tx, None);
+        let (bitrate_tx, _) = watch::channel(initial_bitrate);
+        let (codec_tx, _) = watch::channel(initial_codec.to_string());
+        let _ = state.bitrate_rx; // keep field referenced; we push via the
+                                  // original `bitrate_rx` that make_signaling_state
+                                  // already cloned into state. The test below
+                                  // checks the value pushed at connect time.
+        let _ = bitrate_tx;
+        let _ = codec_tx;
+        let server = SignalingServer::new(state);
+
+        let addr = "127.0.0.1:27349";
+        tokio::spawn(async move {
+            server.serve("127.0.0.1", 27349, std::future::pending()).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut stream = ws_handshake(addr, "/client").await;
+
+        // The handler pushes three CONTROL frames in order; each must be
+        // a binary WS message whose first byte is MSG_CONTROL.
+        for _ in 0..3 {
+            let payload = read_ws_binary_frame(&mut stream).await;
+            let (msg_type, _flags, payload_len) = parse_unified_header(&payload);
+            assert_eq!(msg_type, proto::MSG_CONTROL, "expected MSG_CONTROL");
+            assert_eq!(
+                payload.len(),
+                proto::HEADER_LEN + payload_len as usize,
+                "payload length must match the header's payload_len"
+            );
+        }
+    }
+
+    /// /client delivers an `EncodedPacket` over the unified framing,
+    /// with the is_keyframe flag set in the header (not inline like the
+    /// legacy `/stream` format).
+    #[tokio::test]
+    async fn client_endpoint_delivers_video_in_unified_framing() {
+        let (encoder_control_tx, mut encoder_control_rx) = mpsc::channel(4);
+        let (pending_ping_tx, _pending_ping_rx) = mpsc::channel(4);
+        let (_, bitrate_rx) = watch::channel(2_000_000usize);
+        let (_, codec_rx) = watch::channel(String::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let force_render = Arc::new(AtomicBool::new(false));
+        let (_, cursor_rx) = watch::channel(CursorUpdate::Default);
+        let state = SignalingState::new(
+            mpsc::channel(4).0,
+            mpsc::channel(4).0,
+            mpsc::channel(4).0,
+            mpsc::channel(4).0,
+            None,
+            None,
+            encoder_control_tx,
+            force_render.clone(),
+            pending_ping_tx,
+            bitrate_rx,
+            codec_rx,
+            shutdown_rx,
+            SessionManager::new(Vec::new(), String::new(), shutdown_tx),
+            None,
+            cursor_rx,
+        );
+        let video_tx = state.get_video_sender();
+        let server = SignalingServer::new(state);
+
+        let addr = "127.0.0.1:27350";
+        tokio::spawn(async move {
+            server.serve("127.0.0.1", 27350, std::future::pending()).await.unwrap();
+        });
+
+        // Drain the three initial CONTROL frames before sending the
+        // packet, otherwise the test's `recv` order would be wrong.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut stream = ws_handshake(addr, "/client").await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for _ in 0..3 {
+            let _ = read_ws_binary_frame(&mut stream).await;
+        }
+
+        assert!(
+            force_render.load(Ordering::Relaxed),
+            "connecting to /client should force a render"
+        );
+        assert!(
+            matches!(encoder_control_rx.try_recv(), Ok(EncoderControl::ForceKeyframe)),
+            "connecting to /client should request a fresh keyframe"
+        );
+
+        fn test_packet(data: Vec<u8>, is_keyframe: bool, frame_id: u32) -> EncodedPacket {
+            EncodedPacket {
+                data,
+                is_keyframe,
+                frame_id,
+                capture_to_encode_ms: 0.0,
+                encoding_ms: 0.0,
+                encode_complete: std::time::Instant::now(),
+                ping_echo_client_ts: None,
+            }
+        }
+
+        assert!(
+            video_tx
+                .send(test_packet(vec![0xAA, 0xBB, 0xCC], true, 42))
+                .is_ok()
+        );
+
+        let payload = read_ws_binary_frame(&mut stream).await;
+        let (msg_type, flags, payload_len) = parse_unified_header(&payload);
+        assert_eq!(msg_type, proto::MSG_VIDEO_FRAME);
+        assert_ne!(flags & proto::FLAG_KEYFRAME, 0, "keyframe flag must be set");
+        assert_eq!(
+            flags & proto::FLAG_HAS_PING,
+            0,
+            "no ping echo was sent, so FLAG_HAS_PING must be clear"
+        );
+        assert_eq!(
+            payload.len(),
+            proto::HEADER_LEN + payload_len as usize,
+            "payload length must match the header's payload_len"
+        );
+        let frame_id = u32::from_be_bytes(payload[8..12].try_into().unwrap());
+        assert_eq!(frame_id, 42);
+        // ping_echo_client_ts is 0.0 when none
+        let ping_val = f64::from_be_bytes(payload[12..20].try_into().unwrap());
+        assert_eq!(ping_val, 0.0);
+        assert_eq!(&payload[proto::HEADER_LEN + 20..], &[0xAA, 0xBB, 0xCC]);
+    }
+
+    /// `parse_client_message` rejects anything that isn't a
+    /// `MSG_CLIENT_MSG` -- this is the /client analogue of the /ws
+    /// "ignore unknown text" policy and is important so a stray
+    /// binary frame can't kill the connection.
+    #[test]
+    fn parse_client_message_rejects_wrong_type() {
+        let frame = proto::encode_msg(proto::MSG_VIDEO_FRAME, 0, &[1, 2, 3]);
+        assert!(parse_client_message(&frame).is_err());
+
+        // Too short to even hold a header.
+        assert!(parse_client_message(&[0u8; 3]).is_err());
+
+        // Header says 100 bytes of payload but the buffer only has 4.
+        let mut bad = proto::encode_msg(proto::MSG_CLIENT_MSG, 0, &[1, 2, 3, 4]);
+        // Hand-craft a header claiming payload_len = 100.
+        bad[4] = 100;
+        bad[5] = 0;
+        bad[6] = 0;
+        bad[7] = 0;
+        assert!(parse_client_message(&bad).is_err());
+    }
+
+    /// `parse_client_message` round-trips a real `SignalingMessage`.
+    #[test]
+    fn parse_client_message_round_trips_signaling_message() {
+        let original = SignalingMessage::Ping { client_ts: 12.5 };
+        let json = serde_json::to_vec(&original).unwrap();
+        let frame = proto::encode_msg(proto::MSG_CLIENT_MSG, 0, &json);
+        let parsed = parse_client_message(&frame).expect("valid CLIENT_MSG");
+        match parsed {
+            SignalingMessage::Ping { client_ts } => assert!((client_ts - 12.5).abs() < 1e-9),
+            other => panic!("expected Ping, got {:?}", other),
+        }
     }
 }

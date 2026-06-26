@@ -18,6 +18,7 @@ mod config;
 mod encoder;
 mod input;
 mod latency;
+mod proto;
 mod server;
 mod session;
 mod web;
