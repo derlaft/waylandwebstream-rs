@@ -27,11 +27,26 @@ export class AudioStream {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private closedByCaller = false;
 
+  // Listeners added to fire AudioContext.resume() on the first user gesture.
+  // Needed because AudioContext created without a user gesture starts
+  // suspended, and resume() from an async context (e.g. ws.onopen) is
+  // rejected silently by Chrome's autoplay policy.
+  private gestureHandlers: Array<[string, EventListener]> = [];
+
   connect(): void {
     this.closedByCaller = false;
     this.audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+    // Reset scheduled time when context transitions from suspended to running
+    // so stale future timestamps accumulated during suspension don't cause a
+    // multi-second delay before audio starts.
+    this.audioCtx.addEventListener('statechange', () => {
+      if (this.audioCtx?.state === 'running') {
+        this.nextPlayTime = 0;
+      }
+    });
     this.setupDecoder();
     this.connectSocket();
+    this.installGestureResume();
   }
 
   close(): void {
@@ -48,6 +63,36 @@ export class AudioStream {
     this.decoder = null;
     this.audioCtx?.close();
     this.audioCtx = null;
+    this.removeGestureResume();
+  }
+
+  // Registers pointerdown/keydown listeners that call AudioContext.resume()
+  // on the first user gesture. Chrome requires resume() to be called from
+  // within a user gesture handler; calling it from ws.onopen (async, no
+  // gesture context) is silently rejected.
+  private installGestureResume(): void {
+    const ctx = this.audioCtx;
+    if (!ctx) return;
+    const handler = () => {
+      ctx.resume()
+        .then(() => this.removeGestureResume())
+        .catch(() => { /* ignore: will retry on next gesture */ });
+    };
+    const handlers: Array<[string, EventListener]> = [
+      ['pointerdown', handler as EventListener],
+      ['keydown', handler as EventListener],
+    ];
+    for (const [type, h] of handlers) {
+      document.addEventListener(type, h, { capture: true });
+    }
+    this.gestureHandlers = handlers;
+  }
+
+  private removeGestureResume(): void {
+    for (const [type, h] of this.gestureHandlers) {
+      document.removeEventListener(type, h, { capture: true });
+    }
+    this.gestureHandlers = [];
   }
 
   private setupDecoder(): void {
@@ -89,8 +134,8 @@ export class AudioStream {
     audioData.close();
 
     // Gapless precision scheduling: each buffer starts right after the previous
-    // one.  If we've fallen behind (e.g. reconnect), snap to now + lookahead so
-    // we don't schedule in the past.
+    // one.  If we've fallen behind (e.g. reconnect or context resume after
+    // suspension), snap to now + lookahead so we don't schedule in the past.
     const startAt = Math.max(ctx.currentTime + SCHEDULE_AHEAD_S, this.nextPlayTime);
     this.nextPlayTime = startAt + buffer.duration;
 
@@ -111,14 +156,18 @@ export class AudioStream {
       // Snap play cursor to "now" on fresh connection to avoid carrying over
       // stale scheduling from a previous session.
       this.nextPlayTime = 0;
-      // Resume the AudioContext if the browser suspended it before the first
-      // user gesture (autoplay policy).  Best-effort: connecting the WS is
-      // usually triggered by a user interaction.
-      this.audioCtx?.resume().catch(() => {/* ignore */});
     };
     ws.onmessage = (event) => this.onAudioMessage(event.data as ArrayBuffer);
     ws.onerror = (e) => console.error('Audio stream error:', e);
-    ws.onclose = () => this.scheduleReconnect();
+    ws.onclose = (event) => {
+      // Server sends this when PipeWire capture failed to start at launch.
+      // Reconnecting won't help -- audio capture is a one-time init.
+      if (event.reason === 'audio capture not available') {
+        console.info('Audio capture not available on server; audio disabled.');
+        return;
+      }
+      this.scheduleReconnect();
+    };
     this.ws = ws;
   }
 

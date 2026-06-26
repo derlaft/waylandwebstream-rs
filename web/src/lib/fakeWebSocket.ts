@@ -12,7 +12,7 @@ export class FakeWebSocket {
   readyState = 0;
   binaryType = '';
   onopen: (() => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((e: { code: number; reason: string }) => void) | null = null;
   onerror: ((e: unknown) => void) | null = null;
   onmessage: ((e: { data: unknown }) => void) | null = null;
   readonly sent: string[] = [];
@@ -38,9 +38,9 @@ export class FakeWebSocket {
     this.onopen?.();
   }
 
-  simulateClose(): void {
+  simulateClose(event: { code?: number; reason?: string } = {}): void {
     this.readyState = FakeWebSocket.CLOSED;
-    this.onclose?.();
+    this.onclose?.({ code: event.code ?? 1006, reason: event.reason ?? '' });
   }
 }
 

@@ -13,6 +13,7 @@ export default defineConfig({
     proxy: {
       '/ws': { target: BACKEND, ws: true },
       '/stream': { target: BACKEND, ws: true },
+      '/audio': { target: BACKEND, ws: true },
     },
   },
 })

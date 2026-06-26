@@ -643,6 +643,7 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+    use crate::audio::AudioPacket;
 
     async fn ws_handshake(addr: &str, path: &str) -> TcpStream {
         let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -670,10 +671,12 @@ mod tests {
         stream
     }
 
-    async fn read_ws_binary_frame(stream: &mut TcpStream) -> Vec<u8> {
+    /// Reads one raw WebSocket frame (server-to-client, unmasked).
+    /// Returns (opcode, payload).
+    async fn read_ws_frame(stream: &mut TcpStream) -> (u8, Vec<u8>) {
         let mut header = [0u8; 2];
         stream.read_exact(&mut header).await.unwrap();
-        assert_eq!(header[0] & 0x0F, 2, "expected a binary frame");
+        let opcode = header[0] & 0x0F;
         assert_eq!(header[1] & 0x80, 0, "server frames must not be masked");
 
         let len = match header[1] & 0x7F {
@@ -692,23 +695,40 @@ mod tests {
 
         let mut payload = vec![0u8; len];
         stream.read_exact(&mut payload).await.unwrap();
+        (opcode, payload)
+    }
+
+    async fn read_ws_binary_frame(stream: &mut TcpStream) -> Vec<u8> {
+        let (opcode, payload) = read_ws_frame(stream).await;
+        assert_eq!(opcode, 2, "expected a binary frame (opcode 2)");
         payload
     }
 
-    #[tokio::test]
-    async fn stream_endpoint_delivers_frames_in_wire_format() {
-        let (resize_tx, _resize_rx) = mpsc::channel(4);
-        let (touch_tx, _touch_rx) = mpsc::channel(4);
-        let (mouse_tx, _mouse_rx) = mpsc::channel(4);
-        let (key_tx, _key_rx) = mpsc::channel(4);
-        let (encoder_control_tx, mut encoder_control_rx) = mpsc::channel(4);
-        let (pending_ping_tx, _pending_ping_rx) = mpsc::channel(4);
-        let (_bitrate_tx, bitrate_rx) = watch::channel(2_000_000usize);
-        let (_codec_tx, codec_rx) = watch::channel(String::new());
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let force_render = Arc::new(AtomicBool::new(false));
+    /// Returns the close-frame status code and UTF-8 reason string.
+    async fn read_ws_close_frame(stream: &mut TcpStream) -> (u16, String) {
+        let (opcode, payload) = read_ws_frame(stream).await;
+        assert_eq!(opcode, 8, "expected a close frame (opcode 8)");
+        assert!(payload.len() >= 2, "close frame must carry a status code");
+        let code = u16::from_be_bytes([payload[0], payload[1]]);
+        let reason = String::from_utf8(payload[2..].to_vec()).unwrap_or_default();
+        (code, reason)
+    }
 
-        let state = SignalingState::new(
+    fn make_signaling_state(
+        shutdown_rx: watch::Receiver<bool>,
+        shutdown_tx: watch::Sender<bool>,
+        audio_tx: Option<broadcast::Sender<AudioPacket>>,
+    ) -> SignalingState {
+        let (resize_tx, _) = mpsc::channel(4);
+        let (touch_tx, _) = mpsc::channel(4);
+        let (mouse_tx, _) = mpsc::channel(4);
+        let (key_tx, _) = mpsc::channel(4);
+        let (encoder_control_tx, _) = mpsc::channel(4);
+        let (pending_ping_tx, _) = mpsc::channel(4);
+        let (_, bitrate_rx) = watch::channel(2_000_000usize);
+        let (_, codec_rx) = watch::channel(String::new());
+        let force_render = Arc::new(AtomicBool::new(false));
+        SignalingState::new(
             resize_tx,
             touch_tx,
             mouse_tx,
@@ -716,10 +736,34 @@ mod tests {
             None,
             None,
             encoder_control_tx,
-            force_render.clone(),
+            force_render,
             pending_ping_tx,
             bitrate_rx,
             codec_rx,
+            shutdown_rx,
+            SessionManager::new(Vec::new(), String::new(), shutdown_tx),
+            audio_tx,
+        )
+    }
+
+    #[tokio::test]
+    async fn stream_endpoint_delivers_frames_in_wire_format() {
+        let (encoder_control_tx, mut encoder_control_rx) = mpsc::channel(4);
+        let (pending_ping_tx, _pending_ping_rx) = mpsc::channel(4);
+        let (_, bitrate_rx) = watch::channel(2_000_000usize);
+        let (_, codec_rx) = watch::channel(String::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let force_render = Arc::new(AtomicBool::new(false));
+        let state = SignalingState::new(
+            mpsc::channel(4).0,
+            mpsc::channel(4).0,
+            mpsc::channel(4).0,
+            mpsc::channel(4).0,
+            None, None,
+            encoder_control_tx,
+            force_render.clone(),
+            pending_ping_tx,
+            bitrate_rx, codec_rx,
             shutdown_rx,
             SessionManager::new(Vec::new(), String::new(), shutdown_tx),
             None,
@@ -770,5 +814,54 @@ mod tests {
         assert_eq!(frame2[0], 0, "expected delta flag");
         assert_eq!(u32::from_be_bytes([frame2[1], frame2[2], frame2[3], frame2[4]]), 43);
         assert_eq!(&frame2[STREAM_FRAME_HEADER_BYTES..], &[0xDD]);
+    }
+
+    /// Wire format: [u64 pts_us BE][raw Opus bytes].
+    #[tokio::test]
+    async fn audio_endpoint_delivers_frames_in_wire_format() {
+        let (audio_tx, _) = broadcast::channel::<AudioPacket>(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let state = make_signaling_state(shutdown_rx, shutdown_tx, Some(audio_tx.clone()));
+        let server = SignalingServer::new(state);
+
+        let addr = "127.0.0.1:27346";
+        tokio::spawn(async move {
+            server.serve("127.0.0.1", 27346, std::future::pending()).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut stream = ws_handshake(addr, "/audio").await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let opus_data = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let pts_us: u64 = 20_000;
+        assert!(audio_tx.send(AudioPacket { data: opus_data.clone(), pts_us }).is_ok());
+
+        let frame = read_ws_binary_frame(&mut stream).await;
+        assert!(frame.len() >= 8, "audio frame must have at least 8-byte header");
+        let pts_received = u64::from_be_bytes(frame[..8].try_into().unwrap());
+        assert_eq!(pts_received, pts_us, "PTS must round-trip correctly");
+        assert_eq!(&frame[8..], &opus_data, "Opus payload must follow the header");
+    }
+
+    /// When audio capture failed at startup, /audio closes immediately with
+    /// NORMAL (1000) and reason "audio capture not available".
+    #[tokio::test]
+    async fn audio_endpoint_closes_when_capture_unavailable() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let state = make_signaling_state(shutdown_rx, shutdown_tx, None);
+        let server = SignalingServer::new(state);
+
+        let addr = "127.0.0.1:27347";
+        tokio::spawn(async move {
+            server.serve("127.0.0.1", 27347, std::future::pending()).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut stream = ws_handshake(addr, "/audio").await;
+
+        let (code, reason) = read_ws_close_frame(&mut stream).await;
+        assert_eq!(code, 1000, "expected NORMAL close code");
+        assert_eq!(reason, "audio capture not available");
     }
 }
