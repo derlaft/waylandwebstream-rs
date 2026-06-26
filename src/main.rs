@@ -24,7 +24,7 @@ mod web;
 use adaptive_bitrate::{AdaptiveBitrateConfig, AdaptiveBitrateController, BitrateEvent};
 use compositor::{Compositor, CompositorState, GlCompositor, SwCompositor};
 use config::{CompositorBackendArg, EncoderBackendArg};
-use encoder::{EncoderBackend, EncoderConfig, RateControl, spawn_encoder};
+use encoder::{EncoderBackend, EncoderConfig, EncoderControl, RateControl, spawn_encoder};
 use input::mouse::MouseHandler;
 use input::touch::TouchHandler;
 use server::{SignalingServer, SignalingState};
@@ -347,6 +347,7 @@ async fn main() -> Result<()> {
     };
 
     // Create signaling state and server
+    let encoder_control_for_loop = encoder_control.clone();
     let signaling_state = SignalingState::new(
         resize_tx,
         touch_tx,
@@ -463,12 +464,14 @@ async fn main() -> Result<()> {
     // Buffers the encoder thread has finished with, recycled into render()
     // instead of allocating a fresh ~8MB framebuffer every frame.
     let mut spare_buffers: Vec<Vec<u8>> = Vec::new();
-    // Ticks since the last actual render+encode. Bounds how stale the stream
-    // can get on an unchanging screen: even with nothing dirty, force a
-    // render every `keyframe_interval` ticks so a fresh keyframe still goes
-    // out periodically (decoder resync after loss) rather than only once at
-    // stream start.
+    // Ticks since the last successful render+encode. When this reaches
+    // `keyframe_interval` with no damage, `keyframe_pending` is set instead
+    // of rendering unchanged content -- the keyframe is deferred to the next
+    // actual changed frame rather than wasting bandwidth encoding stale pixels.
     let mut ticks_since_render = 0u32;
+    // Set when `keyframe_interval` ticks elapse with nothing sent. Cleared
+    // (after sending ForceKeyframe) on the next real content frame.
+    let mut keyframe_pending = false;
     // Total frames lost to `frame_sender.try_send` finding the encoder queue
     // full (capacity 4). Expected as backpressure when the encoder lags, but
     // worth surfacing -- otherwise dropped frames look identical to a pacing
@@ -559,8 +562,22 @@ async fn main() -> Result<()> {
             // forced render makes its value moot.
             let screen_dirty = state.take_dirty();
             let new_client = force_render.swap(false, Ordering::Relaxed);
-            let stale = ticks_since_render >= keyframe_interval;
-            if screen_dirty || new_client || stale {
+
+            // Once the screen has been idle for a full keyframe interval, mark
+            // the next real frame as a keyframe instead of encoding unchanged
+            // content just to hit the periodic IDR cadence.
+            if ticks_since_render >= keyframe_interval {
+                keyframe_pending = true;
+            }
+
+            if screen_dirty || new_client {
+                if keyframe_pending {
+                    // new_client: server.rs already sent ForceKeyframe when
+                    // the client connected, so this is a no-op there but
+                    // harmless to send twice.
+                    let _ = encoder_control_for_loop.try_send(EncoderControl::ForceKeyframe);
+                    keyframe_pending = false;
+                }
                 if let Some(captured_frame) = compositor_backend.render(&mut state, spare_buffers.pop()) {
                     // Send frame to encoder (non-blocking)
                     match frame_sender.try_send(captured_frame) {
