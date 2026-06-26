@@ -800,6 +800,34 @@ fn create_vaapi_encoder(config: &EncoderConfig, frames_ref: *mut ffi::AVBufferRe
 mod tests {
     use super::*;
 
+    fn vaapi_available() -> bool {
+        if std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/dri/renderD128")
+            .is_err()
+        {
+            return false;
+        }
+        ffmpeg::init().ok();
+        match create_device("/dev/dri/renderD128") {
+            Ok(mut dev) => {
+                unsafe { ffi::av_buffer_unref(&mut dev) };
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    macro_rules! require_vaapi {
+        () => {
+            if !vaapi_available() {
+                eprintln!("skipping: no VAAPI-capable render node with H264 encode support at /dev/dri/renderD128");
+                return;
+            }
+        };
+    }
+
     // Some VAAPI drivers refuse to encode below a minimum size (e.g. one
     // tested GPU rejected 64x64 with "Hardware does not support encoding at
     // size 64x64 (constraints: width 128-4096 height 128-4096)") -- 256 is
@@ -912,12 +940,11 @@ mod tests {
     /// exit, since glibc detects it lazily). Fixed in `create_vaapi_encoder`
     /// by taking a fresh `av_buffer_ref` for the encoder instead of
     /// transferring the original.
-    /// `#[ignore]`d by default since it needs a real VAAPI-capable render
-    /// node (`vainfo` showing H264 EncSlice) -- run with
-    /// `cargo test --lib vaapi:: -- --ignored` on hardware that has one.
+    /// Skipped gracefully when no VAAPI-capable render node is available
+    /// (requires `vainfo` showing H264 EncSlice).
     #[test]
-    #[ignore = "needs a real VAAPI render node with H264 encode support"]
     fn construct_submit_drop_does_not_corrupt_heap() {
+        require_vaapi!();
         ffmpeg::init().unwrap();
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut encoder = make_encoder(tx, 30);
@@ -939,8 +966,8 @@ mod tests {
     /// mechanism available, not a belt-and-suspenders addition to it. This
     /// proves that alone is sufficient.
     #[test]
-    #[ignore = "needs a real VAAPI render node with H264 encode support"]
     fn force_keyframe_actually_forces_an_idr() {
+        require_vaapi!();
         ffmpeg::init().unwrap();
         let (tx, _rx) = std::sync::mpsc::channel();
         // Large enough that nothing here crosses a natural GOP boundary on
@@ -984,8 +1011,8 @@ mod tests {
     /// A resize that doesn't also corrupt anything, followed by a normal
     /// frame at the new size, is the real regression coverage for that fix.
     #[test]
-    #[ignore = "needs a real VAAPI render node with H264 encode support"]
     fn resize_reinitializes_encoder_without_corruption() {
+        require_vaapi!();
         ffmpeg::init().unwrap();
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut encoder = make_encoder(tx, 1000);
@@ -1027,8 +1054,8 @@ mod tests {
     /// part (shared fallback flag, `GlCompositor` producing `Gpu` frames,
     /// `scale_vaapi` wiring) before investing in the full integration.
     #[test]
-    #[ignore = "needs a real VAAPI render node with H264 encode support"]
     fn dmabuf_can_be_mapped_into_a_vaapi_surface() {
+        require_vaapi!();
         use smithay::backend::allocator::{
             dmabuf::AsDmabuf,
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
@@ -1196,8 +1223,8 @@ mod tests {
     /// still work the same way they do on the `Cpu` path (tagging the frame,
     /// not a `forced_idr` AVOption -- see that test's doc comment).
     #[test]
-    #[ignore = "needs a real VAAPI render node with H264 encode support"]
     fn gpu_frame_zero_copy_path_encodes_and_forces_keyframe() {
+        require_vaapi!();
         ffmpeg::init().unwrap();
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut encoder = make_gpu_encoder(tx, 1000);
@@ -1234,8 +1261,8 @@ mod tests {
     /// the same underlying buffer -- this is exercising that churn, not
     /// surface reuse).
     #[test]
-    #[ignore = "needs a real VAAPI render node with H264 encode support"]
     fn same_dmabuf_can_be_mapped_repeatedly() {
+        require_vaapi!();
         ffmpeg::init().unwrap();
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut encoder = make_gpu_encoder(tx, 1000);
@@ -1259,8 +1286,8 @@ mod tests {
     /// that doesn't corrupt anything, followed by a normal frame at the new
     /// size, is the regression coverage for that rebuild path.
     #[test]
-    #[ignore = "needs a real VAAPI render node with H264 encode support"]
     fn gpu_path_resize_reinitializes_encoder_without_corruption() {
+        require_vaapi!();
         ffmpeg::init().unwrap();
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut encoder = make_gpu_encoder(tx, 1000);
