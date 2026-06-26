@@ -60,6 +60,7 @@ class FakeAudioDecoder {
       numberOfChannels: 2,
       numberOfFrames: 960,
       sampleRate: 48_000,
+      format: 'f32-planar' as AudioSampleFormat,
       copyTo: vi.fn(),
       close: vi.fn(),
     } as unknown as AudioData;

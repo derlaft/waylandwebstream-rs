@@ -129,7 +129,7 @@ export class AudioStream {
 
     for (let ch = 0; ch < audioData.numberOfChannels; ch++) {
       const channelData = buffer.getChannelData(ch);
-      audioData.copyTo(channelData, { planeIndex: ch });
+      audioData.copyTo(channelData, { planeIndex: ch, format: 'f32-planar' });
     }
     audioData.close();
 
