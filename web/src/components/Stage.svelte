@@ -28,7 +28,7 @@
   function applyCursor(update: CursorUpdate): void {
     switch (update.kind) {
       case 'default':
-        cursorCss = 'auto';
+        cursorCss = 'none';
         break;
       case 'hidden':
         cursorCss = 'none';
