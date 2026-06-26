@@ -810,13 +810,55 @@ mod tests {
             return false;
         }
         ffmpeg::init().ok();
-        match create_device("/dev/dri/renderD128") {
-            Ok(mut dev) => {
-                unsafe { ffi::av_buffer_unref(&mut dev) };
-                true
-            }
-            Err(_) => false,
+        // Opening the device is necessary but not sufficient: a render node
+        // can be perfectly valid for GL/compositing yet have no H.264 encode
+        // profile exposed to VAAPI, in which case `h264_vaapi` opens fine
+        // and then immediately fails with "No usable encoding profile found"
+        // (the actual symptom on hardware that can composite but not HW-
+        // encode). The skip probe has to drive the full encoder-open path,
+        // not just av_hwdevice_ctx_create, or the tests that need encode
+        // support bail out at `VaapiEncoder::new` instead of being skipped.
+        let mut device_ref = match create_device("/dev/dri/renderD128") {
+            Ok(dev) => dev,
+            Err(_) => return false,
+        };
+
+        let frames_ref = unsafe { ffi::av_hwframe_ctx_alloc(device_ref) };
+        if frames_ref.is_null() {
+            unsafe { ffi::av_buffer_unref(&mut device_ref) };
+            return false;
         }
+        unsafe {
+            let ctx = (*frames_ref).data as *mut ffi::AVHWFramesContext;
+            (*ctx).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+            (*ctx).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+            (*ctx).width = TEST_SIZE as i32;
+            (*ctx).height = TEST_SIZE as i32;
+        }
+        let init_ret = unsafe { ffi::av_hwframe_ctx_init(frames_ref) };
+        if init_ret < 0 {
+            let mut frames_ref = frames_ref;
+            unsafe { ffi::av_buffer_unref(&mut frames_ref) };
+            unsafe { ffi::av_buffer_unref(&mut device_ref) };
+            return false;
+        }
+
+        let probe_config = EncoderConfig {
+            width: TEST_SIZE,
+            height: TEST_SIZE,
+            framerate: 30,
+            rate_control: RateControl::Bitrate(500_000),
+            keyframe_interval: 60,
+            encoder_backend: super::super::EncoderBackend::Vaapi,
+            vaapi_device: "/dev/dri/renderD128".to_string(),
+            gpu_frames: false,
+        };
+        let result = create_vaapi_encoder(&probe_config, frames_ref).is_ok();
+
+        let mut frames_ref = frames_ref;
+        unsafe { ffi::av_buffer_unref(&mut frames_ref) };
+        unsafe { ffi::av_buffer_unref(&mut device_ref) };
+        result
     }
 
     macro_rules! require_vaapi {
