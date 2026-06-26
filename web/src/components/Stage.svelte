@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
+  import { AudioStream } from '../lib/audio';
   import { ControlChannel } from '../lib/control';
   import { attachInput } from '../lib/input';
   import type { ClientMessage } from '../lib/protocol';
@@ -10,6 +11,7 @@
 
   let control: ControlChannel | null = null;
   let stream: VideoStream | null = null;
+  let audio: AudioStream | null = null;
   let viewport: Viewport | null = null;
   let detachInput: (() => void) | null = null;
 
@@ -24,6 +26,8 @@
     viewport = null;
     stream?.close();
     stream = null;
+    audio?.close();
+    audio = null;
     control?.close();
     control = null;
   }
@@ -34,6 +38,9 @@
 
     stream = new VideoStream({ canvas, sendControl });
     stream.connect();
+
+    audio = new AudioStream();
+    audio.connect();
 
     viewport = new Viewport({ canvas, sendControl });
     viewport.start();

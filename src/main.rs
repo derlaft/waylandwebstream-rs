@@ -11,6 +11,7 @@ use tracing::{info, warn, debug, Level};
 use tracing_subscriber::FmtSubscriber;
 
 mod adaptive_bitrate;
+mod audio;
 mod compositor;
 mod config;
 mod encoder;
@@ -332,6 +333,19 @@ async fn main() -> Result<()> {
     // watching never runs it.
     let session = SessionManager::new(config.command.clone(), config.display_name.clone(), session_shutdown_tx);
 
+    // Start audio capture: PipeWire loopback virtual sink + Opus encoding.
+    // Runs on a dedicated OS thread; the broadcast sender is consumed by /audio WS clients.
+    let audio_tx = match audio::spawn_audio_capture() {
+        Ok(tx) => {
+            info!("Audio capture started (PipeWire loopback + Opus 96 kbps)");
+            Some(tx)
+        }
+        Err(e) => {
+            warn!("Audio capture failed to start ({e:#}); /audio endpoint will be unavailable");
+            None
+        }
+    };
+
     // Create signaling state and server
     let signaling_state = SignalingState::new(
         resize_tx,
@@ -347,6 +361,7 @@ async fn main() -> Result<()> {
         codec_rx,
         shutdown_rx.clone(),
         session.clone(),
+        audio_tx,
     );
     let video_tx = signaling_state.get_video_sender();
     let signaling_server = SignalingServer::new(signaling_state);

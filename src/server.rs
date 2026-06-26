@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::adaptive_bitrate::BitrateEvent;
+use crate::audio::AudioPacket;
 use crate::encoder::{EncodedPacket, EncoderControl};
 use crate::input::keyboard::KeyboardEvent;
 use crate::input::mouse::MouseEvent;
@@ -200,6 +201,9 @@ pub struct SignalingState {
     /// tokio's: the critical section is a single comparison/store, never
     /// held across an `.await`.
     last_keyframe_force: Arc<Mutex<Instant>>,
+    /// Broadcasts Opus-encoded audio packets to `/audio` WebSocket clients.
+    /// `None` when the PipeWire audio capture failed to start at launch.
+    audio_tx: Option<broadcast::Sender<AudioPacket>>,
 }
 
 impl SignalingState {
@@ -217,6 +221,7 @@ impl SignalingState {
         codec_rx: watch::Receiver<String>,
         shutdown_rx: watch::Receiver<bool>,
         session: SessionManager,
+        audio_tx: Option<broadcast::Sender<AudioPacket>>,
     ) -> Self {
         let (video_tx, _) = broadcast::channel(3);
         // Backdated so the very first `RequestKeyframe` after startup is
@@ -240,6 +245,7 @@ impl SignalingState {
             shutdown_rx,
             session,
             last_keyframe_force: Arc::new(Mutex::new(last_keyframe_force)),
+            audio_tx,
         }
     }
 
@@ -261,6 +267,7 @@ impl SignalingServer {
             .route("/", get(serve_index))
             .route("/ws", get(handle_websocket))
             .route("/stream", get(handle_video_stream))
+            .route("/audio", get(handle_audio_stream))
             .fallback(serve_asset)
             .layer(TraceLayer::new_for_http())
             .with_state(state);
@@ -563,6 +570,74 @@ async fn video_stream_handler(socket: WebSocket, state: SignalingState) {
     info!("Video stream client disconnected");
 }
 
+/// Handle the Opus audio WebSocket (`/audio`).
+///
+/// Wire format per message (binary):
+/// ```text
+/// bytes 0-7  : pts_us (u64, big-endian) — presentation timestamp in microseconds
+/// bytes 8..  : raw Opus packet (one 20 ms frame)
+/// ```
+async fn handle_audio_stream(
+    ws: WebSocketUpgrade,
+    State(state): State<SignalingState>,
+) -> Response {
+    ws.on_upgrade(move |socket| audio_stream_handler(socket, state))
+}
+
+async fn audio_stream_handler(socket: WebSocket, state: SignalingState) {
+    let Some(ref audio_tx) = state.audio_tx else {
+        // Audio capture is not available; close immediately with a normal close code.
+        let (mut sender, _) = socket.split();
+        let _ = sender
+            .send(Message::Close(Some(CloseFrame {
+                code: close_code::NORMAL,
+                reason: "audio capture not available".into(),
+            })))
+            .await;
+        return;
+    };
+
+    info!("Audio stream client connected");
+    let (mut sender, _receiver) = socket.split();
+    let mut audio_rx = audio_tx.subscribe();
+    let mut shutdown_rx = state.shutdown_rx.clone();
+
+    loop {
+        tokio::select! {
+            packet = audio_rx.recv() => {
+                let packet = match packet {
+                    Ok(p) => p,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("Audio stream client lagging, skipped {} packet(s)", n);
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                let frame = encode_audio_frame(&packet);
+                if sender.send(Message::Binary(frame)).await.is_err() {
+                    break;
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                let _ = sender.send(Message::Close(Some(CloseFrame {
+                    code: close_code::AWAY,
+                    reason: "server shutting down".into(),
+                }))).await;
+                break;
+            }
+        }
+    }
+
+    info!("Audio stream client disconnected");
+}
+
+fn encode_audio_frame(packet: &AudioPacket) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 + packet.data.len());
+    buf.extend_from_slice(&packet.pts_us.to_be_bytes());
+    buf.extend_from_slice(&packet.data);
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,6 +722,7 @@ mod tests {
             codec_rx,
             shutdown_rx,
             SessionManager::new(Vec::new(), String::new(), shutdown_tx),
+            None,
         );
         let video_tx = state.get_video_sender();
         let server = SignalingServer::new(state);

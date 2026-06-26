@@ -115,3 +115,17 @@ export const DECODER_CONFIG: VideoDecoderConfig = {
   codec: 'avc1.42E01F',
   optimizeForLatency: true,
 };
+
+/// `/audio` binary frame format, one WebSocket message per Opus packet (20 ms):
+///   bytes 0-7  : pts_us (u64, big-endian) — presentation timestamp in microseconds
+///   bytes 8..  : raw Opus packet
+export const AUDIO_FRAME_HEADER_BYTES = 8;
+
+export function parseAudioPts(buf: ArrayBuffer): number {
+  const view = new DataView(buf);
+  // JS numbers can exactly represent integers up to 2^53; PTS values for
+  // audio (microseconds from stream start) stay well within that range.
+  const high = view.getUint32(0, false);
+  const low = view.getUint32(4, false);
+  return high * 2 ** 32 + low;
+}
