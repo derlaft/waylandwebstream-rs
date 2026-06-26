@@ -22,3 +22,8 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
+
+# Wayland client + standard protocols. Phase 4 needs xdg-shell; later
+# phases add wl_shm, wp_* etc.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
