@@ -676,7 +676,7 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
-                let frame = encode_unified_video_frame(&packet);
+                let frame = encode_unified_video_frame(packet);
                 if sender.send(Message::Binary(frame)).await.is_err() {
                     break;
                 }
@@ -690,7 +690,7 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
-                let frame = encode_unified_audio_frame(&packet);
+                let frame = encode_unified_audio_frame(packet);
                 if sender.send(Message::Binary(frame)).await.is_err() {
                     break;
                 }
@@ -761,7 +761,11 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
 /// `is_keyframe` and `has_ping_echo` are carried in the header `flags`
 /// byte, not inline -- saving the two flag bytes the legacy `/stream`
 /// format uses.
-fn encode_unified_video_frame(packet: &EncodedPacket) -> Vec<u8> {
+///
+/// Takes the packet by ownership so the H.264 buffer can be moved into the
+/// framed message with `Vec::append` (no extra allocation or copy beyond
+/// the single `memcpy` a contiguous wire buffer inevitably requires).
+fn encode_unified_video_frame(mut packet: EncodedPacket) -> Vec<u8> {
     let mut flags = 0u8;
     if packet.is_keyframe {
         flags |= proto::FLAG_KEYFRAME;
@@ -770,14 +774,19 @@ fn encode_unified_video_frame(packet: &EncodedPacket) -> Vec<u8> {
         flags |= proto::FLAG_HAS_PING;
     }
 
-    let mut payload = Vec::with_capacity(20 + packet.data.len());
-    payload.extend_from_slice(&packet.frame_id.to_be_bytes());
+    let payload_len = 20 + packet.data.len();
+    let mut buf = Vec::with_capacity(proto::HEADER_LEN + payload_len);
+    buf.push(proto::MSG_VIDEO_FRAME);
+    buf.push(flags);
+    buf.push(0);
+    buf.push(0);
+    buf.extend_from_slice(&(payload_len as u32).to_le_bytes());
+    buf.extend_from_slice(&packet.frame_id.to_be_bytes());
     let ping_val = packet.ping_echo_client_ts.unwrap_or(0.0);
-    payload.extend_from_slice(&ping_val.to_be_bytes());
-    payload.extend_from_slice(&packet.capture_to_encode_ms.to_be_bytes());
-    payload.extend_from_slice(&packet.data);
-
-    proto::encode_msg(proto::MSG_VIDEO_FRAME, flags, &payload)
+    buf.extend_from_slice(&ping_val.to_be_bytes());
+    buf.extend_from_slice(&packet.capture_to_encode_ms.to_be_bytes());
+    buf.append(&mut packet.data);
+    buf
 }
 
 /// Wire layout for a unified `MSG_AUDIO_FRAME` payload:
@@ -786,12 +795,19 @@ fn encode_unified_video_frame(packet: &EncodedPacket) -> Vec<u8> {
 /// bytes 8.. : raw Opus packet
 /// ```
 /// Identical to the legacy `/audio` wire format, just wrapped in the
-/// shared header.
-fn encode_unified_audio_frame(packet: &AudioPacket) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(8 + packet.data.len());
-    payload.extend_from_slice(&packet.pts_us.to_be_bytes());
-    payload.extend_from_slice(&packet.data);
-    proto::encode_msg(proto::MSG_AUDIO_FRAME, 0, &payload)
+/// shared header. Takes ownership for the same zero-copy reason as
+/// `encode_unified_video_frame`.
+fn encode_unified_audio_frame(mut packet: AudioPacket) -> Vec<u8> {
+    let payload_len = 8 + packet.data.len();
+    let mut buf = Vec::with_capacity(proto::HEADER_LEN + payload_len);
+    buf.push(proto::MSG_AUDIO_FRAME);
+    buf.push(0);
+    buf.push(0);
+    buf.push(0);
+    buf.extend_from_slice(&(payload_len as u32).to_le_bytes());
+    buf.extend_from_slice(&packet.pts_us.to_be_bytes());
+    buf.append(&mut packet.data);
+    buf
 }
 
 fn encode_unified_control(msg: &ServerMessage) -> Vec<u8> {
@@ -1400,5 +1416,126 @@ mod tests {
             SignalingMessage::Ping { client_ts } => assert!((client_ts - 12.5).abs() < 1e-9),
             other => panic!("expected Ping, got {:?}", other),
         }
+    }
+
+    fn test_packet(data: Vec<u8>, is_keyframe: bool, frame_id: u32) -> EncodedPacket {
+        EncodedPacket {
+            data,
+            is_keyframe,
+            frame_id,
+            capture_to_encode_ms: 0.0,
+            encoding_ms: 0.0,
+            encode_complete: std::time::Instant::now(),
+            ping_echo_client_ts: None,
+        }
+    }
+
+    /// Thread-local allocation counter used to verify the hot-path encoders
+    /// allocate exactly once per frame. The original implementation built
+    /// an intermediate payload `Vec` (second alloc) and called
+    /// `extend_from_slice(&packet.data)` -- a redundant large memcpy of
+    /// the H.264 bytes -- before wrapping that into the framed message.
+    /// This counter fails if either regression comes back.
+    ///
+    /// `thread_local!` (rather than a global atomic) is essential here:
+    /// `cargo test` runs tests on a thread pool, and a global counter
+    /// would be incremented by allocations from concurrently-running tests
+    /// while our closure is in flight, producing spurious counts.
+    mod alloc_counter {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static ALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
+        }
+
+        pub struct CountingAllocator;
+
+        unsafe impl GlobalAlloc for CountingAllocator {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                ALLOC_COUNT.with(|c| c.set(c.get() + 1));
+                System.alloc(layout)
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                System.dealloc(ptr, layout)
+            }
+        }
+
+        #[global_allocator]
+        static GLOBAL: CountingAllocator = CountingAllocator;
+
+        pub fn delta<F: FnOnce()>(f: F) -> usize {
+            let before = ALLOC_COUNT.with(|c| c.get());
+            f();
+            let after = ALLOC_COUNT.with(|c| c.get());
+            after - before
+        }
+
+        /// Same as `delta` but returns the closure's value alongside the
+        /// allocation count. Useful when the test needs to assert against
+        /// data produced inside the counted region without doing the byte
+        /// comparison inside it (which would itself allocate).
+        pub fn delta_with<F: FnOnce() -> R, R>(f: F) -> (usize, R) {
+            let before = ALLOC_COUNT.with(|c| c.get());
+            let value = f();
+            let after = ALLOC_COUNT.with(|c| c.get());
+            (after - before, value)
+        }
+    }
+
+    /// Single-allocation guarantee for the per-frame video encoder. A
+    /// regression that reintroduces an intermediate payload Vec (the old
+    /// code's `Vec::with_capacity(20 + N)` + `extend_from_slice(&packet.data)`
+    /// step) would push the count to 2.
+    #[test]
+    fn encode_unified_video_frame_allocates_exactly_once() {
+        // Pre-compute the expected H.264 slice OUTSIDE the alloc-counting
+        // closure: any allocation inside `delta(|| ...)` would be counted
+        // against encode_unified_video_frame. The point of this test is the
+        // helper's allocation count, not byte equality (which is already
+        // covered by `client_endpoint_delivers_video_in_unified_framing`).
+        let expected_h264: Vec<u8> = (0u8..=255).cycle().take(8192).collect();
+        let packet = test_packet(expected_h264.clone(), true, 99);
+
+        let (allocs, framed) = alloc_counter::delta_with(|| {
+            let framed = encode_unified_video_frame(packet);
+            assert_eq!(framed.len(), proto::HEADER_LEN + 20 + 8192);
+            let header: [u8; proto::HEADER_LEN] =
+                framed[..proto::HEADER_LEN].try_into().unwrap();
+            let (msg_type, flags, payload_len) = proto::decode_header(&header);
+            assert_eq!(msg_type, proto::MSG_VIDEO_FRAME);
+            assert_ne!(flags & proto::FLAG_KEYFRAME, 0);
+            assert_eq!(payload_len as usize, 20 + 8192);
+            framed
+        });
+        assert_eq!(&framed[proto::HEADER_LEN + 20..], &expected_h264[..]);
+        assert_eq!(
+            allocs, 1,
+            "encode_unified_video_frame should allocate exactly once (the final Vec); got {allocs}"
+        );
+    }
+
+    /// Same single-allocation guarantee for audio.
+    #[test]
+    fn encode_unified_audio_frame_allocates_exactly_once() {
+        let opus: Vec<u8> = (0u8..=200).collect();
+        let packet = crate::audio::AudioPacket {
+            pts_us: 12345,
+            data: opus,
+        };
+
+        let allocs = alloc_counter::delta(|| {
+            let framed = encode_unified_audio_frame(packet);
+            assert_eq!(framed.len(), proto::HEADER_LEN + 8 + 201);
+            let header: [u8; proto::HEADER_LEN] =
+                framed[..proto::HEADER_LEN].try_into().unwrap();
+            let (msg_type, _flags, payload_len) = proto::decode_header(&header);
+            assert_eq!(msg_type, proto::MSG_AUDIO_FRAME);
+            assert_eq!(payload_len as usize, 8 + 201);
+        });
+        assert_eq!(
+            allocs, 1,
+            "encode_unified_audio_frame should allocate exactly once; got {allocs}"
+        );
     }
 }
