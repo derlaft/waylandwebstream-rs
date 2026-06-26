@@ -6,10 +6,10 @@
  * the canvas.  The wayland-cursor-client companion process responds to the
  * resulting wl_pointer.enter by calling wl_pointer.set_cursor with a solid-
  * magenta 16×16 surface.  The compositor reads those pixels and pushes a
- * ServerMessage::Cursor message to connected /ws clients; Stage.svelte applies
- * it as a CSS data-URL cursor on the <canvas>.  The test verifies that the
- * canvas cursor style contains `url(` (i.e. a custom data-URL cursor) within
- * a generous timeout.
+ * ServerMessage::Cursor message to connected /ws clients; Stage.svelte decodes
+ * the RGBA pixels and renders them via a positioned <img> overlay (cursor:none
+ * is always set on the canvas and stage so the OS cursor stays hidden).  The
+ * test verifies that the overlay img src is a PNG data URL and is visible.
  *
  * Prints:   RESULT cursor_set=true   on success.
  * Exits 1 on any failure.
@@ -61,15 +61,15 @@ async function run() {
         );
         console.log(`Initial canvas cursor: "${initialCursor}"`);
 
-        // Arm a watcher that checks whether the cursor style has changed to a
-        // data-URL (i.e. a custom surface cursor).  We poll via
-        // requestAnimationFrame rather than MutationObserver because the style
-        // attribute is set imperatively by Svelte, not via classList.
+        // Arm a watcher that checks whether the cursor overlay <img> has been
+        // populated with a PNG data URL (i.e. a surface cursor was received).
+        // The overlay approach keeps canvas.style.cursor as "none" always;
+        // the cursor image lives in the src of .cursor-overlay instead.
         await page.evaluate(() => {
             window.__cursorChanged = false;
             function check() {
-                const cur = document.querySelector('canvas')?.style.cursor ?? '';
-                if (cur.includes('url(')) {
+                const img = document.querySelector('.cursor-overlay');
+                if (img && img.src.includes('data:image/') && img.style.display !== 'none') {
                     window.__cursorChanged = true;
                 } else {
                     requestAnimationFrame(check);
@@ -93,13 +93,16 @@ async function run() {
             timeout: CURSOR_TIMEOUT_MS,
         });
 
-        const finalCursor = await page.evaluate(
-            () => document.querySelector('canvas').style.cursor,
-        );
-        console.log(`Canvas cursor after pointer enter: "${finalCursor.slice(0, 80)}..."`);
+        const overlayInfo = await page.evaluate(() => {
+            const img = document.querySelector('.cursor-overlay');
+            return img
+                ? { src: img.src.slice(0, 80), display: img.style.display }
+                : null;
+        });
+        console.log(`Cursor overlay after pointer enter: ${JSON.stringify(overlayInfo)}`);
 
-        if (!finalCursor.includes('url(')) {
-            throw new Error(`Expected cursor to contain url(, got: ${finalCursor}`);
+        if (!overlayInfo || !overlayInfo.src.includes('data:image/') || overlayInfo.display === 'none') {
+            throw new Error(`Expected cursor overlay to be visible with a PNG src, got: ${JSON.stringify(overlayInfo)}`);
         }
 
         console.log('RESULT cursor_set=true');

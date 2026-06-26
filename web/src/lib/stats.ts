@@ -4,8 +4,17 @@ import { writable } from 'svelte/store';
 
 export type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'closed' | 'error';
 
+export interface CursorDebug {
+  kind: string;         // last received cursor kind
+  count: number;        // total cursor messages received
+  overlayDisplay: string; // current cursorOverlay.style.display
+  overlayTransform: string; // current cursorOverlay.style.transform
+  imgW: number; imgH: number; // overlay dimensions
+}
+
 export interface StreamStats {
   connectionState: ConnectionState;
+  cursorDebug: CursorDebug | null;
   /// Glass-to-glass: ping round-trip (network + whole server pipeline,
   /// measured via the embedded-timestamp ping/echo in stream.ts) plus this
   /// client's own decode time. See `VideoStream.flushDiagnostics`.
@@ -32,6 +41,7 @@ export interface StreamStats {
 
 const initialStats: StreamStats = {
   connectionState: 'connecting',
+  cursorDebug: null,
   endToEndLatencyMs: 0,
   resolution: null,
   arrivalGapAvgMs: 0,
@@ -58,6 +68,10 @@ export function setResolution(width: number, height: number): void {
 
 export function reportEndToEndLatency(ms: number): void {
   streamStats.update((s) => ({ ...s, endToEndLatencyMs: ms }));
+}
+
+export function setCursorDebug(d: CursorDebug): void {
+  streamStats.update((s) => ({ ...s, cursorDebug: d }));
 }
 
 export function setBitrate(bps: number): void {

@@ -2,6 +2,20 @@
   import { streamStats } from '../lib/stats';
 </script>
 
+{#if $streamStats.cursorDebug !== null}
+  {@const c = $streamStats.cursorDebug}
+  <details open class="cursor-debug">
+    <summary>Cursor debug</summary>
+    <dl class="stats">
+      <dt>Messages</dt><dd>{c.count}</dd>
+      <dt>Last kind</dt><dd>{c.kind}</dd>
+      <dt>Overlay display</dt><dd>{c.overlayDisplay || '(empty)'}</dd>
+      <dt>Overlay size</dt><dd>{c.imgW}×{c.imgH}</dd>
+      <dt>Transform</dt><dd class="mono">{c.overlayTransform || '(empty)'}</dd>
+    </dl>
+  </details>
+{/if}
+
 <dl class="stats">
   <dt>Connection</dt>
   <dd>{$streamStats.connectionState}</dd>
@@ -59,5 +73,22 @@
     grid-column: 2;
     text-align: right;
     font-variant-numeric: tabular-nums;
+  }
+
+  .cursor-debug {
+    margin-bottom: 12px;
+  }
+
+  .cursor-debug summary {
+    font-size: 12px;
+    color: #aaa;
+    cursor: pointer;
+    margin-bottom: 6px;
+  }
+
+  .mono {
+    font-family: monospace;
+    font-size: 11px;
+    word-break: break-all;
   }
 </style>

@@ -645,6 +645,7 @@ impl WaylandWebStreamState {
         let Some(pointer) = self.seat.get_pointer() else { return };
         let location = Point::<f64, Logical>::from((x, y));
         let target = self.surface_at(location);
+        tracing::debug!("pointer_motion ({x:.1},{y:.1}): surface={}", target.is_some());
         let time = self.clock.now().as_millis();
         let (focus, event_location) = match target {
             Some((surface, surface_local)) => (Some((surface, Point::from((0.0, 0.0)))), surface_local),
@@ -744,9 +745,18 @@ impl WaylandWebStreamState {
     /// (when a new cursor is set) and from `commit` (for animated cursors).
     fn try_extract_cursor(&mut self) {
         // Clone so we don't hold a borrow on self while calling the methods below.
-        let Some((wl_surface, hotspot)) = self.cursor_surface.clone() else { return };
-        if let Some(pending) = Self::read_cursor_pixels(&wl_surface, hotspot) {
-            self.cursor_pending = Some(pending);
+        let Some((wl_surface, hotspot)) = self.cursor_surface.clone() else {
+            tracing::debug!("try_extract_cursor: no cursor_surface set");
+            return;
+        };
+        match Self::read_cursor_pixels(&wl_surface, hotspot) {
+            Some(pending) => {
+                tracing::debug!("try_extract_cursor: extracted pixels successfully");
+                self.cursor_pending = Some(pending);
+            }
+            None => {
+                tracing::debug!("try_extract_cursor: no buffer yet (will retry on next commit)");
+            }
         }
     }
 
@@ -1062,6 +1072,7 @@ impl smithay::input::SeatHandler for WaylandWebStreamState {
     }
     
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        tracing::debug!("cursor_image: {:?}", image);
         match image {
             CursorImageStatus::Hidden => {
                 self.cursor_surface = None;
@@ -1080,6 +1091,7 @@ impl smithay::input::SeatHandler for WaylandWebStreamState {
                         .map(|d| d.lock().unwrap().hotspot)
                         .unwrap_or_default()
                 });
+                tracing::debug!("cursor_image: Surface with hotspot {:?}", hotspot);
                 self.cursor_surface = Some((wl_surface, hotspot));
                 // Attempt to read pixels immediately; on success, sets
                 // cursor_pending.  If the buffer hasn't been committed yet,
