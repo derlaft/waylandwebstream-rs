@@ -3,11 +3,15 @@
 use anyhow::{Context, Result};
 use smithay::{
     backend::{
-        allocator::{dmabuf::Dmabuf, Buffer as _},
+        allocator::{
+            dmabuf::{Dmabuf, DmabufMappingMode, DmabufSyncFlags},
+            Buffer as _, Fourcc,
+        },
         input::{Axis, AxisSource, ButtonState, KeyState, TouchSlot},
         renderer::{gles::GlesRenderer, utils::with_renderer_surface_state, ImportDma},
     },
-    delegate_compositor, delegate_dmabuf, delegate_keyboard_shortcuts_inhibit, delegate_output,
+    delegate_compositor, delegate_cursor_shape, delegate_dmabuf,
+    delegate_keyboard_shortcuts_inhibit, delegate_output,
     delegate_pointer_constraints, delegate_presentation, delegate_seat, delegate_shm,
     delegate_single_pixel_buffer, delegate_viewporter, delegate_xdg_shell,
     delegate_xdg_toplevel_icon,
@@ -34,7 +38,7 @@ use smithay::{
         compositor::{
             CompositorClientState, CompositorState as SmithayCompositorState, with_states,
         },
-        dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
+        dmabuf::{get_dmabuf, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         output::{OutputManagerState, OutputHandler},
         shell::xdg::{
             XdgShellState, ToplevelSurface,
@@ -45,10 +49,12 @@ use smithay::{
         seat::WaylandFocus,
         pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState},
         presentation::PresentationState,
+        cursor_shape::CursorShapeManagerState,
         keyboard_shortcuts_inhibit::{
             KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState,
             KeyboardShortcutsInhibitor,
         },
+        tablet_manager::TabletSeatHandler,
         xdg_toplevel_icon::{XdgToplevelIconHandler, XdgToplevelIconManager},
     },
 };
@@ -74,6 +80,16 @@ pub enum CursorPending {
     },
 }
 
+impl CursorPending {
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            CursorPending::Hidden => "Hidden",
+            CursorPending::Named(_) => "Named",
+            CursorPending::Surface { .. } => "Surface",
+        }
+    }
+}
+
 pub struct WaylandWebStreamState {
     // Core Smithay states
     pub compositor_state: SmithayCompositorState,
@@ -92,6 +108,8 @@ pub struct WaylandWebStreamState {
     pub keyboard_shortcuts_inhibit_state: KeyboardShortcutsInhibitState,
     #[allow(dead_code)]
     pub xdg_toplevel_icon_manager: XdgToplevelIconManager,
+    #[allow(dead_code)]
+    pub cursor_shape_state: CursorShapeManagerState,
     pub seat_state: SeatState<Self>,
 
     // Desktop management
@@ -163,6 +181,7 @@ impl WaylandWebStreamState {
         let presentation_state = PresentationState::new::<Self>(&dh, 1 /* CLOCK_MONOTONIC */);
         let keyboard_shortcuts_inhibit_state = KeyboardShortcutsInhibitState::new::<Self>(&dh);
         let xdg_toplevel_icon_manager = XdgToplevelIconManager::new::<Self>(&dh);
+        let cursor_shape_state = CursorShapeManagerState::new::<Self>(&dh);
         // Registers the wl_output/xdg-output globals as a side effect; the
         // returned handle itself is never read afterwards.
         OutputManagerState::new_with_xdg_output::<Self>(&dh);
@@ -210,6 +229,7 @@ impl WaylandWebStreamState {
             presentation_state,
             keyboard_shortcuts_inhibit_state,
             xdg_toplevel_icon_manager,
+            cursor_shape_state,
             seat_state,
             space,
             seat,
@@ -744,83 +764,208 @@ impl WaylandWebStreamState {
     /// stores it in `cursor_pending`. Safe to call both from `cursor_image`
     /// (when a new cursor is set) and from `commit` (for animated cursors).
     fn try_extract_cursor(&mut self) {
-        // Clone so we don't hold a borrow on self while calling the methods below.
         let Some((wl_surface, hotspot)) = self.cursor_surface.clone() else {
-            tracing::debug!("try_extract_cursor: no cursor_surface set");
             return;
         };
-        match Self::read_cursor_pixels(&wl_surface, hotspot) {
+        let renderer = self.dmabuf_renderer.clone();
+        match Self::read_cursor_pixels(&wl_surface, hotspot, renderer.as_ref()) {
             Some(pending) => {
-                tracing::debug!("try_extract_cursor: extracted pixels successfully");
+                info!("try_extract_cursor: extracted {:?}", pending.kind_name());
                 self.cursor_pending = Some(pending);
             }
             None => {
-                tracing::debug!("try_extract_cursor: no buffer yet (will retry on next commit)");
+                info!("try_extract_cursor: no buffer yet, will retry on commit");
             }
         }
     }
 
-    /// Reads RGBA pixel data from `wl_surface`'s committed SHM buffer.
+    /// Reads RGBA pixel data from `wl_surface`'s committed buffer (SHM or dmabuf).
     /// Returns `None` if no buffer is committed yet or the format is unsupported.
-    fn read_cursor_pixels(wl_surface: &WlSurface, hotspot: Point<i32, Logical>) -> Option<CursorPending> {
+    fn read_cursor_pixels(
+        wl_surface: &WlSurface,
+        hotspot: Point<i32, Logical>,
+        renderer: Option<&Rc<RefCell<GlesRenderer>>>,
+    ) -> Option<CursorPending> {
         let mut result: Option<CursorPending> = None;
 
-        with_renderer_surface_state(wl_surface, |rstate| {
-            let Some(buffer) = rstate.buffer() else { return };
+        let had_renderer_state = with_renderer_surface_state(wl_surface, |rstate| {
+            let Some(buffer) = rstate.buffer() else {
+                info!("read_cursor_pixels: RendererSurfaceState exists but buffer is None");
+                return;
+            };
 
-            let _ = with_buffer_contents(&**buffer, |ptr, len, data| {
+            // Try SHM first.
+            let shm_result = with_buffer_contents(&**buffer, |ptr, len, data| {
                 let w = data.width as u32;
                 let h = data.height as u32;
                 let stride = data.stride as u32;
                 let offset = data.offset as isize;
 
-                // Only Argb8888 / Xrgb8888 (BGRA in memory on LE) are
-                // common for cursor surfaces. Everything else is skipped.
                 let is_bgra = matches!(
                     data.format,
                     wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888
                 );
-                if !is_bgra {
-                    return;
-                }
+                if !is_bgra { return; }
 
                 let expected = (stride * h) as usize;
-                if (offset as usize).saturating_add(expected) > len {
-                    return;
-                }
+                if (offset as usize).saturating_add(expected) > len { return; }
 
                 let pixels = unsafe {
                     std::slice::from_raw_parts(ptr.offset(offset), expected)
                 };
-
                 let mut rgba = vec![0u8; (w * h * 4) as usize];
                 for y in 0..h {
                     for x in 0..w {
                         let src = (y * stride + x * 4) as usize;
                         let dst = (y * w + x) as usize * 4;
-                        // Argb8888 LE in memory: [B, G, R, A] → RGBA: [R, G, B, A]
-                        rgba[dst]     = pixels[src + 2]; // R
-                        rgba[dst + 1] = pixels[src + 1]; // G
-                        rgba[dst + 2] = pixels[src];     // B
-                        rgba[dst + 3] = if data.format == wl_shm::Format::Xrgb8888 {
-                            255
-                        } else {
-                            pixels[src + 3]
-                        };
+                        rgba[dst]     = pixels[src + 2];
+                        rgba[dst + 1] = pixels[src + 1];
+                        rgba[dst + 2] = pixels[src];
+                        rgba[dst + 3] = if data.format == wl_shm::Format::Xrgb8888 { 255 } else { pixels[src + 3] };
                     }
                 }
-
                 result = Some(CursorPending::Surface {
-                    width: w,
-                    height: h,
-                    hotspot_x: hotspot.x,
-                    hotspot_y: hotspot.y,
+                    width: w, height: h,
+                    hotspot_x: hotspot.x, hotspot_y: hotspot.y,
                     rgba,
                 });
             });
+
+            if matches!(shm_result, Err(smithay::wayland::shm::BufferAccessError::NotManaged)) {
+                // SHM failed — try dmabuf (wlroots uses dmabuf-backed cursor surfaces on GPU hardware).
+                if let Ok(dmabuf) = get_dmabuf(&**buffer) {
+                    result = Self::read_cursor_pixels_dmabuf(dmabuf, hotspot, renderer);
+                }
+            }
         });
 
+        if had_renderer_state.is_none() {
+            info!("read_cursor_pixels: no RendererSurfaceState yet");
+        }
+
         result
+    }
+
+    /// Reads RGBA pixels from a dmabuf cursor surface.
+    /// Tries linear mmap first (fast, works if modifier is LINEAR/Invalid), then falls back
+    /// to GL texture import + readback (works for tiled/vendor-modified dmabufs).
+    fn read_cursor_pixels_dmabuf(
+        dmabuf: &Dmabuf,
+        hotspot: Point<i32, Logical>,
+        renderer: Option<&Rc<RefCell<GlesRenderer>>>,
+    ) -> Option<CursorPending> {
+        use smithay::backend::allocator::Buffer as AllocBuffer;
+        use smithay::backend::renderer::{ExportMem, ImportDma};
+        use smithay::utils::Rectangle;
+
+        let size = dmabuf.size();
+        let w = size.w as u32;
+        let h = size.h as u32;
+        let fourcc = dmabuf.format().code;
+
+        let is_argb = fourcc == Fourcc::Argb8888;
+        let is_xrgb = fourcc == Fourcc::Xrgb8888;
+        if !is_argb && !is_xrgb {
+            info!("read_cursor_pixels_dmabuf: unsupported format {fourcc:?}");
+            return None;
+        }
+
+        // Fast path: linear dmabuf — mmap plane 0 and read stride-based pixels.
+        if !dmabuf.has_modifier() {
+            if let Some(stride) = dmabuf.strides().next() {
+                let _ = dmabuf.sync_plane(0, DmabufSyncFlags::START | DmabufSyncFlags::READ);
+                let map_result = dmabuf.map_plane(0, DmabufMappingMode::READ);
+                let _ = dmabuf.sync_plane(0, DmabufSyncFlags::END | DmabufSyncFlags::READ);
+                if let Ok(mapping) = map_result {
+                    let expected = (stride * h) as usize;
+                    if mapping.length() >= expected {
+                        let pixels = unsafe {
+                            std::slice::from_raw_parts(mapping.ptr() as *const u8, expected)
+                        };
+                        let mut rgba = vec![0u8; (w * h * 4) as usize];
+                        for y in 0..h {
+                            for x in 0..w {
+                                let src = (y * stride + x * 4) as usize;
+                                let dst = (y * w + x) as usize * 4;
+                                rgba[dst]     = pixels[src + 2];
+                                rgba[dst + 1] = pixels[src + 1];
+                                rgba[dst + 2] = pixels[src];
+                                rgba[dst + 3] = if is_xrgb { 255 } else { pixels[src + 3] };
+                            }
+                        }
+                        return Some(CursorPending::Surface {
+                            width: w, height: h,
+                            hotspot_x: hotspot.x, hotspot_y: hotspot.y,
+                            rgba,
+                        });
+                    }
+                }
+                info!("read_cursor_pixels_dmabuf: linear mmap failed, trying GL readback");
+            }
+        }
+
+        // GL readback path: import the dmabuf as an EGL image → GL texture → readback.
+        // Works for tiled modifiers that can't be stride-mmap'd.
+        let Some(renderer) = renderer else {
+            info!("read_cursor_pixels_dmabuf: no GL renderer available for tiled dmabuf");
+            return None;
+        };
+
+        let mut rend = match renderer.try_borrow_mut() {
+            Ok(r) => r,
+            Err(_) => {
+                info!("read_cursor_pixels_dmabuf: renderer already borrowed");
+                return None;
+            }
+        };
+
+        let texture = match rend.import_dmabuf(dmabuf, None) {
+            Ok(t) => t,
+            Err(e) => {
+                info!("read_cursor_pixels_dmabuf: import_dmabuf failed: {e:?}");
+                return None;
+            }
+        };
+
+        // Check if this texture can be attached to an FBO for readback
+        // (external GL textures from OES_EGL_image_external cannot).
+        match rend.can_read_texture(&texture) {
+            Ok(false) | Err(_) => {
+                info!("read_cursor_pixels_dmabuf: texture not readable (likely external OES texture)");
+                return None;
+            }
+            Ok(true) => {}
+        }
+
+        let region = Rectangle::from_size((w as i32, h as i32).into());
+        // Abgr8888 = GL_RGBA/UNSIGNED_BYTE = R,G,B,A bytes — no post-swap needed.
+        let mapping = match rend.copy_texture(&texture, region, Fourcc::Abgr8888) {
+            Ok(m) => m,
+            Err(e) => {
+                info!("read_cursor_pixels_dmabuf: copy_texture failed: {e:?}");
+                return None;
+            }
+        };
+
+        let raw = match rend.map_texture(&mapping) {
+            Ok(b) => b,
+            Err(e) => {
+                info!("read_cursor_pixels_dmabuf: map_texture failed: {e:?}");
+                return None;
+            }
+        };
+
+        // The dmabuf has top-down pixel order (Wayland convention). GL imports
+        // it with y-flip baked in (row 0 → t=0 = FBO bottom), so glReadPixels
+        // starting at y=0 returns dmabuf row 0 = visual top. Data is already
+        // top-down — no flip needed.
+        let rgba = raw.to_vec();
+
+        Some(CursorPending::Surface {
+            width: w, height: h,
+            hotspot_x: hotspot.x, hotspot_y: hotspot.y,
+            rgba,
+        })
     }
 
     pub fn send_frames(&mut self) {
@@ -858,6 +1003,7 @@ delegate_pointer_constraints!(WaylandWebStreamState);
 delegate_presentation!(WaylandWebStreamState);
 delegate_keyboard_shortcuts_inhibit!(WaylandWebStreamState);
 delegate_xdg_toplevel_icon!(WaylandWebStreamState);
+delegate_cursor_shape!(WaylandWebStreamState);
 
 // XDG Shell handler for window management
 impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
@@ -943,6 +1089,7 @@ impl smithay::wayland::compositor::CompositorHandler for WaylandWebStreamState {
             .map(|(s, _)| s == surface)
             .unwrap_or(false);
         if is_cursor_surface {
+            info!("commit: retrying cursor extraction for cursor surface");
             self.try_extract_cursor();
         }
 
@@ -1072,7 +1219,7 @@ impl smithay::input::SeatHandler for WaylandWebStreamState {
     }
     
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-        tracing::debug!("cursor_image: {:?}", image);
+        info!("cursor_image: {:?}", image);
         match image {
             CursorImageStatus::Hidden => {
                 self.cursor_surface = None;
@@ -1083,7 +1230,6 @@ impl smithay::input::SeatHandler for WaylandWebStreamState {
                 self.cursor_pending = Some(CursorPending::Named(cursor_icon_to_css(icon).to_owned()));
             }
             CursorImageStatus::Surface(wl_surface) => {
-                // Read the hotspot from the surface's compositor user-data.
                 let hotspot = with_states(&wl_surface, |states| {
                     states
                         .data_map
@@ -1091,11 +1237,8 @@ impl smithay::input::SeatHandler for WaylandWebStreamState {
                         .map(|d| d.lock().unwrap().hotspot)
                         .unwrap_or_default()
                 });
-                tracing::debug!("cursor_image: Surface with hotspot {:?}", hotspot);
+                info!("cursor_image: Surface hotspot={:?}", hotspot);
                 self.cursor_surface = Some((wl_surface, hotspot));
-                // Attempt to read pixels immediately; on success, sets
-                // cursor_pending.  If the buffer hasn't been committed yet,
-                // the commit() handler will pick it up later.
                 self.try_extract_cursor();
             }
         }
@@ -1123,6 +1266,8 @@ impl KeyboardShortcutsInhibitHandler for WaylandWebStreamState {
 }
 
 impl XdgToplevelIconHandler for WaylandWebStreamState {}
+
+impl TabletSeatHandler for WaylandWebStreamState {}
 
 // Client state to store per-client data
 pub struct ClientState {

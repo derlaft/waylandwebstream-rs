@@ -58,16 +58,17 @@
       cursorSurfaceActive = false;
       cursorOverlay.style.display = 'none';
       // named  → native cursor with the requested CSS name
-      // hidden → hide cursor (app explicitly asked for no cursor)
-      // default → show native cursor (no surface provided; nested compositors
-      //           like labwc render the cursor into their own frame, so we
-      //           must not hide the native cursor or the user sees nothing)
+      // hidden → app explicitly hid the cursor
+      // default → hide as well: labwc renders cursor in its own frame via
+      //   software compositing (wlr_scene), so it never calls set_cursor on
+      //   the parent; the cursor IS visible in the video stream. Showing the
+      //   native browser cursor on top just creates a double-cursor, and
+      //   hiding it lets GIMP/labwc cursor-hide requests (nil set_cursor) work
+      //   correctly because the browser cursor is already gone.
       if (update.kind === 'named') {
         canvas.style.cursor = update.name;
-      } else if (update.kind === 'hidden') {
-        canvas.style.cursor = 'none';
       } else {
-        canvas.style.cursor = 'auto';
+        canvas.style.cursor = 'none';
       }
     }
     setCursorDebug({
