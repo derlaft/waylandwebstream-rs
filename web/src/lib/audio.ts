@@ -6,6 +6,12 @@
 //
 // Reconnect behavior mirrors VideoStream: exponential back-off, full state
 // reset on reconnect, no reconnect when close() is called intentionally.
+//
+// AudioContext lifecycle: deferred until the first user gesture (pointerdown
+// or keydown).  Creating it then guarantees it starts in 'running' state
+// with no autoplay warning.  Opus packets that arrive before the first
+// gesture are silently dropped — a non-issue in practice because the user
+// has to interact with the page to control the remote desktop.
 
 import { nextBackoffDelayMs } from './backoff';
 import { AUDIO_FRAME_HEADER_BYTES, parseAudioPts } from './protocol';
@@ -27,26 +33,14 @@ export class AudioStream {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private closedByCaller = false;
 
-  // Listeners added to fire AudioContext.resume() on the first user gesture.
-  // Needed because AudioContext created without a user gesture starts
-  // suspended, and resume() from an async context (e.g. ws.onopen) is
-  // rejected silently by Chrome's autoplay policy.
+  // Capture-phase gesture listeners that create the AudioContext on first
+  // interaction. Stored so they can be cleaned up on close().
   private gestureHandlers: Array<[string, EventListener]> = [];
 
   connect(): void {
     this.closedByCaller = false;
-    this.audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
-    // Reset scheduled time when context transitions from suspended to running
-    // so stale future timestamps accumulated during suspension don't cause a
-    // multi-second delay before audio starts.
-    this.audioCtx.addEventListener('statechange', () => {
-      if (this.audioCtx?.state === 'running') {
-        this.nextPlayTime = 0;
-      }
-    });
-    this.setupDecoder();
     this.connectSocket();
-    this.installGestureResume();
+    this.installGestureCreate();
   }
 
   close(): void {
@@ -63,20 +57,25 @@ export class AudioStream {
     this.decoder = null;
     this.audioCtx?.close();
     this.audioCtx = null;
-    this.removeGestureResume();
+    this.removeGestureHandlers();
   }
 
-  // Registers pointerdown/keydown listeners that call AudioContext.resume()
-  // on the first user gesture. Chrome requires resume() to be called from
-  // within a user gesture handler; calling it from ws.onopen (async, no
-  // gesture context) is silently rejected.
-  private installGestureResume(): void {
-    const ctx = this.audioCtx;
-    if (!ctx) return;
+  // Called once on first user gesture: creates AudioContext (which starts in
+  // 'running' state when created inside a gesture handler) and AudioDecoder.
+  private installGestureCreate(): void {
     const handler = () => {
-      ctx.resume()
-        .then(() => this.removeGestureResume())
-        .catch(() => { /* ignore: will retry on next gesture */ });
+      if (this.audioCtx) return; // Already initialised by a prior gesture
+      this.audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+      // Defensive: if the context is later suspended (browser background
+      // policy) and then resumed, reset nextPlayTime so we don't schedule
+      // frames seconds in the past.
+      this.audioCtx.addEventListener('statechange', () => {
+        if (this.audioCtx?.state === 'running') {
+          this.nextPlayTime = 0;
+        }
+      });
+      this.setupDecoder();
+      this.removeGestureHandlers();
     };
     const handlers: Array<[string, EventListener]> = [
       ['pointerdown', handler as EventListener],
@@ -88,7 +87,7 @@ export class AudioStream {
     this.gestureHandlers = handlers;
   }
 
-  private removeGestureResume(): void {
+  private removeGestureHandlers(): void {
     for (const [type, h] of this.gestureHandlers) {
       document.removeEventListener(type, h, { capture: true });
     }
@@ -129,12 +128,15 @@ export class AudioStream {
 
     for (let ch = 0; ch < audioData.numberOfChannels; ch++) {
       const channelData = buffer.getChannelData(ch);
+      // Specify f32-planar so the browser deinterleaves into the per-channel
+      // Float32Array; without this, interleaved f32 AudioData would try to
+      // copy all channels into a single-channel buffer and throw RangeError.
       audioData.copyTo(channelData, { planeIndex: ch, format: 'f32-planar' });
     }
     audioData.close();
 
     // Gapless precision scheduling: each buffer starts right after the previous
-    // one.  If we've fallen behind (e.g. reconnect or context resume after
+    // one.  If we've fallen behind (e.g. reconnect or context-resume after
     // suspension), snap to now + lookahead so we don't schedule in the past.
     const startAt = Math.max(ctx.currentTime + SCHEDULE_AHEAD_S, this.nextPlayTime);
     this.nextPlayTime = startAt + buffer.duration;
@@ -153,15 +155,13 @@ export class AudioStream {
     ws.binaryType = 'arraybuffer';
     ws.onopen = () => {
       this.reconnectAttempt = 0;
-      // Snap play cursor to "now" on fresh connection to avoid carrying over
-      // stale scheduling from a previous session.
       this.nextPlayTime = 0;
     };
     ws.onmessage = (event) => this.onAudioMessage(event.data as ArrayBuffer);
     ws.onerror = (e) => console.error('Audio stream error:', e);
     ws.onclose = (event) => {
       // Server sends this when PipeWire capture failed to start at launch.
-      // Reconnecting won't help -- audio capture is a one-time init.
+      // Reconnecting won't help — audio capture is a one-time init.
       if (event.reason === 'audio capture not available') {
         console.info('Audio capture not available on server; audio disabled.');
         return;
@@ -173,8 +173,12 @@ export class AudioStream {
 
   private scheduleReconnect(): void {
     if (this.closedByCaller) return;
-    // Reset the decoder so stale state from the previous session doesn't carry over.
-    this.recoverDecoder();
+    // Only recover the decoder if the AudioContext already exists (i.e. the
+    // user has already interacted). Before the first gesture, decoder is null
+    // and packets are dropped anyway, so there is nothing to recover.
+    if (this.audioCtx) {
+      this.recoverDecoder();
+    }
     this.nextPlayTime = 0;
     const delay = nextBackoffDelayMs(this.reconnectAttempt);
     this.reconnectAttempt += 1;
@@ -190,8 +194,8 @@ export class AudioStream {
     const data = new Uint8Array(buf, AUDIO_FRAME_HEADER_BYTES);
 
     const chunk = new EncodedAudioChunk({
-      // Opus doesn't have I/P frame distinction; every packet is independently decodable
-      // after the decoder is configured.
+      // Opus doesn't have I/P frame distinction; every packet is independently
+      // decodable after the decoder is configured.
       type: 'key',
       timestamp: pts_us,
       data,
