@@ -1,31 +1,39 @@
-// CLI entry point. Phase 4 wires up the Wayland window on top of Phase 3's
-// transport:
-//   1. spawn the Wayland display thread (creates the window titled
-//      "waylandwebstream")
-//   2. parse `ws <URL>` from argv, connect the WebSocket transport
-//   3. send `SignalingMessage::Ready`, then `Resize` with the initial size
-//   4. recv frames in a loop, print type/size/keyframe flag, exit on
-//      Ctrl-C or window-close
+// CLI entry point. Phase 5 wires up the SW H.264 decoder + SHM
+// renderer on top of Phase 3's transport and Phase 4's window:
 //
-// Audio decoding, video decoding, rendering, and input forwarding are
-// added in later phases -- see docs/native-client-plan.md Part 4.
+//   1. spawn the Wayland display thread (creates the window titled
+//      "waylandwebstream" + the ShmRenderer that blits frames into it)
+//   2. parse `ws <URL>` from argv, connect the WebSocket transport
+//   3. spawn the H.264 -> ARGB decoder thread; bridge the WS
+//      transport to it via an H.264 packet channel
+//   4. send `SignalingMessage::Ready`, then `Resize` with the initial size
+//   5. recv frames in a loop, forward H.264 packets to the decoder
+//      thread; the decoder feeds the display thread's renderer
+//   6. exit on window-close, transport error, or Ctrl-C
+//
+// Audio decoding and input forwarding land in Phases 6 and 7.
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::{info, warn};
+use std::sync::mpsc;
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod decode;
 mod display;
 mod proto;
+mod render;
 mod transport;
 mod types;
 
+use decode::sw::{spawn_decoder_thread, DecodedFrame};
 use display::spawn_display_thread;
 use transport::{Frame, Transport};
 use types::SignalingMessage;
 
-/// Initial window size. Phase 5+ will resync this to whatever the
-/// compositor assigns via xdg_toplevel::Configure.
+/// Initial window size. Phase 4 waits for the compositor's first
+/// xdg_toplevel Configure so we tell the server a size that matches
+/// what we're actually drawing into. Until then we fall back to this.
 const INITIAL_WINDOW_SIZE: (u32, u32) = (1280, 720);
 
 #[derive(Parser, Debug)]
@@ -53,11 +61,19 @@ async fn main() -> Result<()> {
     let transport_spec = parse_transport(&args.transport)?;
     info!("wws-client starting ({:?})", transport_spec);
 
-    let mut display = spawn_display_thread(INITIAL_WINDOW_SIZE).context("Wayland display")?;
-    // Wait for the compositor's first Configure so we tell the server a
-    // size that matches what we're actually drawing into. Until then we
-    // fall back to INITIAL_WINDOW_SIZE.
-    let initial_size = *display.size_rx.borrow_and_update();
+    // Build both channels up front, then hand each half to its
+    // respective thread. `packet_tx` -> packet_rx feeds H.264 packets
+    // to the decoder; `frame_tx` -> frame_rx feeds decoded frames to
+    // the renderer. Both channels are bounded to 1 so a slow
+    // downstream drops work rather than backpressuring everything.
+    let (packet_tx, packet_rx) = mpsc::sync_channel::<Vec<u8>>(1);
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<DecodedFrame>(1);
+
+    // Display thread first: we want the window up before we start
+    // burning CPU decoding frames into the void.
+    let mut display =
+        spawn_display_thread(INITIAL_WINDOW_SIZE, frame_rx).context("Wayland display")?;
+    let initial_size = *display.size_rx.borrow();
     info!("window initial size: {}x{}", initial_size.0, initial_size.1);
 
     let mut transport = match transport_spec {
@@ -67,6 +83,7 @@ async fn main() -> Result<()> {
     };
     info!("connected; sending Ready + Resize");
 
+    // Handshake.
     let ready = serde_json::to_string(&SignalingMessage::Ready)
         .context("SignalingMessage::Ready always serializes")?;
     transport
@@ -76,12 +93,15 @@ async fn main() -> Result<()> {
     let resize = serde_json::to_string(&SignalingMessage::Resize {
         width: initial_size.0,
         height: initial_size.1,
-    })
-    .context("SignalingMessage::Resize always serializes")?;
-    transport
-        .send(&resize)
-        .await
-        .context("failed to send Resize")?;
+    })?;
+    transport.send(&resize).await?;
+
+    // Spawn the H.264 -> ARGB decoder thread. It reads packet bodies
+    // from `packet_rx` (one H.264 Annex-B NAL unit per message) and
+    // pushes `DecodedFrame`s through `frame_tx` to the display
+    // thread's renderer.
+    let _decoder_join = spawn_decoder_thread(packet_rx, frame_tx);
+    debug!("decoder thread spawned");
 
     loop {
         tokio::select! {
@@ -93,15 +113,14 @@ async fn main() -> Result<()> {
                         break;
                     }
                 };
-                print_frame(&frame);
+                handle_frame(frame, &packet_tx);
             }
             changed = display.size_rx.changed() => {
                 if changed.is_ok() {
                     let (w, h) = *display.size_rx.borrow();
                     info!("window resized to {w}x{h}; notifying server");
                     let resize = serde_json::to_string(&SignalingMessage::Resize {
-                        width: w,
-                        height: h,
+                        width: w, height: h,
                     })?;
                     if let Err(e) = transport.send(&resize).await {
                         warn!("failed to send Resize: {}; exiting", e);
@@ -121,11 +140,42 @@ async fn main() -> Result<()> {
             }
         }
     }
-
-    // The OS will close the socket on exit; the server's broadcast channel
-    // will see the lag and the WS handler will return on its own. A proper
-    // graceful-close handshake lands when input forwarding is added (Phase 7).
     Ok(())
+}
+
+/// Hand a wire frame off to the right consumer. Phase 5 only routes
+/// `VideoFrame` to the decoder thread; `AudioFrame` is logged (Phase
+/// 6 plays it) and `Control` is logged verbatim.
+fn handle_frame(frame: Frame, packet_tx: &mpsc::SyncSender<Vec<u8>>) {
+    match frame {
+        Frame::VideoFrame {
+            is_keyframe,
+            frame_id,
+            ping_echo,
+            data,
+            capture_to_encode_ms,
+        } => {
+            debug!(
+                "VideoFrame id={frame_id} keyframe={is_keyframe} {} bytes (c2e={capture_to_encode_ms:.2}ms)",
+                data.len()
+            );
+            if ping_echo != 0.0 {
+                debug!("  ping_echo_client_ts={ping_echo}");
+            }
+            // `try_send`: if the decoder is behind, drop the frame.
+            // The next keyframe (~1s away) will resync cheaply. Same
+            // policy as the server's broadcast channel (AGENTS.md).
+            if packet_tx.try_send(data).is_err() {
+                debug!("decoder behind; dropping H.264 packet");
+            }
+        }
+        Frame::AudioFrame { pts_us, data } => {
+            debug!("AudioFrame pts={pts_us}us {} bytes (Phase 6 plays it)", data.len());
+        }
+        Frame::Control(msg) => {
+            info!("control: {msg:?}");
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -153,31 +203,5 @@ fn parse_transport(args: &[String]) -> Result<TransportSpec> {
             "unknown transport `{}`; only `ws <URL>` is supported in this phase",
             other
         ),
-    }
-}
-
-fn print_frame(frame: &Frame) {
-    match frame {
-        Frame::VideoFrame {
-            is_keyframe,
-            frame_id,
-            ping_echo,
-            data,
-            capture_to_encode_ms,
-        } => {
-            println!(
-                "VideoFrame id={} keyframe={} {} bytes (capture_to_encode={:.2}ms)",
-                frame_id, is_keyframe, data.len(), capture_to_encode_ms
-            );
-            if *ping_echo != 0.0 {
-                println!("  ping_echo_client_ts={}", ping_echo);
-            }
-        }
-        Frame::AudioFrame { pts_us, data } => {
-            println!("AudioFrame pts={}us {} bytes", pts_us, data.len());
-        }
-        Frame::Control(msg) => {
-            println!("Control: {:?}", msg);
-        }
     }
 }

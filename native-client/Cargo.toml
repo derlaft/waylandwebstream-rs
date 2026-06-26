@@ -33,3 +33,8 @@ wayland-protocols = { version = "0.32", features = ["client"] }
 # a buffer the compositor never shows the window); Phase 5+ replaces
 # this with a real SW decoder-fed renderer.
 libc = "0.2"
+
+# H.264 -> ARGB8888 decoder + swscale for Phase 5. Version pinned to
+# match the server (src/encoder/mod.rs) so the wire format and decoder
+# agree on H.264 profile/level without a separate feature-flag dance.
+ffmpeg-next = "8.1"
