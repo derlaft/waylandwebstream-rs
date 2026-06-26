@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "wayland-test-client"]
+members = [".", "native-client", "wayland-test-client"]
 
 [package]
 name = "waylandwebstream"
