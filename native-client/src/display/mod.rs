@@ -14,13 +14,15 @@
 // async executor entirely.
 
 use anyhow::{Context, Result};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::thread;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 use wayland_client::{
-    protocol::wl_compositor, protocol::wl_registry, protocol::wl_seat, protocol::wl_shm,
-    protocol::wl_surface, Connection, Dispatch, QueueHandle,
+    protocol::wl_buffer, protocol::wl_compositor, protocol::wl_registry, protocol::wl_seat,
+    protocol::wl_shm, protocol::wl_shm_pool, protocol::wl_surface, Connection, Dispatch,
+    QueueHandle,
 };
 use wayland_protocols::xdg::shell::client::xdg_surface as xdg_surface_protocol;
 use wayland_protocols::xdg::shell::client::xdg_toplevel as xdg_toplevel_protocol;
@@ -60,6 +62,81 @@ pub fn spawn_display_thread(initial_size: (u32, u32)) -> Result<DisplayHandle> {
         .context("failed to spawn display thread")?;
 
     Ok(DisplayHandle { size_rx, close_rx })
+}
+
+/// Create a `memfd_create`-backed wl_shm buffer of `width x height`
+/// pixels in `WL_SHM_FORMAT_ARGB8888` filled with solid dark grey,
+/// attach it to `surface`, and damage the entire surface so the
+/// compositor redraws.
+///
+/// Returns the `(pool, buffer, fd)` triple so the caller can stash them
+/// in `DisplayState` -- the buffer's mmap must remain valid until the
+/// compositor sends `wl_buffer::release` (or until the surface is
+/// unmapped). Phase 5 replaces this with a real decoded frame.
+fn attach_placeholder_buffer(
+    surface: &wl_surface::WlSurface,
+    shm: &wl_shm::WlShm,
+    qh: &QueueHandle<DisplayState>,
+    width: u32,
+    height: u32,
+) -> Result<(wl_shm_pool::WlShmPool, wl_buffer::WlBuffer, OwnedFd)> {
+    use std::ffi::CString;
+
+    const BYTES_PER_PIXEL: usize = 4; // WL_SHM_FORMAT_ARGB8888
+    let stride = width as usize * BYTES_PER_PIXEL;
+    let size = stride * height as usize;
+
+    // memfd_create + ftruncate + mmap. We're on Linux (Wayland implies
+    // it); MFD_CLOEXEC so the fd doesn't leak into child processes.
+    let name = CString::new("wws-client-placeholder").unwrap();
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        anyhow::bail!(
+            "memfd_create failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+
+    let ret = unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) };
+    if ret < 0 {
+        anyhow::bail!("ftruncate({size}) failed: {}", std::io::Error::last_os_error());
+    }
+
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        anyhow::bail!("mmap failed: {}", std::io::Error::last_os_error());
+    }
+    // SAFETY: ptr is valid for `size` bytes; we just mapped it.
+    let pixels: &mut [u32] = unsafe {
+        std::slice::from_raw_parts_mut(ptr as *mut u32, size / BYTES_PER_PIXEL)
+    };
+    pixels.fill(0xFF20_2020); // ARGB32 dark grey, opaque
+    unsafe { libc::msync(ptr, size, libc::MS_SYNC) };
+
+    let pool = shm.create_pool(fd.as_fd(), size as i32, qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        width as i32,
+        height as i32,
+        stride as i32,
+        wl_shm::Format::Argb8888,
+        qh,
+        (),
+    );
+
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage_buffer(0, 0, width as i32, height as i32);
+    Ok((pool, buffer, fd))
 }
 
 fn run_display_loop(
@@ -113,8 +190,36 @@ fn run_display_loop(
         .roundtrip(&mut state)
         .context("configure roundtrip")?;
 
+    // Without a buffer attached, the xdg-shell spec says the surface is
+    // never mapped -- so it lives in the task switcher but stays
+    // invisible. We attach a solid-color wl_shm buffer here as a
+    // placeholder; Phase 5 replaces it with the SW-decoder-fed renderer.
+    if state.shm.is_some() {
+        match attach_placeholder_buffer(
+            &surface,
+            state.shm.as_ref().unwrap(),
+            &qh,
+            state.width,
+            state.height,
+        ) {
+            Ok((pool, buffer, fd)) => {
+                state.placeholder_pool = Some(pool);
+                state.placeholder_buffer = Some(buffer);
+                state.placeholder_fd = Some(fd);
+                surface.commit();
+                event_queue
+                    .roundtrip(&mut state)
+                    .context("post-placeholder commit roundtrip")?;
+                info!("placeholder buffer attached; window should be visible");
+            }
+            Err(e) => warn!("could not attach placeholder buffer: {e:#}"),
+        }
+    } else {
+        warn!("no wl_shm available; window will be invisible until Phase 5 adds a renderer");
+    }
+
     info!(
-        "window created: title=\"waylandwebstream\" initial_size={}x{}",
+        "window created: title=\"waylandwebstream\" size={}x{}",
         state.width, state.height
     );
 
@@ -150,6 +255,14 @@ struct DisplayState {
     seat: Option<wl_seat::WlSeat>, // bound for Phase 7 input forwarding
     #[allow(dead_code)]
     shm: Option<wl_shm::WlShm>, // bound for Phase 5 SHM render
+
+    // Phase 4 placeholder buffer so the surface actually maps (see
+    // attach_placeholder_buffer). Dropped automatically when the
+    // display thread exits, which destroys the wl_buffer, wl_shm_pool,
+    // and memfd in that order.
+    placeholder_pool: Option<wl_shm_pool::WlShmPool>,
+    placeholder_buffer: Option<wl_buffer::WlBuffer>,
+    placeholder_fd: Option<OwnedFd>,
 }
 
 impl DisplayState {
@@ -168,6 +281,9 @@ impl DisplayState {
             wm_base: None,
             seat: None,
             shm: None,
+            placeholder_pool: None,
+            placeholder_buffer: None,
+            placeholder_fd: None,
         }
     }
 }
@@ -342,6 +458,38 @@ impl Dispatch<wl_shm::WlShm, ()> for DisplayState {
     ) {
         // wl_shm::Format advertises supported pixel formats. Phase 5
         // (SHM renderer) reads this; for now we ignore it.
+    }
+}
+
+impl Dispatch<wl_shm_pool::WlShmPool, ()> for DisplayState {
+    fn event(
+        _: &mut Self,
+        _: &wl_shm_pool::WlShmPool,
+        _: wl_shm_pool::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // wl_shm_pool has no events.
+    }
+}
+
+/// `wl_buffer::release` fires when the compositor is done reading from
+/// the buffer. Phase 4 doesn't reuse buffers (one placeholder for the
+/// whole session) so we just log it. Phase 5's SHM renderer will use
+/// this to recycle released slots.
+impl Dispatch<wl_buffer::WlBuffer, ()> for DisplayState {
+    fn event(
+        _: &mut Self,
+        _: &wl_buffer::WlBuffer,
+        event: wl_buffer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_buffer::Event::Release = event {
+            debug!("placeholder wl_buffer released by compositor");
+        }
     }
 }
 

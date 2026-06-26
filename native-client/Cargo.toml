@@ -27,3 +27,9 @@ clap = { version = "4", features = ["derive"] }
 # phases add wl_shm, wp_* etc.
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }
+
+# memfd_create for the placeholder wl_shm buffer. Phase 4 attaches a
+# single solid-color buffer so the surface is actually mapped (without
+# a buffer the compositor never shows the window); Phase 5+ replaces
+# this with a real SW decoder-fed renderer.
+libc = "0.2"
