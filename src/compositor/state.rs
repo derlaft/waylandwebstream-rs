@@ -1330,3 +1330,195 @@ fn cursor_icon_to_css(icon: smithay::input::pointer::CursorIcon) -> &'static str
 
 // Re-export as CompositorState for compatibility
 pub type CompositorState = WaylandWebStreamState;
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+    use smithay::backend::allocator::{
+        dmabuf::DmabufFlags,
+        Modifier,
+    };
+    use smithay::utils::{Buffer as BufSpace, Physical, Size};
+    use std::io::Write;
+    use std::os::unix::io::OwnedFd;
+
+    /// Builds a `Dmabuf` backed by a temp file (no real GPU needed).
+    /// Filled with `bgra_pixels` in row-major order. `Modifier::Linear`
+    /// ensures `read_cursor_pixels_dmabuf` uses the mmap fast path.
+    fn make_linear_dmabuf(w: u32, h: u32, fourcc: Fourcc, bgra_pixels: &[[u8; 4]]) -> Dmabuf {
+        assert_eq!(bgra_pixels.len(), (w * h) as usize);
+        let stride = w * 4;
+        let mut tmp = tempfile::tempfile().expect("tempfile");
+        for p in bgra_pixels {
+            tmp.write_all(p).unwrap();
+        }
+        let fd: OwnedFd = tmp.into();
+        let size = Size::<i32, BufSpace>::from((w as i32, h as i32));
+        let mut builder = Dmabuf::builder(size, fourcc, Modifier::Linear, DmabufFlags::empty());
+        builder.add_plane(fd, 0, 0, stride);
+        builder.build().expect("Dmabuf::build")
+    }
+
+    #[test]
+    fn sw_cursor_bgra_to_rgba_conversion() {
+        // 2×2 ARGB8888 LE in memory = [B, G, R, A] per pixel.
+        let bgra: [[u8; 4]; 4] = [
+            [255,   0,   0, 255], // blue pixel  → RGBA [  0,  0,255,255]
+            [  0, 255,   0, 255], // green pixel → RGBA [  0,255,  0,255]
+            [  0,   0, 255, 255], // red pixel   → RGBA [255,  0,  0,255]
+            [255, 255,   0, 128], // cyan+alpha  → RGBA [  0,255,255,128]
+        ];
+        let dmabuf = make_linear_dmabuf(2, 2, Fourcc::Argb8888, &bgra);
+        let hotspot: Point<i32, Logical> = (3, 7).into();
+
+        let result = WaylandWebStreamState::read_cursor_pixels_dmabuf(&dmabuf, hotspot, None)
+            .expect("expected Some(CursorPending::Surface)");
+
+        let CursorPending::Surface { width, height, hotspot_x, hotspot_y, rgba } = result else {
+            panic!("expected CursorPending::Surface, got {result:?}");
+        };
+
+        assert_eq!((width, height), (2, 2));
+        assert_eq!((hotspot_x, hotspot_y), (3, 7));
+        assert_eq!(rgba.len(), 16);
+        assert_eq!(&rgba[0..4],   &[  0,   0, 255, 255], "pixel 0: blue   BGRA→RGBA");
+        assert_eq!(&rgba[4..8],   &[  0, 255,   0, 255], "pixel 1: green  BGRA→RGBA");
+        assert_eq!(&rgba[8..12],  &[255,   0,   0, 255], "pixel 2: red    BGRA→RGBA");
+        assert_eq!(&rgba[12..16], &[  0, 255, 255, 128], "pixel 3: cyan   BGRA→RGBA");
+    }
+
+    #[test]
+    fn sw_cursor_xrgb_alpha_forced_opaque() {
+        // XRGB8888: the alpha byte in the buffer is ignored; output must be 255.
+        let bgra: [[u8; 4]; 1] = [[100, 150, 200, 42]]; // A=42 in buffer
+        let dmabuf = make_linear_dmabuf(1, 1, Fourcc::Xrgb8888, &bgra);
+
+        let result = WaylandWebStreamState::read_cursor_pixels_dmabuf(
+            &dmabuf, (0, 0).into(), None,
+        ).expect("Some");
+
+        let CursorPending::Surface { rgba, .. } = result else { panic!("not Surface") };
+        assert_eq!(rgba[3], 255, "Xrgb8888 must produce alpha=255 regardless of buffer byte");
+    }
+
+    /// Opens the first available DRM render node or returns `None`.
+    fn open_drm_render_node() -> Option<std::fs::File> {
+        for path in ["/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/renderD130"] {
+            if let Ok(f) = std::fs::File::options().read(true).write(true).open(path) {
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    /// GL readback test: allocates a GBM dmabuf (driver picks the modifier, which on
+    /// real GPU hardware is tiled), fills it with solid red via a GL clear, then calls
+    /// `read_cursor_pixels_dmabuf` to verify the GL texture-import + readback path.
+    ///
+    /// Skipped gracefully when no DRM render node or EGL/GL init fails.
+    /// A `None` result is also accepted: some drivers return an OES external texture
+    /// that can't be attached to an FBO; the test verifies the graceful fallback.
+    #[test]
+    fn hw_cursor_gl_readback() {
+        use smithay::backend::allocator::{
+            dmabuf::AsDmabuf as _,
+            gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
+            Allocator,
+        };
+        use smithay::backend::egl::{EGLContext, EGLDisplay};
+        use smithay::backend::renderer::{Bind, Color32F, Frame as RendererFrame, Renderer};
+
+        macro_rules! skip {
+            ($msg:literal, $e:expr) => {{
+                eprintln!(concat!("hw_cursor_gl_readback: ", $msg, " ({e}), skipping"), e = $e);
+                return;
+            }};
+            ($msg:literal) => {{
+                eprintln!(concat!("hw_cursor_gl_readback: ", $msg, ", skipping"));
+                return;
+            }};
+        }
+
+        // ── prerequisites ──────────────────────────────────────────────────
+        let drm_file = match open_drm_render_node() {
+            Some(f) => f,
+            None => { skip!("no DRM render node found") }
+        };
+        let drm_for_egl = drm_file.try_clone().unwrap();
+        let gbm = match GbmDevice::new(drm_file) {
+            Ok(d) => d,
+            Err(e) => { skip!("GBM init failed", e) }
+        };
+        let egl_gbm = GbmDevice::new(drm_for_egl).unwrap();
+        let display = match unsafe { EGLDisplay::new(egl_gbm) } {
+            Ok(d) => d,
+            Err(e) => { skip!("EGL display failed", e) }
+        };
+        let ctx = match EGLContext::new(&display) {
+            Ok(c) => c,
+            Err(e) => { skip!("EGL context failed", e) }
+        };
+        let renderer = match unsafe { GlesRenderer::new(ctx) } {
+            Ok(r) => r,
+            Err(e) => { skip!("GlesRenderer init failed", e) }
+        };
+
+        // ── allocate a cursor-sized dmabuf (driver picks modifier) ─────────
+        let (w, h) = (16u32, 16u32);
+        let mut gbm_alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
+        let gbm_buf = match gbm_alloc.create_buffer(w, h, Fourcc::Argb8888, &[Modifier::Invalid]) {
+            Ok(b) => b,
+            Err(e) => { skip!("GBM alloc failed", e) }
+        };
+        let mut dmabuf = match gbm_buf.export() {
+            Ok(d) => d,
+            Err(e) => { skip!("dmabuf export failed", e) }
+        };
+
+        // ── fill the dmabuf with solid red via GL clear ────────────────────
+        let renderer_rc = Rc::new(RefCell::new(renderer));
+        {
+            let mut rend = renderer_rc.borrow_mut();
+            let mut target = match rend.bind(&mut dmabuf) {
+                Ok(t) => t,
+                Err(e) => { skip!("bind failed", e) }
+            };
+            let output_size = Size::<i32, Physical>::from((w as i32, h as i32));
+            let mut frame = rend.render(&mut target, output_size, Transform::Normal)
+                .expect("render");
+            frame.clear(
+                Color32F::new(1.0, 0.0, 0.0, 1.0),
+                &[Rectangle::from_size(output_size)],
+            ).expect("clear");
+            let _ = frame.finish().expect("finish");
+        }
+
+        // ── read pixels back via read_cursor_pixels_dmabuf ─────────────────
+        let result = WaylandWebStreamState::read_cursor_pixels_dmabuf(
+            &dmabuf,
+            (0i32, 0i32).into(),
+            Some(&renderer_rc),
+        );
+
+        match result {
+            Some(CursorPending::Surface { width, height, rgba, .. }) => {
+                assert_eq!((width, height), (w, h));
+                assert_eq!(rgba.len(), (w * h * 4) as usize);
+                // GL clear to red should yield RGBA ≈ [255, 0, 0, 255] per pixel.
+                for (i, pixel) in rgba.chunks_exact(4).enumerate() {
+                    assert!(pixel[0] > 200, "pixel {i}: R={} expected ≈255", pixel[0]);
+                    assert!(pixel[1] < 50,  "pixel {i}: G={} expected ≈0",   pixel[1]);
+                    assert!(pixel[2] < 50,  "pixel {i}: B={} expected ≈0",   pixel[2]);
+                    assert!(pixel[3] > 200, "pixel {i}: A={} expected ≈255", pixel[3]);
+                }
+                eprintln!("hw_cursor_gl_readback: GL readback succeeded on {w}×{h} dmabuf");
+            }
+            None => {
+                // Some drivers return an OES external texture that can't bind to an FBO.
+                // The function returning None is the correct graceful fallback.
+                eprintln!("hw_cursor_gl_readback: returned None (OES external texture or unsupported format — expected on some drivers)");
+            }
+            _ => panic!("expected CursorPending::Surface or None"),
+        }
+    }
+}
