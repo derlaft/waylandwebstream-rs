@@ -144,10 +144,22 @@ impl ActiveRenderer {
         }
     }
 
-    fn resize(&mut self, w: u32, h: u32) {
+    /// Resize the renderer and immediately commit a frame at the new size so
+    /// the compositor maps the window correctly without waiting for the next
+    /// decoded video frame.  Returns false only in degenerate edge cases.
+    fn resize_and_prime(&mut self, qh: &QueueHandle<DisplayState>, w: u32, h: u32) -> bool {
         match self {
-            Self::Shm(r) => r.resize(w, h),
-            Self::Egl(r) => r.resize(w, h),
+            Self::Shm(r) => r.resize_and_prime(qh, w, h),
+            Self::Egl(r) => {
+                r.resize(w, h);
+                match r.prime() {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!("EGL prime after resize: {e:#}");
+                        false
+                    }
+                }
+            }
         }
     }
 
@@ -322,14 +334,16 @@ fn run_display_loop(
         }
 
         // Apply any resize that arrived in this tick's configure event.
+        // resize_and_prime attaches a new-sized black frame and commits it so
+        // the compositor maps the window at the correct dimensions immediately,
+        // without waiting for the next decoded video frame to arrive.
         if let Some((w, h)) = state.pending_resize.take() {
             debug!("resize → {w}x{h}");
             if let Some(r) = state.renderer.as_mut() {
-                r.resize(w, h);
+                if !r.resize_and_prime(&qh, w, h) {
+                    warn!("resize_and_prime failed (all slots held by compositor?)");
+                }
             }
-            // Bare commit acknowledges the configure; the next rendered frame
-            // carries the new-size buffer.
-            state.window.wl_surface().commit();
             event_queue.flush().ok();
         }
 

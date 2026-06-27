@@ -165,6 +165,30 @@ impl ShmRenderer {
         }
     }
 
+    /// Resize and immediately commit a new-sized buffer so the compositor
+    /// maps the window at the correct dimensions without waiting for the
+    /// next decoded frame.  Returns `false` only if all slots are still
+    /// held by the compositor as zombies (very unlikely with 3 slots).
+    pub fn resize_and_prime<State>(
+        &mut self,
+        qh: &QueueHandle<State>,
+        new_w: u32,
+        new_h: u32,
+    ) -> bool
+    where
+        State: Dispatch<wl_shm_pool::WlShmPool, u32>
+            + Dispatch<wl_buffer::WlBuffer, u32>
+            + 'static,
+    {
+        self.resize(new_w, new_h);
+        // Fill any freed (None) slots at the new size.
+        if let Err(e) = self.recreate_slots(qh) {
+            tracing::warn!("resize_and_prime recreate_slots: {e:#}");
+            return false;
+        }
+        self.prime()
+    }
+
     /// Attach the first available slot to the surface and commit.
     /// Use once after construction so the compositor has a buffer
     /// to map -- before the first decoded frame arrives. Returns
