@@ -2188,8 +2188,15 @@ dependencies = [
 name = "wayland-test-client"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "libc",
  "memmap2",
+ "native-client",
+ "serde",
+ "serde_json",
  "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
  "wayland-client",
  "wayland-protocols",
 ]

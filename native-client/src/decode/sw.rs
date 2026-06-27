@@ -126,7 +126,7 @@ impl H264Decoder {
         let width = raw.width();
         let height = raw.height();
         if width == 0 || height == 0 {
-            anyhow::bail!("decoder emitted a 0x{} frame", "frame");
+            anyhow::bail!("decoder emitted a zero-dimension frame: {width}x{height}");
         }
 
         // (Re)create the swscale context if the source resolution or

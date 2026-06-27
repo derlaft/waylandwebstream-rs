@@ -23,8 +23,28 @@ path = "src/keyboard_client.rs"
 name = "wayland-cursor-client"
 path = "src/cursor_client.rs"
 
+# Test-only payload client used by `tests/smoke_e2e.rs` to drive the wws
+# server's compositor with a known solid color.
+[[bin]]
+name = "payload-client"
+path = "src/payload_client.rs"
+
 [dependencies]
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }
 memmap2 = "0.9"
 tempfile = "3"
+libc = "0.2"
+anyhow = "1"
+
+# Integration tests under tests/ drive the native-client + the
+# wws-server binaries and need the full wws-client pipeline
+# (transport + decoder + display thread). Marked dev-only so
+# `cargo build --bin *` from this crate stays lean.
+[dev-dependencies]
+native-client = { path = "../native-client" }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.26"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

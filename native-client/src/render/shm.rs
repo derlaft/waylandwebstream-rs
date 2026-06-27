@@ -59,6 +59,11 @@ struct BufferSlot {
     /// `false` from the moment we attach until the compositor sends
     /// `Release`. `true` when it's safe to write + attach again.
     released: bool,
+    /// `true` when the renderer has been resized past this slot's
+    /// dimensions and the slot is waiting for the compositor to release
+    /// it before being dropped. Must not be written into or re-attached;
+    /// it will be dropped by `release_slot` once released.
+    zombie: bool,
 }
 
 // SAFETY: BufferSlot holds a raw mmap pointer + proxies. The pointer
@@ -152,22 +157,29 @@ impl ShmRenderer {
         Ok(())
     }
 
-    /// Resize the renderer to `new_w x new_h`. Slots are dropped and
-    /// rebuilt on the next `render` or `prime` call (we don't
-    /// allocate here so callers can call resize at any point without
-    /// holding the surface flush).
+    /// Resize the renderer to `new_w x new_h`. Released slots are
+    /// freed immediately; held slots become zombies — they're kept
+    /// alive until the compositor sends their `wl_buffer::Release`,
+    /// then dropped by `release_slot`. Sending `wl_buffer.destroy()`
+    /// to the compositor while it still holds the buffer is a
+    /// protocol error that can cause the compositor to show garbage or
+    /// disconnect; the zombie pattern avoids that.
     pub fn resize(&mut self, new_w: u32, new_h: u32) {
         if (new_w, new_h) == (self.width, self.height) {
             return;
         }
         self.width = new_w;
         self.height = new_h;
-        // Drop slots now -- the renderer doesn't allocate yet, so we
-        // can defer the actual mmap + pool creation until render
-        // fires. (Allocating here would also be fine; deferring keeps
-        // resize() non-fallible.)
         for slot in &mut self.slots {
-            *slot = None;
+            match slot {
+                Some(s) if s.released => {
+                    *slot = None; // compositor is done with it; safe to drop
+                }
+                Some(s) => {
+                    s.zombie = true; // compositor holds it; drop on release
+                }
+                None => {}
+            }
         }
     }
 
@@ -180,7 +192,7 @@ impl ShmRenderer {
         let picked = (0..NUM_SLOTS).find(|i| {
             self.slots[*i]
                 .as_ref()
-                .map(|s| s.released)
+                .map(|s| s.released && !s.zombie)
                 .unwrap_or(false)
         });
         let Some(idx) = picked else {
@@ -239,6 +251,10 @@ impl ShmRenderer {
         if let Some(slot) = self.slots.get_mut(slot_idx as usize) {
             if let Some(s) = slot.as_mut() {
                 s.released = true;
+                if s.zombie {
+                    // Compositor done with the stale buffer; safe to drop now.
+                    *slot = None;
+                }
             }
         }
     }
@@ -257,15 +273,19 @@ impl ShmRenderer {
             + Dispatch<wl_buffer::WlBuffer, u32>
             + 'static,
     {
-        if self.slots[0].is_none() || self.slots[1].is_none() {
+        // Recreate any slot that is missing (None). Zombie slots still
+        // occupy their index and will be cleaned up when released; we
+        // cannot allocate a new slot at that index until then.
+        if self.slots.iter().any(|s| s.is_none()) {
             self.recreate_slots(qh)?;
         }
 
-        // Pick the next *released* slot; toggle `next_idx` so we
-        // ping-pong between slots for cache friendliness.
+        // Pick the next non-zombie, released slot. Zombie slots have
+        // the right index but stale dimensions; writing into them would
+        // corrupt memory and violate the protocol.
         let released: [bool; NUM_SLOTS] = [
-            self.slots[0].as_ref().map(|s| s.released).unwrap_or(false),
-            self.slots[1].as_ref().map(|s| s.released).unwrap_or(false),
+            self.slots[0].as_ref().map(|s| s.released && !s.zombie).unwrap_or(false),
+            self.slots[1].as_ref().map(|s| s.released && !s.zombie).unwrap_or(false),
         ];
         let Some(idx) = pick_next_released(&released, self.next_idx) else {
             // Both slots are held by the compositor. This happens
@@ -316,11 +336,14 @@ impl ShmRenderer {
     /// when the renderer appears stuck (no released slot -> no render
     /// possible). Returns a string like `[released,held]`.
     pub fn slot_state(&self) -> String {
-        format!(
-            "[{},{}]",
-            self.slots[0].as_ref().map(|s| s.released).unwrap_or(false),
-            self.slots[1].as_ref().map(|s| s.released).unwrap_or(false),
-        )
+        let fmt = |s: &Option<BufferSlot>| match s {
+            None => "none",
+            Some(b) if b.zombie && b.released => "zombie-released",
+            Some(b) if b.zombie => "zombie-held",
+            Some(b) if b.released => "released",
+            Some(_) => "held",
+        };
+        format!("[{},{}]", fmt(&self.slots[0]), fmt(&self.slots[1]))
     }
 }
 
@@ -412,6 +435,7 @@ where
         width,
         height,
         released: true, // fresh buffer hasn't been attached yet
+        zombie: false,
     })
 }
 

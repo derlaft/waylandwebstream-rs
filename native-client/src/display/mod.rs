@@ -12,6 +12,7 @@
 use anyhow::{Context, Result};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 use wayland_client::{
@@ -157,6 +158,10 @@ fn run_display_loop(
     toplevel.set_title("waylandwebstream".to_string());
     toplevel.set_app_id("wws-client".to_string());
 
+    // Store the surface in state so the xdg_surface::Configure handler
+    // can commit after ack_configure (required by the xdg-shell spec).
+    state.surface = Some(surface.clone());
+
     // Initial commit to trigger the first Configure. xdg_surface::Configure
     // arrives in the next roundtrip; until then the compositor hasn't
     // allocated us a size, so we keep `state.width/height` at initial.
@@ -251,26 +256,28 @@ fn run_display_loop(
             }
         }
 
-        // Drain Wayland events. CRUCIAL: this must be
-        // `blocking_dispatch`, not `dispatch_pending`. The latter
-        // only dispatches events already buffered in the EventQueue;
-        // it does NOT read from the Wayland socket. Without
-        // `blocking_dispatch`, the compositor's `wl_buffer::Release`
-        // events sit unread in the socket buffer, slots never get
-        // marked available, and the renderer is stuck after the very
-        // first frame -- symptoms: "picture displays but doesn't
-        // update, must restart the client to see a new picture".
+        // Non-blocking read from the Wayland socket, then dispatch
+        // any newly-buffered events (wl_buffer::Release, frame
+        // callbacks, xdg_wm_base::Ping, etc.).
         //
-        // `blocking_dispatch` first tries `dispatch_pending`, and if
-        // nothing was pending it reads from the socket (blocking).
-        // For our loop: if frames just arrived, dispatch_pending
-        // picks up any release events already queued; if nothing
-        // happened, blocking_dispatch parks the thread until the
-        // compositor sends something (typically <1 vsync later).
-        event_queue
-            .blocking_dispatch(&mut state)
-            .context("blocking_dispatch")?;
-        event_queue.flush().context("flush")?;
+        // IMPORTANT: in wayland-client 0.31, `dispatch_pending` alone
+        // does NOT read from the socket — it only dispatches events
+        // that are already in the queue's internal buffer. Without the
+        // explicit prepare_read + read step, Release events sent by the
+        // compositor never land in the buffer and both SHM slots stay
+        // "held" indefinitely, starving the renderer after the very
+        // first frame. `blocking_dispatch` reads from the socket but
+        // blocks until an event arrives, which would stall frame_rx
+        // polling. The prepare_read + non-blocking read is the correct
+        // idiom for a tight event loop; see the docs on
+        // EventQueue::prepare_read.
+        if let Some(guard) = event_queue.prepare_read() {
+            let _ = guard.read(); // non-blocking: returns Ok(0) if no data
+        }
+        let _ = event_queue.dispatch_pending(&mut state);
+        // Brief sleep so we don't spin at 100% CPU.
+        std::thread::sleep(Duration::from_millis(1));
+        event_queue.flush().ok();
     }
 
     Ok(())
@@ -288,6 +295,12 @@ struct DisplayState {
     shm: Option<wl_shm::WlShm>,
     #[allow(dead_code)]
     seat: Option<wl_seat::WlSeat>, // bound for Phase 7 input forwarding
+
+    /// The wl_surface for the main window. Set before the configure
+    /// roundtrip so the xdg_surface::Configure handler can call
+    /// `surface.commit()` after `ack_configure` — the spec requires a
+    /// commit to apply each configure.
+    surface: Option<wl_surface::WlSurface>,
 
     renderer: Option<ShmRenderer>,
     /// Resize requests from xdg_toplevel::Configure are applied on the
@@ -320,6 +333,7 @@ impl DisplayState {
             wm_base: None,
             shm: None,
             seat: None,
+            surface: None,
             renderer: None,
             pending_resize: None,
             last_render: None,
@@ -418,9 +432,15 @@ impl Dispatch<xdg_wm_base_protocol::XdgWmBase, ()> for DisplayState {
 /// or the compositor treats the next commit as out-of-sync. The size
 /// itself comes from the xdg_toplevel Configure event (xdg_surface's
 /// Configure is per-surface, xdg_toplevel's is per-role).
+///
+/// After the ack we also commit the surface. The xdg-shell spec requires
+/// a commit to "apply" each configure event; without it the compositor
+/// may keep sending configures or consider the client non-responsive. The
+/// commit here re-commits the current surface state (last attached buffer
+/// unchanged) — it is not a new frame, just a protocol acknowledgement.
 impl Dispatch<xdg_surface_protocol::XdgSurface, ()> for DisplayState {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         xdg_surface: &xdg_surface_protocol::XdgSurface,
         event: xdg_surface_protocol::Event,
         _: &(),
@@ -428,7 +448,12 @@ impl Dispatch<xdg_surface_protocol::XdgSurface, ()> for DisplayState {
         _: &QueueHandle<Self>,
     ) {
         if let xdg_surface_protocol::Event::Configure { serial } = event {
+            debug!("xdg_surface::Configure serial={serial} -> ack_configure");
             xdg_surface.ack_configure(serial);
+            // Commit so the compositor considers this configure applied.
+            if let Some(s) = &state.surface {
+                s.commit();
+            }
         }
     }
 }
@@ -555,7 +580,7 @@ impl Dispatch<wl_buffer::WlBuffer, SlotId> for DisplayState {
                 1,
                 std::sync::atomic::Ordering::Relaxed,
             );
-            tracing::info!("wl_buffer::Release for slot={slot_id}");
+            tracing::debug!("wl_buffer::Release for slot={slot_id}");
             if let Some(renderer) = state.renderer.as_mut() {
                 renderer.release_slot(*slot_id);
             }
