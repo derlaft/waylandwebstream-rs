@@ -64,9 +64,16 @@ async fn main() -> Result<()> {
     // Build both channels up front, then hand each half to its
     // respective thread. `packet_tx` -> packet_rx feeds H.264 packets
     // to the decoder; `frame_tx` -> frame_rx feeds decoded frames to
-    // the renderer. Both channels are bounded to 1 so a slow
-    // downstream drops work rather than backpressuring everything.
-    let (packet_tx, packet_rx) = mpsc::sync_channel::<Vec<u8>>(1);
+    // the renderer.
+    //
+    // packet_tx: capacity 4 -- dropping *encoded* packets breaks the H.264
+    // reference chain, corrupting the picture until the next IDR. A little
+    // slack absorbs scheduler jitter without ever dropping. Capacity 1 was
+    // too aggressive: any single-frame delay in the decoder caused corruption.
+    //
+    // frame_tx: capacity 1 -- dropping decoded frames is harmless (just
+    // shows the previous frame for one tick), so stay tight here.
+    let (packet_tx, packet_rx) = mpsc::sync_channel::<Vec<u8>>(4);
     let (frame_tx, frame_rx) = mpsc::sync_channel::<DecodedFrame>(1);
 
     // Display thread first: we want the window up before we start
@@ -162,9 +169,10 @@ fn handle_frame(frame: Frame, packet_tx: &mpsc::SyncSender<Vec<u8>>) {
             if ping_echo != 0.0 {
                 debug!("  ping_echo_client_ts={ping_echo}");
             }
-            // `try_send`: if the decoder is behind, drop the frame.
-            // The next keyframe (~1s away) will resync cheaply. Same
-            // policy as the server's broadcast channel (AGENTS.md).
+            // `try_send`: if the decoder is consistently behind (4+
+            // frames), drop. The next IDR (~2s away at default GOP)
+            // will resync. Channel capacity 4 absorbs transient jitter
+            // so we only drop when genuinely overwhelmed.
             if packet_tx.try_send(data).is_err() {
                 debug!("decoder behind; dropping H.264 packet");
             }

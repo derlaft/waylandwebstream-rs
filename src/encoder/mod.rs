@@ -659,15 +659,20 @@ fn create_encoder(config: &EncoderConfig) -> Result<ffmpeg::encoder::Video> {
         RateControl::Bitrate(bitrate) => {
             encoder.set_bit_rate(bitrate);
 
-            // Cap how far a single frame's size can exceed the target bitrate.
-            // Without a VBV limit, x264's "bitrate" is only an average over the
-            // whole stream - an IDR frame (every keyframe_interval frames) can come
-            // out several times larger than a P-frame, and at 2Mbps a ~250KB
-            // keyframe alone takes ~1 second to drain through the link. That shows
-            // up as the receive-side jitter buffer ballooning every GOP and then
-            // draining back down. Bounding vbv-bufsize caps that worst case.
+            // VBV: bound peak instantaneous bitrate so a single IDR
+            // frame can't stall the transport for several seconds.
+            //
+            // vbv-bufsize must be generous enough for keyframes to be
+            // encoded at acceptable quality. At 2Mbps the average
+            // P-frame needs ~67 kbits; a glxgears-class IDR at
+            // 1280×720 needs 5-15× that. With vbv-bufsize = maxrate/4
+            // (250ms = 500 kbits at 2Mbps), x264 was forced to crush
+            // every IDR to 62.5KB, producing visible block artifacts
+            // at every 2-second GOP boundary. With 2× maxrate (2s),
+            // keyframes get the bits they need without starving the
+            // transport for more than one GOP interval in the worst case.
             let vbv_maxrate_kbps = (bitrate / 1000).max(1);
-            let vbv_bufsize_kbps = (vbv_maxrate_kbps / 4).max(1); // ~250ms worth of frames
+            let vbv_bufsize_kbps = (vbv_maxrate_kbps * 2).max(1); // 2s of headroom for IDRs
             opts.set("vbv-maxrate", &vbv_maxrate_kbps.to_string());
             opts.set("vbv-bufsize", &vbv_bufsize_kbps.to_string());
         }

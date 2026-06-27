@@ -189,5 +189,3 @@ browser input → /ws WS → mpsc → compositor seat injection
 - Prefer adding CLI knobs in `src/config.rs` (clap) over hardcoding.
 - This project links FFmpeg/x264 and is **AGPL-3.0**; the resulting binary may
   carry GPL terms depending on the FFmpeg build.
-</content>
-</invoke>
