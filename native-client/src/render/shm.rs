@@ -410,12 +410,15 @@ where
     }
 
     let pool = shm.create_pool(fd.as_fd(), size as i32, qh, slot_id);
+    // Xrgb8888 — compositor ignores the alpha byte, treating the surface as
+    // fully opaque.  Argb8888 would alpha-blend the zero-initialised bytes
+    // (alpha=0) making the window transparent until a frame fills the slot.
     let buffer = pool.create_buffer(
         0,
         width as i32,
         height as i32,
         stride as i32,
-        wl_shm::Format::Argb8888,
+        wl_shm::Format::Xrgb8888,
         qh,
         slot_id,
     );

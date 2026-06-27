@@ -170,7 +170,10 @@ void main() {
 
 // Frame data is BGRA; uploaded as GL_RGBA so channels arrive as
 //   texture.r = B,  texture.g = G,  texture.b = R,  texture.a = A
-// Swizzle c.bgra maps: out.r = tex.b = R, out.g = tex.g = G, out.b = tex.r = B.
+// Swizzle .bgr picks: out.r = tex.b = R, out.g = tex.g = G, out.b = tex.r = B.
+// Alpha is forced to 1.0 — the EGL surface has no alpha channel (XRGB), and
+// defensive 1.0 prevents any compositor from treating the surface as transparent
+// if the format detection ever changes.
 // Also: GL textures are bottom-row-first, frame data is top-row-first, so
 // the QUAD below inverts v (tex v=1 at screen bottom) to produce an upright image.
 const FRAG_SRC: &str = "
@@ -179,7 +182,7 @@ uniform sampler2D u_tex;
 varying vec2 v_tex;
 void main() {
     vec4 c = texture2D(u_tex, v_tex);
-    gl_FragColor = c.bgra;
+    gl_FragColor = vec4(c.bgr, 1.0);
 }
 ";
 
@@ -253,13 +256,18 @@ impl EglRenderer {
             anyhow::bail!("eglInitialize failed");
         }
 
-        // ── EGL config (RGBA8888, window surface, GLES2) ───────────────
+        // ── EGL config (RGB888 opaque, window surface, GLES2) ─────────
+        // EGL_ALPHA_SIZE = 0 selects an XRGB (opaque) visual so the
+        // compositor treats the surface as fully opaque.  With alpha=8
+        // the compositor picks ARGB and alpha-blends the surface; if the
+        // alpha channel is ever 0 (zero-init buffer, format mismatch, etc.)
+        // the window goes fully transparent.
         #[rustfmt::skip]
         let config_attribs: [i32; 13] = [
             EGL_RED_SIZE,        8,
             EGL_GREEN_SIZE,      8,
             EGL_BLUE_SIZE,       8,
-            EGL_ALPHA_SIZE,      8,
+            EGL_ALPHA_SIZE,      0,
             EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
             EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
             EGL_NONE,

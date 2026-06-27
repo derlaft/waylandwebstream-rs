@@ -321,6 +321,20 @@ fn run_display_loop(
         event_queue.dispatch_pending(&mut state).context("dispatch_pending")?;
         event_queue.flush().ok();
 
+        // Apply any resize that arrived in this tick's configure event BEFORE
+        // draining frames.  After ack_configure the next committed buffer must
+        // have the new size; draining frames first could commit an old-sized
+        // buffer between ack_configure and resize_and_prime (protocol violation).
+        if let Some((w, h)) = state.pending_resize.take() {
+            debug!("resize → {w}x{h}");
+            if let Some(r) = state.renderer.as_mut() {
+                if !r.resize_and_prime(&qh, w, h) {
+                    warn!("resize_and_prime failed (all slots held by compositor?)");
+                }
+            }
+            event_queue.flush().ok();
+        }
+
         // Render the latest decoded frame (drops older ones).
         let frames_drained = match state.renderer.as_mut().unwrap().try_drain(&qh, &frame_rx) {
             Ok(n) => n,
@@ -331,20 +345,6 @@ fn run_display_loop(
         };
         if frames_drained > 0 {
             state.last_render = Some(std::time::Instant::now());
-        }
-
-        // Apply any resize that arrived in this tick's configure event.
-        // resize_and_prime attaches a new-sized black frame and commits it so
-        // the compositor maps the window at the correct dimensions immediately,
-        // without waiting for the next decoded video frame to arrive.
-        if let Some((w, h)) = state.pending_resize.take() {
-            debug!("resize → {w}x{h}");
-            if let Some(r) = state.renderer.as_mut() {
-                if !r.resize_and_prime(&qh, w, h) {
-                    warn!("resize_and_prime failed (all slots held by compositor?)");
-                }
-            }
-            event_queue.flush().ok();
         }
 
         if let Some(last) = state.last_render {
