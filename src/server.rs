@@ -1554,4 +1554,118 @@ mod tests {
             "encode_unified_audio_frame should allocate exactly once; got {allocs}"
         );
     }
+
+    /// `dispatch_signaling_message` with a Resize message forwards the
+    /// dimensions to `resize_tx` so the compositor render loop picks them up.
+    #[tokio::test]
+    async fn dispatch_resize_forwards_to_channel() {
+        let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32)>(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (touch_tx, _) = mpsc::channel(4);
+        let (mouse_tx, _) = mpsc::channel(4);
+        let (key_tx, _) = mpsc::channel(4);
+        let (encoder_control_tx, _) = mpsc::channel(4);
+        let (pending_ping_tx, _) = mpsc::channel(4);
+        let (_, bitrate_rx) = watch::channel(2_000_000usize);
+        let (_, codec_rx) = watch::channel(String::new());
+        let (_, cursor_rx) = watch::channel(CursorUpdate::Default);
+        let force_render = Arc::new(AtomicBool::new(false));
+        let state = SignalingState::new(
+            resize_tx,
+            touch_tx,
+            mouse_tx,
+            key_tx,
+            None,
+            None,
+            encoder_control_tx,
+            force_render,
+            pending_ping_tx,
+            bitrate_rx,
+            codec_rx,
+            shutdown_rx,
+            SessionManager::new(Vec::new(), String::new(), shutdown_tx),
+            None,
+            cursor_rx,
+        );
+
+        dispatch_signaling_message(SignalingMessage::Resize { width: 800, height: 600 }, &state)
+            .await;
+
+        let received = resize_rx.try_recv().expect("resize_rx should have a value");
+        assert_eq!(received, (800, 600));
+    }
+
+    /// The /client endpoint routes a binary-framed Resize message (as the
+    /// native client sends it) through to `resize_tx`.
+    #[tokio::test]
+    async fn client_endpoint_routes_resize_binary_message() {
+        let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32)>(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (touch_tx, _) = mpsc::channel(4);
+        let (mouse_tx, _) = mpsc::channel(4);
+        let (key_tx, _) = mpsc::channel(4);
+        let (encoder_control_tx, _encoder_control_rx) = mpsc::channel(4);
+        let (pending_ping_tx, _) = mpsc::channel(4);
+        let (_, bitrate_rx) = watch::channel(2_000_000usize);
+        let (_, codec_rx) = watch::channel(String::new());
+        let (_, cursor_rx) = watch::channel(CursorUpdate::Default);
+        let force_render = Arc::new(AtomicBool::new(false));
+        let state = SignalingState::new(
+            resize_tx,
+            touch_tx,
+            mouse_tx,
+            key_tx,
+            None,
+            None,
+            encoder_control_tx,
+            force_render,
+            pending_ping_tx,
+            bitrate_rx,
+            codec_rx,
+            shutdown_rx,
+            SessionManager::new(Vec::new(), String::new(), shutdown_tx),
+            None,
+            cursor_rx,
+        );
+        let server = SignalingServer::new(state);
+
+        let addr = "127.0.0.1:27351";
+        tokio::spawn(async move {
+            server.serve("127.0.0.1", 27351, std::future::pending()).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut stream = ws_handshake(addr, "/client").await;
+        // Drain the 3 initial CONTROL frames (bitrate, codec, cursor).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for _ in 0..3 {
+            let _ = read_ws_frame(&mut stream).await;
+        }
+
+        // Build a MSG_CLIENT_MSG binary frame containing a Resize JSON (the
+        // same format WsTransport::send() produces).
+        let resize_json =
+            serde_json::to_vec(&SignalingMessage::Resize { width: 1280, height: 720 }).unwrap();
+        let frame = proto::encode_msg(proto::MSG_CLIENT_MSG, 0, &resize_json);
+
+        // Send a masked WebSocket binary frame (client→server must be masked).
+        use tokio::io::AsyncWriteExt;
+        let mask: [u8; 4] = [0x37, 0xfa, 0x21, 0x3d];
+        let payload_len = frame.len();
+        let mut ws_frame = Vec::new();
+        ws_frame.push(0x82u8); // FIN=1, opcode=binary(2)
+        ws_frame.push(0x80 | payload_len as u8); // MASK=1, len (single byte for <126)
+        ws_frame.extend_from_slice(&mask);
+        for (i, b) in frame.iter().enumerate() {
+            ws_frame.push(b ^ mask[i % 4]);
+        }
+        stream.write_all(&ws_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        // Give the server handler a moment to dispatch the message.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let received = resize_rx.try_recv().expect("resize_rx should have received (1280, 720)");
+        assert_eq!(received, (1280, 720));
+    }
 }

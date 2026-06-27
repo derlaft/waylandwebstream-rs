@@ -424,6 +424,14 @@ impl EglRenderer {
     }
 
     fn render_frame(&mut self, frame: &DecodedFrame) -> Result<()> {
+        // Skip frames significantly different from the current viewport.
+        // After a resize, old-size frames arrive until the server processes
+        // our Resize message; rendering them stretches them into the new
+        // viewport producing a distorted image.  The 2 px tolerance handles
+        // the server's ÷2 alignment rounding (at most 1 px per dimension).
+        if frame.width.abs_diff(self.width) > 2 || frame.height.abs_diff(self.height) > 2 {
+            return Ok(());
+        }
         unsafe {
             glViewport(0, 0, self.width as i32, self.height as i32);
             // Clear with alpha=1 before drawing so the framebuffer never

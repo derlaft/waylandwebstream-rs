@@ -63,6 +63,9 @@ fn which(bin: &str) -> Option<PathBuf> {
 }
 
 fn run_test() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     write_control("white")?;
     let port = pick_free_port();
 
@@ -116,21 +119,41 @@ fn run_visual_pipeline(port: u16) -> Result<()> {
             .send(&serde_json::to_string(&SignalingMessage::Ready).expect("Ready serializes"))
             .await
             .context("send Ready")?;
-        transport
-            .send(
-                &serde_json::to_string(&SignalingMessage::Resize { width: 1280, height: 720 })
-                    .expect("Resize serializes"),
-            )
-            .await
-            .context("send Resize")?;
 
         let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel(1);
         let display =
             spawn_display_thread((1280, 720), frame_rx, RendererKind::Shm)
                 .context("spawn display thread")?;
-        let _decoder = spawn_decoder(transport, frame_tx).await?;
+        eprintln!("smoke_e2e: display thread spawned");
 
-        let elapsed = wait_for_render_count(&display, 1, FIRST_FRAME_TIMEOUT).await?;
+        // Wait for the display thread to receive the actual window size from
+        // labwc (labwc may differ from the initial 1280×720 due to server-side
+        // decorations). Using that size for Resize keeps the server in sync.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            display.size_rx.clone().changed(),
+        )
+        .await
+        .context("display thread never received initial configure")??;
+        // Settle — labwc often sends a second configure shortly after the first.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (actual_w, actual_h) = *display.size_rx.borrow();
+        eprintln!("smoke_e2e: labwc configured window at {actual_w}x{actual_h}");
+        transport
+            .send(
+                &serde_json::to_string(&SignalingMessage::Resize {
+                    width: actual_w,
+                    height: actual_h,
+                })
+                .expect("Resize serializes"),
+            )
+            .await
+            .context("send Resize")?;
+
+        let (_decoder, decoded_count) = spawn_decoder(transport, frame_tx).await?;
+        eprintln!("smoke_e2e: decoder spawned");
+
+        let elapsed = wait_for_render_count(&display, 1, FIRST_FRAME_TIMEOUT, &decoded_count).await?;
         eprintln!("smoke_e2e: first rendered frame at t={elapsed:?}");
         // Wait for at least a couple of vsyncs + margin so the screenshot
         // sees the actual frame content, not the prime buffer.
@@ -193,39 +216,56 @@ fn run_visual_pipeline(port: u16) -> Result<()> {
 async fn spawn_decoder(
     mut transport: WsTransport,
     frame_tx: std::sync::mpsc::SyncSender<native_client::decode::sw::DecodedFrame>,
-) -> Result<tokio::task::JoinHandle<()>> {
+) -> Result<(tokio::task::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicU64>)> {
     use native_client::decode::sw::spawn_decoder_thread;
     let (packet_tx, packet_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+    let ws_frame_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let ws_frame_count2 = ws_frame_count.clone();
     let handle = tokio::spawn(async move {
+        let mut ctrl = 0u64;
         loop {
             match transport.recv().await {
                 Ok(Frame::VideoFrame { data, .. }) => {
+                    let n = ws_frame_count2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 3 { eprintln!("smoke_e2e: ws video frame #{n} len={}", data.len()); }
                     let _ = packet_tx.try_send(data);
                 }
-                Ok(_) => {}
-                Err(_) => break,
+                Ok(_) => { ctrl += 1; eprintln!("smoke_e2e: ws ctrl frame #{ctrl}"); }
+                Err(e) => { eprintln!("smoke_e2e: ws recv error: {e:#}"); break; }
             }
         }
+        eprintln!("smoke_e2e: ws recv loop exited");
     });
-    let _ = spawn_decoder_thread(packet_rx, frame_tx);
-    Ok(handle)
+    let (_, decoded_count) = spawn_decoder_thread(packet_rx, frame_tx);
+    Ok((handle, decoded_count))
 }
 
 async fn wait_for_render_count(
     display: &native_client::display::DisplayHandle,
     target: u64,
     timeout: Duration,
+    decoded_count: &std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<Duration> {
     let start = Instant::now();
+    let mut last_log = Instant::now();
     loop {
         let now = display.render_counter.load(std::sync::atomic::Ordering::Relaxed);
         if now >= target {
             return Ok(start.elapsed());
         }
         if start.elapsed() > timeout {
+            let decoded = decoded_count.load(std::sync::atomic::Ordering::Relaxed);
             return Err(anyhow!(
-                "render_count never reached {target} within {timeout:?} (last: {now})"
+                "render_count never reached {target} within {timeout:?} (render={now}, decoded={decoded})"
             ));
+        }
+        if last_log.elapsed() > Duration::from_secs(2) {
+            let decoded = decoded_count.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "smoke_e2e: waiting... render={now} decoded={decoded} elapsed={:?}",
+                start.elapsed()
+            );
+            last_log = Instant::now();
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

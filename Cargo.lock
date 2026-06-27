@@ -2311,6 +2311,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.26.2",
+ "tracing-subscriber",
  "wayland-client",
  "wayland-protocols 0.32.13",
 ]

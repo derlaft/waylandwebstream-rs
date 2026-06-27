@@ -140,6 +140,7 @@ fn main() -> Result<()> {
     eprintln!("payload-client: configured at {}x{}", state.size.0, state.size.1);
 
     let mut current_color = state.color;
+    let mut committed_size = state.size;
     let mut buffer = create_colored_buffer(&shm, &qh, state.size, current_color)?;
     surface.attach(Some(&buffer), 0, 0);
     surface.damage_buffer(0, 0, state.size.0 as i32, state.size.1 as i32);
@@ -168,6 +169,25 @@ fn main() -> Result<()> {
             break;
         }
 
+        // Compositor sent a resize configure — submit a new correctly-sized
+        // buffer immediately so the compositor can render the new size.
+        // Without this the server's smithay compositor gets stale (it only
+        // re-renders on new commits, not on a resize by itself).
+        if state.size != committed_size {
+            eprintln!(
+                "payload-client: resizing buffer {}x{} → {}x{}",
+                committed_size.0, committed_size.1, state.size.0, state.size.1
+            );
+            committed_size = state.size;
+            buffer = create_colored_buffer(&shm, &qh, committed_size, current_color)?;
+            surface.attach(Some(&buffer), 0, 0);
+            surface.damage_buffer(0, 0, committed_size.0 as i32, committed_size.1 as i32);
+            surface.commit();
+            last_commit = Instant::now();
+            event_queue.flush().ok();
+            continue;
+        }
+
         if let Some(requested) = read_control(&args.control_file) {
             if requested != current_color {
                 eprintln!("payload-client: switching to {:?}", requested);
@@ -183,7 +203,10 @@ fn main() -> Result<()> {
         }
 
         // Periodic re-commit to keep the compositor from going idle.
+        // Re-attach the buffer explicitly: some compositors (smithay headless)
+        // don't re-render on damage-only commits without a new attach.
         if last_commit.elapsed() >= COMMIT_INTERVAL {
+            surface.attach(Some(&buffer), 0, 0);
             surface.damage_buffer(0, 0, state.size.0 as i32, state.size.1 as i32);
             surface.commit();
             last_commit = Instant::now();

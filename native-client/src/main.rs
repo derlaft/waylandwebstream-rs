@@ -83,7 +83,14 @@ async fn main() -> Result<()> {
     // --- Wayland display (Phase 4+) + input channel (Phase 7) ---
     let mut display = spawn_display_thread(INITIAL_WINDOW_SIZE, frame_rx, renderer_kind)
         .context("Wayland display")?;
-    let initial_size = *display.size_rx.borrow();
+
+    // Wait for the display thread's initial xdg_toplevel::configure so we
+    // send the real compositor-assigned size, not the hard-coded fallback.
+    // Local Wayland IPC is fast; 2 s is a very generous ceiling.
+    let _ = tokio::time::timeout(Duration::from_secs(2), display.size_rx.changed()).await;
+    // borrow_and_update marks this version as seen so the resize arm in the
+    // select! loop below doesn't fire again for the initial configure.
+    let initial_size = *display.size_rx.borrow_and_update();
     info!("window initial size: {}x{}", initial_size.0, initial_size.1);
 
     // --- transport (Phase 3) ---

@@ -79,6 +79,12 @@ pub struct DisplayHandle {
     #[allow(dead_code)]
     pub release_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub input_rx: tokio::sync::mpsc::Receiver<SignalingMessage>,
+    /// Inject a synthetic compositor configure event for integration tests.
+    /// Sending `(w, h)` causes the display thread to resize its renderer as
+    /// if the compositor had sent an xdg_toplevel::configure at that size,
+    /// without needing a real Wayland compositor to trigger it.
+    #[allow(dead_code)]
+    pub synthetic_resize_tx: std::sync::mpsc::SyncSender<(u32, u32)>,
 }
 
 /// Spawn the Wayland display thread.
@@ -92,6 +98,7 @@ pub fn spawn_display_thread(
     let render_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let release_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (input_tx, input_rx) = tokio::sync::mpsc::channel::<SignalingMessage>(64);
+    let (synthetic_resize_tx, synthetic_resize_rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(4);
 
     let counters = DisplayCounters {
         render: render_counter.clone(),
@@ -109,13 +116,21 @@ pub fn spawn_display_thread(
                 counters,
                 input_tx,
                 renderer_kind,
+                synthetic_resize_rx,
             ) {
                 warn!("display thread exited: {e:#}");
             }
         })
         .context("failed to spawn display thread")?;
 
-    Ok(DisplayHandle { size_rx, close_rx, render_counter, release_counter, input_rx })
+    Ok(DisplayHandle {
+        size_rx,
+        close_rx,
+        render_counter,
+        release_counter,
+        input_rx,
+        synthetic_resize_tx,
+    })
 }
 
 // ── Private types ─────────────────────────────────────────────────────────────
@@ -200,6 +215,7 @@ fn run_display_loop(
     counters: DisplayCounters,
     input_tx: tokio::sync::mpsc::Sender<SignalingMessage>,
     renderer_kind: RendererKind,
+    synthetic_resize_rx: std::sync::mpsc::Receiver<(u32, u32)>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env()
         .context("could not connect to Wayland compositor (is $WAYLAND_DISPLAY set?)")?;
@@ -238,7 +254,6 @@ fn run_display_loop(
         keyboard: None,
         pointer: None,
         pointer_pos: (0.5, 0.5),
-        initial_size,
         width: initial_size.0,
         height: initial_size.1,
         configured: false,
@@ -321,6 +336,18 @@ fn run_display_loop(
         event_queue.dispatch_pending(&mut state).context("dispatch_pending")?;
         event_queue.flush().ok();
 
+        // Synthetic resize injection (used by integration tests to simulate a
+        // compositor configure without needing to resize an actual Wayland output).
+        if let Ok((w, h)) = synthetic_resize_rx.try_recv() {
+            if (w, h) != (state.width, state.height) {
+                debug!("synthetic resize inject: {}x{} → {w}x{h}", state.width, state.height);
+                state.width = w;
+                state.height = h;
+                let _ = state.size_tx.send((w, h));
+                state.pending_resize = Some((w, h));
+            }
+        }
+
         // Apply any resize that arrived in this tick's configure event BEFORE
         // draining frames.  After ack_configure the next committed buffer must
         // have the new size; draining frames first could commit an old-sized
@@ -388,7 +415,6 @@ struct DisplayState {
     /// Last pointer position in 0..1 surface-local coordinates.
     pointer_pos: (f64, f64),
 
-    initial_size: (u32, u32),
     width: u32,
     height: u32,
     /// Set on first WindowHandler::configure; used to gate renderer creation.
@@ -478,13 +504,20 @@ impl WindowHandler for DisplayState {
         _serial: u32,
     ) {
         // SCTK has already sent ack_configure before calling us.
-        let w = configure.new_size.0.map(|v| v.get()).unwrap_or(self.initial_size.0);
-        let h = configure.new_size.1.map(|v| v.get()).unwrap_or(self.initial_size.1);
+        // Fall back to the current window dimensions when the compositor sends
+        // None for a dimension (meaning "client chooses") — NOT the original
+        // initial_size, which would revert back to 1280×720 on e.g. tiling
+        // configure events.
+        let w = configure.new_size.0.map(|v| v.get()).unwrap_or(self.width);
+        let h = configure.new_size.1.map(|v| v.get()).unwrap_or(self.height);
 
         if !self.configured {
             self.width = w;
             self.height = h;
             self.configured = true;
+            // Signal main.rs so it sends the real compositor-assigned size as
+            // the initial Resize, not the hard-coded INITIAL_WINDOW_SIZE.
+            let _ = self.size_tx.send((w, h));
             debug!("initial configure: {w}x{h} decoration={:?}", configure.decoration_mode);
         } else if (w, h) != (self.width, self.height) {
             debug!("resize configure: {}x{} → {w}x{h}", self.width, self.height);

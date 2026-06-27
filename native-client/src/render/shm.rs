@@ -306,13 +306,12 @@ impl ShmRenderer {
 
         let slot = self.slots[idx].as_mut().unwrap();
 
-        // Skip frames whose dimensions don't match the current slot.  After a
-        // resize the server keeps sending old-size frames until it processes
-        // our Resize message.  Blitting an old-size frame into a new-size slot
-        // produces a visible crop/letterbox glitch; showing black (the
-        // zero-initialised slot) is cleaner.  Frames at the new size start
-        // arriving once the server keyframe is emitted (~1–2 s).
-        if frame.width != slot.width || frame.height != slot.height {
+        // Skip frames significantly different from the current slot.  After a
+        // resize, old-size frames arrive until the server processes our Resize
+        // message; blitting them produces a visible crop/letterbox glitch.
+        // A tolerance of 2 px handles the server's ÷2 alignment rounding
+        // (at most 1 px per dimension).
+        if frame.width.abs_diff(slot.width) > 2 || frame.height.abs_diff(slot.height) > 2 {
             tracing::debug!(
                 "skipping frame {}x{} (slot {}x{})",
                 frame.width, frame.height, slot.width, slot.height

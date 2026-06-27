@@ -175,3 +175,57 @@ pub struct TouchPoint {
     #[serde(default)]
     pub pressure: f64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_serializes_to_expected_json() {
+        let msg = SignalingMessage::Resize { width: 800, height: 600 };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(json, r#"{"type":"resize","width":800,"height":600}"#);
+    }
+
+    #[test]
+    fn resize_round_trips_through_json() {
+        let original = SignalingMessage::Resize { width: 1920, height: 1080 };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: SignalingMessage = serde_json::from_str(&json).expect("deserialize");
+        match parsed {
+            SignalingMessage::Resize { width, height } => {
+                assert_eq!(width, 1920);
+                assert_eq!(height, 1080);
+            }
+            other => panic!("expected Resize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resize_round_trips_through_client_framing() {
+        use crate::proto;
+        let msg = SignalingMessage::Resize { width: 800, height: 600 };
+        let json = serde_json::to_vec(&msg).expect("serialize");
+        let frame = proto::encode_msg(proto::MSG_CLIENT_MSG, 0, &json);
+
+        // Verify the header is well-formed.
+        assert_eq!(frame.len(), proto::HEADER_LEN + json.len());
+        assert_eq!(frame[0], proto::MSG_CLIENT_MSG);
+
+        // Decode the payload and verify it round-trips.
+        let (msg_type, _flags, payload_len) = proto::decode_header(
+            frame[..proto::HEADER_LEN].try_into().unwrap(),
+        );
+        assert_eq!(msg_type, proto::MSG_CLIENT_MSG);
+        assert_eq!(payload_len as usize, json.len());
+        let payload = &frame[proto::HEADER_LEN..proto::HEADER_LEN + payload_len as usize];
+        let parsed: SignalingMessage = serde_json::from_slice(payload).expect("deserialize");
+        match parsed {
+            SignalingMessage::Resize { width, height } => {
+                assert_eq!(width, 800);
+                assert_eq!(height, 600);
+            }
+            other => panic!("expected Resize, got {other:?}"),
+        }
+    }
+}

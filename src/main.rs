@@ -519,9 +519,11 @@ async fn main() -> Result<()> {
 
         // Check for resize requests (non-blocking)
         if let Ok((req_width, req_height)) = resize_rx.try_recv() {
-            // Ensure dimensions are divisible by 16 for optimal H.264 encoding
-            let new_width = (req_width / 16) * 16;
-            let new_height = (req_height / 16) * 16;
+            // YUV 4:2:0 requires even dimensions; round down to the nearest
+            // even number.  ÷16 macroblock alignment is NOT required — x264
+            // pads internally and signals the crop via SPS.
+            let new_width = req_width & !1u32;
+            let new_height = req_height & !1u32;
             
             // Validate minimum dimensions (minimum 16x16 after rounding)
             if new_width < 16 || new_height < 16 {
