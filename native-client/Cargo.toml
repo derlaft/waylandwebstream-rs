@@ -9,6 +9,16 @@ description = "Native Wayland client for the waylandwebstream /client endpoint -
 name = "wws-client"
 path = "src/main.rs"
 
+# Library target so integration tests under tests/ can drive the
+# same code paths the binary uses. The binary still has its own
+# `mod decode; mod display; mod transport; mod types;` declarations
+# -- they shadow the lib here, which is fine because we only need
+# the modules to be importable by tests/, not to share code with the
+# binary.
+[lib]
+name = "native_client"
+path = "src/lib.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.26"

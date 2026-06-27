@@ -48,6 +48,7 @@ pub enum FrameError {
 /// Transport trait. `recv` returns a fully-decoded `Frame`; `send` wraps a
 /// JSON `SignalingMessage` in a `MSG_CLIENT_MSG` framed message before
 /// shipping it -- callers don't see the proto header.
+#[allow(async_fn_in_trait)] // no Send bound needed; both impls are single-threaded
 pub trait Transport: Send {
     async fn recv(&mut self) -> Result<Frame>;
     async fn send(&mut self, json: &str) -> Result<()>;

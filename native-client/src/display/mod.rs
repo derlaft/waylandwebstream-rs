@@ -39,6 +39,14 @@ pub struct DisplayHandle {
     /// Flips to `true` when `xdg_toplevel::Close` fires. The display thread
     /// then breaks out of its loop.
     pub close_rx: watch::Receiver<bool>,
+    /// Counter of successful `ShmRenderer::render` calls (i.e. a
+    /// decoded frame was actually attached + committed to the
+    /// surface). Smoke tests use this to assert "frames are
+    /// reaching the window" without driving the compositor directly.
+    /// Set up after `spawn_display_thread` returns, so read it
+    /// lazily in tests that need it.
+    #[allow(dead_code)] // read by integration tests, not by the main binary
+    pub render_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Spawn the Wayland display thread. `frame_rx` is consumed by the
@@ -59,17 +67,29 @@ pub fn spawn_display_thread(
 ) -> Result<DisplayHandle> {
     let (size_tx, size_rx) = watch::channel(initial_size);
     let (close_tx, close_rx) = watch::channel(false);
+    // Shared with the renderer so observers (smoke tests, the main
+    // loop's debug log) can read "frames attached to the surface"
+    // without borrowing the renderer directly. See
+    // `DisplayHandle::render_counter`.
+    let render_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+    let counter_for_thread = render_counter.clone();
     thread::Builder::new()
         .name("wws-display".into())
         .spawn(move || {
-            if let Err(e) = run_display_loop(initial_size, size_tx, close_tx, frame_rx) {
+            if let Err(e) =
+                run_display_loop(initial_size, size_tx, close_tx, frame_rx, counter_for_thread)
+            {
                 warn!("display thread exited: {e:#}");
             }
         })
         .context("failed to spawn display thread")?;
 
-    Ok(DisplayHandle { size_rx, close_rx })
+    Ok(DisplayHandle {
+        size_rx,
+        close_rx,
+        render_counter,
+    })
 }
 
 fn run_display_loop(
@@ -77,6 +97,7 @@ fn run_display_loop(
     size_tx: watch::Sender<(u32, u32)>,
     close_tx: watch::Sender<bool>,
     frame_rx: mpsc::Receiver<DecodedFrame>,
+    render_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env()
         .context("could not connect to Wayland compositor (is $WAYLAND_DISPLAY set?)")?;
@@ -124,6 +145,10 @@ fn run_display_loop(
 
     let mut renderer = ShmRenderer::new(shm, surface.clone(), &qh, state.width, state.height)
         .context("create SHM renderer")?;
+    // Replace the renderer's internal counter with the shared one
+    // so the DisplayHandle returned to the caller observes the same
+    // increments. Cheap: just an Arc swap.
+    renderer.install_render_counter(render_counter.clone());
     if !renderer.prime() {
         warn!("renderer could not prime initial buffer");
     } else {

@@ -77,6 +77,12 @@ pub struct ShmRenderer {
     /// Index of the slot we'd prefer to write into next (we toggle
     /// between 0 and 1, but skip slots that aren't released yet).
     next_idx: usize,
+    /// Successful `render` calls. Useful for smoke tests that want
+    /// to assert "frames are actually reaching the surface" without
+    /// observing the Wayland compositor directly. Wrapped in a
+    /// shared `Arc` so the test can read it without borrowing the
+    /// renderer's owner.
+    render_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ShmRenderer {
@@ -102,9 +108,29 @@ impl ShmRenderer {
             width,
             height,
             next_idx: 0,
+            render_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         renderer.recreate_slots(qh)?;
         Ok(renderer)
+    }
+
+    /// Return a handle to the render counter. Tests (and any other
+    /// observer) can read `count.load(Relaxed)` without borrowing the
+    /// renderer.
+    #[allow(dead_code)] // currently used only by integration tests
+    pub fn render_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.render_count.clone()
+    }
+
+    /// Replace the render counter with one supplied by the caller.
+    /// `spawn_display_thread` uses this so the `DisplayHandle`
+    /// returned to the caller observes the same increments as the
+    /// renderer (one shared `Arc`, no extra plumbing).
+    pub fn install_render_counter(
+        &mut self,
+        counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        self.render_count = counter;
     }
 
     /// Drop and reallocate both slots at the current `width x height`.
@@ -277,6 +303,8 @@ impl ShmRenderer {
         self.surface.commit();
 
         self.next_idx = (idx + 1) % NUM_SLOTS;
+        self.render_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
             "rendered slot={idx} {}x{} ({}x{} source)",
             slot.width, slot.height, frame.width, frame.height
