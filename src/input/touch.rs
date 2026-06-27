@@ -134,19 +134,16 @@ impl TouchHandler {
                 }
                 state.touch_frame();
             }
-            TouchEvent::Cancel { touches } => {
-                debug!("Touch cancel: {} touches", touches.len());
-                for touch in touches {
-                    if let Some(touch_state) = self.active_touches.remove(&touch.identifier) {
-                        debug!(
-                            "Touch {} cancelled at ({:.1}, {:.1})",
-                            touch.identifier, touch_state.x, touch_state.y
-                        );
-                    }
-                }
-                // wl_touch.cancel ends the whole sequence, not individual
-                // slots, so it's only sent once per batch regardless of how
-                // many touches the browser reported as cancelled.
+            TouchEvent::Cancel { .. } => {
+                // wl_touch.cancel is a global cancellation of the entire touch
+                // sequence, not a per-contact release. All active contacts are
+                // invalidated at once. Clear the full map rather than iterating
+                // the event's touch list: the client-side filter may have already
+                // dropped some identifiers (e.g., contacts whose coordinates went
+                // off-screen before the cancel fired), so the list can be
+                // incomplete.
+                debug!("Touch cancel: clearing {} active touches", self.active_touches.len());
+                self.active_touches.clear();
                 state.touch_cancel();
             }
         }
@@ -329,6 +326,34 @@ mod tests {
         let (x, y) = handler.to_compositor_coords(0.5, 0.5);
         assert_eq!(x, 1920.0);
         assert_eq!(y, 1080.0);
+    }
+
+    /// `touchcancel` must clear ALL active touches, not just the ones listed in
+    /// the event. The browser's changedTouches list can be incomplete (e.g. when
+    /// coordinates went off-screen and the client dropped some identifiers), and
+    /// wl_touch.cancel is a global protocol-level cancellation in any case.
+    #[test]
+    fn test_cancel_clears_all_active_touches_even_when_event_list_is_empty() {
+        let (_event_loop, _display, mut comp_state) = test_compositor_state();
+        let mut handler = TouchHandler::new(1920, 1080);
+
+        // Start two touches.
+        handler.handle_event(
+            TouchEvent::Start {
+                touches: vec![
+                    TouchPoint { identifier: 0, x: 0.3, y: 0.3, pressure: 0.5 },
+                    TouchPoint { identifier: 1, x: 0.7, y: 0.7, pressure: 0.5 },
+                ],
+            },
+            &mut comp_state,
+        );
+        assert_eq!(handler.active_touch_count(), 2);
+
+        // Cancel with an EMPTY touch list — simulates the client dropping all
+        // identifiers because both contacts were off-screen when cancel fired.
+        // The handler must still clear both active touches.
+        handler.handle_event(TouchEvent::Cancel { touches: vec![] }, &mut comp_state);
+        assert_eq!(handler.active_touch_count(), 0);
     }
 
     #[test]

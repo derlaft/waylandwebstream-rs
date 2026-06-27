@@ -7,17 +7,33 @@ export function attachInput(
   canvas: HTMLCanvasElement,
   sendControl: (msg: ClientMessage) => void,
 ): () => void {
-  function normalizeTouches(touchList: TouchList): TouchPoint[] {
+  // Converts a TouchList to normalized [0,1] coordinates.
+  //
+  // `clampOutOfBounds = false` (touchstart only): drops contacts whose
+  // coordinates are outside the canvas. A new contact starting off the
+  // canvas should not be tracked at all.
+  //
+  // `clampOutOfBounds = true` (touchmove / touchend / touchcancel): clamps
+  // instead of dropping. A finger that slid off the screen still needs to
+  // send its release event; if the touchend is dropped the server is left
+  // with a phantom active touch that never gets released. Phantom touches
+  // combine with real ones to look like multi-touch to the remote app --
+  // that is what causes spurious context menus on the next single tap.
+  function normalizeTouches(touchList: TouchList, clampOutOfBounds: boolean): TouchPoint[] {
     const rect = canvas.getBoundingClientRect();
     const touches: TouchPoint[] = [];
     for (let i = 0; i < touchList.length; i++) {
       const touch = touchList[i];
       const x = (touch.clientX - rect.left) / rect.width;
       const y = (touch.clientY - rect.top) / rect.height;
-      // Drop touches outside [0,1] -- a defensive clamp against
-      // floating-point rect math at the exact edge, now that the canvas's
-      // CSS box always matches the viewport exactly (see viewport.ts).
-      if (x >= 0 && x <= 1 && y >= 0 && y <= 1) {
+      if (clampOutOfBounds) {
+        touches.push({
+          identifier: touch.identifier,
+          x: Math.min(Math.max(x, 0), 1),
+          y: Math.min(Math.max(y, 0), 1),
+          pressure: touch.force || 0.5,
+        });
+      } else if (x >= 0 && x <= 1 && y >= 0 && y <= 1) {
         touches.push({ identifier: touch.identifier, x, y, pressure: touch.force || 0.5 });
       }
     }
@@ -28,7 +44,8 @@ export function attachInput(
     eventType: 'touchstart' | 'touchmove' | 'touchend' | 'touchcancel',
     touchList: TouchList,
   ): void {
-    const touches = normalizeTouches(touchList);
+    const clamp = eventType !== 'touchstart';
+    const touches = normalizeTouches(touchList, clamp);
     if (touches.length > 0) {
       sendControl({ type: 'touch', eventType, touches });
     }
@@ -107,12 +124,30 @@ export function attachInput(
   const onContextMenu = (e: Event): void => e.preventDefault();
   canvas.addEventListener('contextmenu', onContextMenu);
 
+  // Browsers report wheel deltas in three different units depending on the
+  // device and browser. Firefox physical mouse wheels use DOM_DELTA_LINE
+  // (deltaY ≈ 3), while Chrome uses DOM_DELTA_PIXEL (deltaY ≈ 100) for the
+  // same physical click. Passing raw values through would make scrolling
+  // behave completely differently across browsers. Normalize everything to
+  // CSS pixels so the server always sees one consistent unit.
+  const LINE_HEIGHT_PX = 40; // 1 line ≈ 40px; 3 Firefox lines ≈ 120px ≈ Chrome's ~100px
+  function normalizedWheelDelta(e: WheelEvent, canvasHeight: number): { deltaX: number; deltaY: number } {
+    if (e.deltaMode === WheelEvent.DOM_DELTA_LINE) {
+      return { deltaX: e.deltaX * LINE_HEIGHT_PX, deltaY: e.deltaY * LINE_HEIGHT_PX };
+    }
+    if (e.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+      return { deltaX: e.deltaX * canvasHeight, deltaY: e.deltaY * canvasHeight };
+    }
+    return { deltaX: e.deltaX, deltaY: e.deltaY };
+  }
+
   const onWheel = (e: WheelEvent): void => {
     e.preventDefault();
     const rect = canvas.getBoundingClientRect();
     const x = Math.min(Math.max((e.clientX - rect.left) / rect.width, 0), 1);
     const y = Math.min(Math.max((e.clientY - rect.top) / rect.height, 0), 1);
-    sendControl({ type: 'pointer', eventType: 'wheel', x, y, deltaX: e.deltaX, deltaY: e.deltaY });
+    const { deltaX, deltaY } = normalizedWheelDelta(e, rect.height);
+    sendControl({ type: 'pointer', eventType: 'wheel', x, y, deltaX, deltaY });
   };
   canvas.addEventListener('wheel', onWheel, { passive: false });
 

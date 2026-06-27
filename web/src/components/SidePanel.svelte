@@ -15,11 +15,19 @@
   function close(): void {
     if (!open) return;
     open = false;
-    tabEl?.focus();
+    // Return keyboard focus to the stream canvas so remote input works
+    // immediately. Focusing tabEl here would steal focus from the canvas
+    // (e.g. when Escape is pressed while the canvas had focus), breaking
+    // keyboard input to the remote app until the user clicks the canvas again.
+    document.querySelector<HTMLCanvasElement>('canvas')?.focus();
   }
 
   function toggle(): void {
-    open = !open;
+    if (open) {
+      close();
+    } else {
+      open = true;
+    }
   }
 
   // Capture-phase so this runs before canvas input handlers (input.ts) --
