@@ -176,13 +176,9 @@ fn run_display_loop(
     // so the DisplayHandle returned to the caller observes the same
     // increments. Cheap: just an Arc swap.
     renderer.install_render_counter(counters.render.clone());
+    info!("window created: {}x{}", state.width, state.height);
     if !renderer.prime() {
-        warn!("renderer could not prime initial buffer");
-    } else {
-        info!(
-            "window created: title=\"waylandwebstream\" size={}x{}",
-            state.width, state.height
-        );
+        warn!("renderer: no free slot for initial commit");
     }
     state.renderer = Some(renderer);
 
@@ -203,10 +199,6 @@ fn run_display_loop(
                 .unwrap_or_else(|| "<no renderer>".into()),
         );
 
-        // Drain decoded frames first (fast, non-blocking). This is
-        // what makes the window *show* new pictures -- if no frame is
-        // available, we fall through to blocking_dispatch to wait for
-        // compositor events.
         let frames_drained = match state
             .renderer
             .as_mut()
@@ -256,21 +248,10 @@ fn run_display_loop(
             }
         }
 
-        // Non-blocking read from the Wayland socket, then dispatch
-        // any newly-buffered events (wl_buffer::Release, frame
-        // callbacks, xdg_wm_base::Ping, etc.).
-        //
-        // IMPORTANT: in wayland-client 0.31, `dispatch_pending` alone
-        // does NOT read from the socket — it only dispatches events
-        // that are already in the queue's internal buffer. Without the
-        // explicit prepare_read + read step, Release events sent by the
-        // compositor never land in the buffer and both SHM slots stay
-        // "held" indefinitely, starving the renderer after the very
-        // first frame. `blocking_dispatch` reads from the socket but
-        // blocks until an event arrives, which would stall frame_rx
-        // polling. The prepare_read + non-blocking read is the correct
-        // idiom for a tight event loop; see the docs on
-        // EventQueue::prepare_read.
+        // `dispatch_pending` alone does NOT read from the socket — it
+        // only dispatches already-buffered events. Without prepare_read
+        // + read, wl_buffer::Release events never arrive and both SHM
+        // slots stay held indefinitely (slot starvation).
         if let Some(guard) = event_queue.prepare_read() {
             let _ = guard.read(); // non-blocking: returns Ok(0) if no data
         }
@@ -428,16 +409,6 @@ impl Dispatch<xdg_wm_base_protocol::XdgWmBase, ()> for DisplayState {
     }
 }
 
-/// xdg_surface::Configure carries a serial we MUST ack before committing,
-/// or the compositor treats the next commit as out-of-sync. The size
-/// itself comes from the xdg_toplevel Configure event (xdg_surface's
-/// Configure is per-surface, xdg_toplevel's is per-role).
-///
-/// After the ack we also commit the surface. The xdg-shell spec requires
-/// a commit to "apply" each configure event; without it the compositor
-/// may keep sending configures or consider the client non-responsive. The
-/// commit here re-commits the current surface state (last attached buffer
-/// unchanged) — it is not a new frame, just a protocol acknowledgement.
 impl Dispatch<xdg_surface_protocol::XdgSurface, ()> for DisplayState {
     fn event(
         state: &mut Self,
@@ -458,9 +429,6 @@ impl Dispatch<xdg_surface_protocol::XdgSurface, ()> for DisplayState {
     }
 }
 
-/// The compositor's authoritative surface size (per the xdg-shell spec).
-/// A width/height of 0 means "pick something" -- we fall back to the
-/// `initial_size` so a misbehaving compositor can't leave us at 0x0.
 impl Dispatch<xdg_toplevel_protocol::XdgToplevel, ()> for DisplayState {
     fn event(
         state: &mut Self,
@@ -512,8 +480,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for DisplayState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // Phase 4 binds the seat but doesn't yet request its input
-        // capabilities. Phase 7 fills this in.
+        // Seat is bound for future input forwarding; no events handled yet.
     }
 }
 
@@ -526,10 +493,7 @@ impl Dispatch<wl_shm::WlShm, ()> for DisplayState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // wl_shm::Format advertises supported pixel formats. We use
-        // Argb8888 unconditionally; ignoring means we don't react if
-        // a compositor claims it doesn't support it (then we'd
-        // negotiate). Phase 5 keeps it simple.
+        // Format advertisements; we use Argb8888 unconditionally.
     }
 }
 
@@ -546,11 +510,8 @@ impl Dispatch<wl_shm_pool::WlShmPool, SlotId> for DisplayState {
     }
 }
 
-/// `wl_buffer::release` for the *placeholder* user-data type. Phase 5
-/// no longer uses the placeholder -- the renderer's slots carry
-/// `SlotId` as their user data (see the next impl). Kept around as a
-/// no-op so any stray placeholder buffer (left over from an aborted
-/// startup, for example) doesn't panic the event loop.
+// No-op: keeps the event loop from panicking if a placeholder buffer
+// gets a Release (e.g. from a stale startup buffer).
 impl Dispatch<wl_buffer::WlBuffer, ()> for DisplayState {
     fn event(
         _: &mut Self,
@@ -563,9 +524,6 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for DisplayState {
     }
 }
 
-/// `wl_buffer::release` for the *renderer* buffers. The user data is
-/// the slot index (`SlotId`), so we route the release back to the
-/// renderer's slot table.
 impl Dispatch<wl_buffer::WlBuffer, SlotId> for DisplayState {
     fn event(
         state: &mut Self,

@@ -1,21 +1,9 @@
 // Double-buffered wl_shm renderer for decoded video frames.
 //
-// `ShmRenderer` is owned by the Wayland display thread and holds the
-// `wl_surface` + `wl_shm` proxies the renderer needs to allocate new
-// buffers. It also owns the two buffer slots; the `wl_buffer` user
-// data carries the slot index so the `wl_buffer::Release` Dispatch
-// impl can find the right slot to mark available again (see
-// `DisplayState::release_buffer`).
-//
-// Resolution policy (see Q2 in Phase 5 design): on a size mismatch
-// between the decoded frame and the window we do a centered memcpy of
-// `min(frame, buf)` rows/cols -- the compositor scales the rest. This
-// avoids a second swscale pass on the hot path. The server already
-// rescales on resize so the race is short.
-//
-// Vsync: Phase 5 commits on every decoded frame. That can mean
-// 30-60 commits/sec, well within what wl_shm handles. Phase 9 (EGL
-// renderer) replaces this with `wl_callback` frame throttling.
+// Owns two `BufferSlot`s; the `wl_buffer` user data carries the slot index
+// so `wl_buffer::Release` events can mark the right slot free again. On a
+// frame/window size mismatch we blit a centered `min(frame, buf)` region
+// and let the compositor scale; the server rescales on resize anyway.
 
 use anyhow::{Context, Result};
 use std::ffi::CString;
@@ -82,11 +70,6 @@ pub struct ShmRenderer {
     /// Index of the slot we'd prefer to write into next (we toggle
     /// between 0 and 1, but skip slots that aren't released yet).
     next_idx: usize,
-    /// Successful `render` calls. Useful for smoke tests that want
-    /// to assert "frames are actually reaching the surface" without
-    /// observing the Wayland compositor directly. Wrapped in a
-    /// shared `Arc` so the test can read it without borrowing the
-    /// renderer's owner.
     render_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -119,18 +102,9 @@ impl ShmRenderer {
         Ok(renderer)
     }
 
-    /// Return a handle to the render counter. Tests (and any other
-    /// observer) can read `count.load(Relaxed)` without borrowing the
-    /// renderer.
-    #[allow(dead_code)] // currently used only by integration tests
-    pub fn render_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
-        self.render_count.clone()
-    }
-
     /// Replace the render counter with one supplied by the caller.
     /// `spawn_display_thread` uses this so the `DisplayHandle`
-    /// returned to the caller observes the same increments as the
-    /// renderer (one shared `Arc`, no extra plumbing).
+    /// returned to the caller observes the same increments.
     pub fn install_render_counter(
         &mut self,
         counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -301,7 +275,6 @@ impl ShmRenderer {
             return Ok(false);
         };
 
-        // SAFETY: we just checked the slot exists.
         let slot = self.slots[idx].as_mut().unwrap();
         let frame_w = frame.width.min(slot.width);
         let frame_h = frame.height.min(slot.height);
@@ -325,10 +298,6 @@ impl ShmRenderer {
         self.next_idx = (idx + 1) % NUM_SLOTS;
         self.render_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        tracing::info!(
-            "rendered slot={idx} {}x{} ({}x{} source)",
-            slot.width, slot.height, frame.width, frame.height
-        );
         Ok(true)
     }
 
@@ -359,11 +328,6 @@ fn pick_next_released(released: &[bool; NUM_SLOTS], preferred: usize) -> Option<
         .find(|i| released[*i])
 }
 
-/// Allocate one wl_shm memfd + pool + buffer pair. Mirrors
-/// `attach_placeholder_buffer` in `display/mod.rs` but returns the
-/// components (the placeholder path stays because Phase 4 needs it
-/// before any decoded frame arrives -- the renderer takes over on the
-/// first frame).
 fn create_buffer_slot<State>(
     shm: &wl_shm::WlShm,
     qh: &QueueHandle<State>,
@@ -502,10 +466,6 @@ mod tests {
 
     #[test]
     fn pick_next_released_returns_none_when_all_held() {
-        // The pathological state the original bug produced: both
-        // slots marked unreleased because the compositor's
-        // wl_buffer::Release events were never read off the socket.
-        // (See run_display_loop's blocking_dispatch comment.)
         assert_eq!(pick_next_released(&[false, false], 0), None);
         assert_eq!(pick_next_released(&[false, false], 1), None);
     }
