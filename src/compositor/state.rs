@@ -445,47 +445,27 @@ impl WaylandWebStreamState {
                                     std::slice::from_raw_parts(ptr.offset(buffer_offset), expected_len)
                                 };
                                 
-                                // Scale the client buffer to fill the space available to it
-                                // on the output. Windows are configured to match the output
-                                // size, but we scale rather than copy 1:1 so the picture still
-                                // fills the screen for a frame or two while a client catches up
-                                // to a viewport resize (or doesn't honor it exactly).
+                                // Copy the buffer into the output at 1:1 scale, clipping to
+                                // whichever is smaller in each dimension. The GL compositor
+                                // (GlCompositor) renders windows at 1:1 in the space too, so
+                                // keeping SW consistent means surface_at can use the same
+                                // 1:1 coordinate formula for both paths without
+                                // introducing a scale factor that only one renderer applies.
+                                // The render_buffer is zero-initialised above, so any output
+                                // pixels not covered by the buffer remain black.
                                 let target_width = self.width.saturating_sub(window_pos_x);
                                 let target_height = self.height.saturating_sub(window_pos_y);
 
                                 if buffer_width > 0 && buffer_height > 0 && target_width > 0 && target_height > 0 {
-                                    if buffer_width == target_width && buffer_height == target_height {
-                                        // Steady-state case: the client buffer already matches
-                                        // its target 1:1 (the common case, since windows are
-                                        // configured fullscreen). Scaling only matters for the
-                                        // frame or two a client lags a viewport resize by, so
-                                        // there's no need to fast-path that path too -- just
-                                        // copy row-by-row (respecting stride) instead of running
-                                        // the per-pixel scaling loop below.
-                                        let row_bytes = (buffer_width * 4) as usize;
-                                        for y in 0..buffer_height {
-                                            let src_idx = (y * buffer_stride) as usize;
-                                            let dest_idx = (((window_pos_y + y) * self.width + window_pos_x) * 4) as usize;
-                                            if src_idx + row_bytes <= pixel_data.len() && dest_idx + row_bytes <= render_buffer.len() {
-                                                render_buffer[dest_idx..dest_idx + row_bytes]
-                                                    .copy_from_slice(&pixel_data[src_idx..src_idx + row_bytes]);
-                                            }
-                                        }
-                                    } else {
-                                        for dest_y in 0..target_height {
-                                            let src_y = (dest_y as u64 * buffer_height as u64 / target_height as u64) as u32;
-                                            for dest_x in 0..target_width {
-                                                let src_x = (dest_x as u64 * buffer_width as u64 / target_width as u64) as u32;
-
-                                                let src_idx = (src_y * buffer_stride + src_x * 4) as usize;
-                                                let dest_idx = (((window_pos_y + dest_y) * self.width + (window_pos_x + dest_x)) * 4) as usize;
-
-                                                if src_idx + 3 < pixel_data.len() && dest_idx + 3 < render_buffer.len() {
-                                                    // Copy ARGB8888/XRGB8888 pixel
-                                                    render_buffer[dest_idx..dest_idx + 4]
-                                                        .copy_from_slice(&pixel_data[src_idx..src_idx + 4]);
-                                                }
-                                            }
+                                    let copy_w = buffer_width.min(target_width);
+                                    let copy_h = buffer_height.min(target_height);
+                                    let row_bytes = (copy_w * 4) as usize;
+                                    for dest_y in 0..copy_h {
+                                        let src_idx = (dest_y * buffer_stride) as usize;
+                                        let dest_idx = (((window_pos_y + dest_y) * self.width + window_pos_x) * 4) as usize;
+                                        if src_idx + row_bytes <= pixel_data.len() && dest_idx + row_bytes <= render_buffer.len() {
+                                            render_buffer[dest_idx..dest_idx + row_bytes]
+                                                .copy_from_slice(&pixel_data[src_idx..src_idx + row_bytes]);
                                         }
                                     }
                                 }
@@ -543,16 +523,12 @@ impl WaylandWebStreamState {
     /// space. Used by both touch and pointer injection.
     ///
     /// Every window is configured to occupy the entire output (see
-    /// `configure_toplevel_fullscreen`), and `render()` scales whatever
-    /// buffer a client has actually attached to fill the output regardless
-    /// of the buffer's real pixel size -- a client can lag a viewport
-    /// resize by a frame or more, or simply never resize at all (see the
-    /// `wayland-touch-client` test client). `Space::element_under` hit-tests
+    /// `configure_toplevel_fullscreen`). Both SW and GL renderers copy the
+    /// buffer at 1:1 scale (clipping if the buffer is larger than the output,
+    /// leaving black fill if it is smaller). `Space::element_under` hit-tests
     /// against the literal, possibly-stale buffer bbox, which would make
-    /// most of a touch test client's window untouchable. So for hit
-    /// testing, any point within the output belongs to the topmost window,
-    /// scaled into its buffer space the same way `render()` scales the
-    /// other direction.
+    /// most of a touch test client's window untouchable, so for hit testing
+    /// any point within the output belongs to the topmost window.
     fn surface_at(&self, location: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
         if location.x < 0.0
             || location.y < 0.0
@@ -573,11 +549,13 @@ impl WaylandWebStreamState {
         let rel_x = (location.x - origin_x).clamp(0.0, target_w);
         let rel_y = (location.y - origin_y).clamp(0.0, target_h);
 
-        let bbox = window.bbox();
-        let buffer_w = (bbox.size.w.max(1)) as f64;
-        let buffer_h = (bbox.size.h.max(1)) as f64;
-
-        let surface_local = Point::<f64, Logical>::from((rel_x * buffer_w / target_w, rel_y * buffer_h / target_h));
+        // 1:1 mapping: compositor coordinates ARE surface-local coordinates.
+        // Both SW and GL renderers now copy the buffer at 1:1 (clipping when
+        // the buffer is larger than the output), so no bbox-based scale factor
+        // is needed here. Using bbox dimensions as a scale multiplier was
+        // consistent only with the old SW scale-to-fill path; it produced
+        // wrong coordinates under GL (which always clips, never scales).
+        let surface_local = Point::<f64, Logical>::from((rel_x, rel_y));
         Some((surface, surface_local))
     }
 

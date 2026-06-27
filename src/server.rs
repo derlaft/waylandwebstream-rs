@@ -358,6 +358,8 @@ async fn websocket_handler(socket: WebSocket, state: SignalingState) {
     let mut codec_rx = state.codec_rx.clone();
     let mut cursor_rx = state.cursor_rx.clone();
     let mut shutdown_rx = state.shutdown_rx.clone();
+    // Save for post-disconnect cleanup (state is moved into the loop below).
+    let touch_tx_cleanup = state.touch_tx.clone();
 
     // Push the current bitrate right away -- otherwise a client connecting
     // between adaptive-bitrate adjustments would see nothing until the next
@@ -429,6 +431,7 @@ loop {
             }
         }
     }
+    let _ = touch_tx_cleanup.send(TouchEvent::Cancel { touches: vec![] }).await;
 }
 
 async fn send_server_message(
@@ -762,6 +765,11 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
     }
 
     info!("Unified client disconnected");
+    // Cancel any in-progress touches so the next session doesn't inherit
+    // phantom active-touch entries from a session that closed mid-gesture.
+    // wl_touch.cancel is a global reset -- the empty-list form clears all
+    // active contacts, matching what TouchHandler::handle_event(Cancel) does.
+    let _ = state.touch_tx.send(TouchEvent::Cancel { touches: vec![] }).await;
 }
 
 /// Wire layout for a unified `MSG_VIDEO_FRAME` payload (after the 8-byte

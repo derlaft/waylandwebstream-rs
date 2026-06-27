@@ -77,10 +77,15 @@ export class Viewport {
       this.update();
     });
 
-    window.addEventListener('resize', this.handleViewportChange);
-    window.addEventListener('orientationchange', this.handleViewportChange);
-    window.visualViewport?.addEventListener('resize', this.handleViewportChange);
-    window.visualViewport?.addEventListener('scroll', this.handleViewportChange);
+    window.addEventListener('resize', this.handleWindowResize);
+    window.addEventListener('orientationchange', this.handleWindowResize);
+    // visualViewport events fire on discrete mobile changes (URL bar
+    // show/hide, soft keyboard). Apply them immediately so the canvas CSS
+    // size and touch-coordinate denominator are always current. The debounce
+    // only guards against the continuous stream of events from desktop
+    // drag-resize (window.resize), which these are not.
+    window.visualViewport?.addEventListener('resize', this.handleVisualViewportChange);
+    window.visualViewport?.addEventListener('scroll', this.handleVisualViewportChange);
 
     this.update();
   }
@@ -89,10 +94,10 @@ export class Viewport {
     this.unsubscribeScale?.();
     this.unsubscribeScale = null;
 
-    window.removeEventListener('resize', this.handleViewportChange);
-    window.removeEventListener('orientationchange', this.handleViewportChange);
-    window.visualViewport?.removeEventListener('resize', this.handleViewportChange);
-    window.visualViewport?.removeEventListener('scroll', this.handleViewportChange);
+    window.removeEventListener('resize', this.handleWindowResize);
+    window.removeEventListener('orientationchange', this.handleWindowResize);
+    window.visualViewport?.removeEventListener('resize', this.handleVisualViewportChange);
+    window.visualViewport?.removeEventListener('scroll', this.handleVisualViewportChange);
 
     if (this.debounceTimer !== null) {
       clearTimeout(this.debounceTimer);
@@ -100,11 +105,15 @@ export class Viewport {
     }
   }
 
-  private handleViewportChange = (): void => {
+  private handleWindowResize = (): void => {
     if (this.debounceTimer !== null) {
       clearTimeout(this.debounceTimer);
     }
     this.debounceTimer = setTimeout(() => this.update(), RESIZE_DEBOUNCE_MS);
+  };
+
+  private handleVisualViewportChange = (): void => {
+    this.update();
   };
 
   private update(): void {

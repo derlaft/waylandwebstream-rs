@@ -93,8 +93,8 @@ impl TouchHandler {
                     };
                     self.active_touches.insert(touch.identifier, touch_state);
                     debug!(
-                        "Touch {} down at ({:.1}, {:.1}) pressure={:.2}",
-                        touch.identifier, x, y, touch.pressure
+                        "Touch {} down: norm=({:.4}, {:.4}) -> comp=({:.1}, {:.1}) [dim {}x{}]",
+                        touch.identifier, touch.x, touch.y, x, y, self.width, self.height
                     );
                     state.touch_down(touch.identifier, x, y);
                 }

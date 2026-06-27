@@ -21,11 +21,14 @@ export function attachInput(
   // that is what causes spurious context menus on the next single tap.
   function normalizeTouches(touchList: TouchList, clampOutOfBounds: boolean): TouchPoint[] {
     const rect = canvas.getBoundingClientRect();
+    const vv = window.visualViewport;
+    const w = vv && vv.width > 0 ? vv.width : rect.width;
+    const h = vv && vv.height > 0 ? vv.height : rect.height;
     const touches: TouchPoint[] = [];
     for (let i = 0; i < touchList.length; i++) {
       const touch = touchList[i];
-      const x = (touch.clientX - rect.left) / rect.width;
-      const y = (touch.clientY - rect.top) / rect.height;
+      const x = (touch.clientX - rect.left) / w;
+      const y = (touch.clientY - rect.top) / h;
       if (clampOutOfBounds) {
         touches.push({
           identifier: touch.identifier,
