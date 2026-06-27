@@ -672,6 +672,20 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
                     Ok(packet) => packet,
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!("Unified client video lagging, skipped {} frame(s)", skipped);
+                        // Authoritative congestion: this client's socket
+                        // drained slower than the encoder produced, so frames
+                        // piled past the small broadcast buffer and were
+                        // dropped. Unlike a keyframe request (which the browser
+                        // also fires on a purely local decode stall), the send
+                        // path only backs up when the link genuinely can't
+                        // carry the current rate -- feed it straight to the
+                        // bitrate controller. try_send (not await) so a full
+                        // event queue can't stall this hot send loop; the
+                        // controller's own cooldown coalesces the repeated lags
+                        // a sustained stall produces.
+                        if let Some(ref bitrate_event_tx) = state.bitrate_event_tx {
+                            let _ = bitrate_event_tx.try_send(BitrateEvent::SendBacklog);
+                        }
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,

@@ -5,13 +5,18 @@
 //! decrease (AIMD) congestion avoidance, remembering the post-cut rate as a
 //! `ssthresh` ceiling so future growth stops there before probing further.
 //!
-//! The congestion signal is the client's bursty-arrival report
+//! The primary congestion signal is server-side send backpressure
+//! (`BitrateEvent::SendBacklog`): when a client's outbound socket drains
+//! slower than the encoder produces, frames pile past the small per-client
+//! broadcast buffer and get dropped (the `Lagged` arm in `src/server.rs`).
+//! That is measured right at the bottleneck -- the send socket -- and is
+//! loss-equivalent: direct evidence the current rate doesn't fit this
+//! client's link, the same way a dropped TCP segment is evidence a window
+//! was too large. A client's bursty-arrival report
 //! (`BitrateEvent::ArrivalStall`, derived from `burst_count` in
-//! `SignalingMessage::Latency`): several frames landing within milliseconds
-//! of each other means a batch queued up somewhere in the network path and
-//! released all at once -- loss-equivalent evidence the current rate doesn't
-//! fit the path, the same way a dropped TCP segment is evidence a window was
-//! too large.
+//! `SignalingMessage::Latency`) is a secondary, client-side corroborator of
+//! the same condition for paths where the server's own writes don't visibly
+//! stall. Both cut the rate identically.
 //!
 //! A client's keyframe-request (`SignalingMessage::RequestKeyframe`) is
 //! deliberately *not* a congestion signal. It fires whenever the client's
@@ -51,13 +56,21 @@ use crate::encoder::EncoderControl;
 /// Signal fed into the controller from the server's signaling handlers.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BitrateEvent {
+    /// The server's per-client send path fell behind: frames piled past the
+    /// small outbound broadcast buffer and were dropped because the socket
+    /// drained slower than the encoder produced (the `Lagged` arm in
+    /// src/server.rs). The most direct congestion signal there is -- measured
+    /// at the actual bottleneck -- and one a client's *local* decode/render
+    /// stall can't fake, since that doesn't slow the server's TCP writes (the
+    /// browser keeps draining the socket into its message queue regardless of
+    /// how fast it decodes).
+    SendBacklog,
     /// The client reported several frames landing within milliseconds of
     /// each other (see `SignalingMessage::Latency::burst_count` in
     /// src/server.rs): a batch that queued up somewhere in the network path
-    /// between server and client and released all at once. This is the
-    /// controller's congestion signal -- it means the current rate doesn't
-    /// fit the path right now, the same way a dropped TCP segment means a
-    /// window was too large.
+    /// between server and client and released all at once. A secondary,
+    /// client-side corroborator of the same "rate doesn't fit the path"
+    /// condition that `SendBacklog` reports from the server side.
     ArrivalStall,
     /// A client's self-reported average decode latency (ms) over its most
     /// recent reporting window.
@@ -254,7 +267,7 @@ impl AdaptiveBitrateController {
             tokio::select! {
                 event = self.event_rx.recv() => {
                     match event {
-                        Some(BitrateEvent::ArrivalStall) => {
+                        Some(BitrateEvent::SendBacklog) | Some(BitrateEvent::ArrivalStall) => {
                             if let Some(new_rate) = self.algo.on_congestion(Instant::now()) {
                                 self.apply(new_rate).await;
                             }
