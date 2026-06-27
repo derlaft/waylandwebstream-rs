@@ -54,11 +54,11 @@ const ARRIVAL_STALL_BURST_THRESHOLD: u32 = 5;
 /// before falling behind again. Forcing a *new* keyframe on every one of
 /// those requests only makes things worse: keyframes are bigger and slower
 /// to decode than the delta frames they replace, so spamming them feeds
-/// more load into an already-overloaded pipe. The adaptive-bitrate cut this
-/// also triggers (`BitrateEvent::KeyframeRequested`) is the actual remedy,
-/// but it has its own multi-second cooldown (`decrease_cooldown`) -- without
-/// this gate, dozens of full-size forced keyframes can go out before a
-/// single cut lands. Unlike `decrease_cooldown`, this applies unconditionally
+/// more load into an already-overloaded pipe. This gate is the only thing
+/// bounding forced-keyframe spam from a struggling client: a keyframe request
+/// no longer cuts the bitrate (that signal proved to be local decode jank far
+/// more often than a too-high rate -- see adaptive_bitrate.rs), so there's no
+/// `decrease_cooldown` backstop behind it. The gate applies unconditionally
 /// (even with adaptive bitrate disabled), since the keyframe-spam problem
 /// exists independent of whether the bitrate is allowed to change.
 const KEYFRAME_FORCE_COOLDOWN: Duration = Duration::from_millis(500);
@@ -891,14 +891,16 @@ async fn dispatch_signaling_message(signal: SignalingMessage, state: &SignalingS
         }
         SignalingMessage::RequestKeyframe => {
             info!("Client requested a keyframe resync (decoder fell behind)");
-            // Always feed the congestion signal -- `BitrateAlgorithm`
-            // has its own (longer) cooldown on actually cutting, so
-            // this can't over-cut even when called every loop of a
-            // tight resync spiral.
-            if let Some(ref bitrate_event_tx) = state.bitrate_event_tx {
-                let _ = bitrate_event_tx.send(BitrateEvent::KeyframeRequested).await;
-            }
-            // But don't force a *new* keyframe more often than
+            // A keyframe request is a *local* decode-pacing concern, not a
+            // congestion signal -- in the browser it's dominated by transient
+            // main-thread stalls, not by the rate being too high (the native
+            // client decodes the same stream without ever requesting one). So
+            // it forces an IDR to resync the client but deliberately does not
+            // touch the bitrate; genuine network congestion comes in via the
+            // bursty-arrival path (`BitrateEvent::ArrivalStall`) instead. See
+            // adaptive_bitrate.rs.
+            //
+            // Don't force a *new* keyframe more often than
             // `KEYFRAME_FORCE_COOLDOWN` -- see its doc comment for
             // why honoring every request here can spiral.
             let should_force = {
@@ -955,9 +957,9 @@ async fn dispatch_signaling_message(signal: SignalingMessage, state: &SignalingS
             {
                 let _ = bitrate_event_tx.send(BitrateEvent::Latency(ms)).await;
             }
-            // Bursty arrival with a shallow decode queue is
-            // network-level congestion the keyframe-request
-            // signal can't see -- cut on it directly. See
+            // Bursty arrival is network-level congestion: a batch of
+            // frames queued up in the path and released at once. This is
+            // the signal the controller actually cuts on. See
             // `BitrateEvent::ArrivalStall`.
             if burst_count >= ARRIVAL_STALL_BURST_THRESHOLD {
                 warn!(

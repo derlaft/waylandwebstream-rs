@@ -5,19 +5,30 @@
 //! decrease (AIMD) congestion avoidance, remembering the post-cut rate as a
 //! `ssthresh` ceiling so future growth stops there before probing further.
 //!
-//! The congestion signal is the client's keyframe-request message
-//! (`SignalingMessage::RequestKeyframe` in `src/server.rs`) -- sent only
-//! when its WebCodecs decode queue has actually backed up, never on a
-//! routine new-client connect (that path forces a keyframe directly without
-//! going through this message). That makes it a loss-equivalent signal:
-//! unambiguous evidence the current rate is too high for this client, in
-//! the same way a dropped TCP segment is evidence a window was too large.
+//! The congestion signal is the client's bursty-arrival report
+//! (`BitrateEvent::ArrivalStall`, derived from `burst_count` in
+//! `SignalingMessage::Latency`): several frames landing within milliseconds
+//! of each other means a batch queued up somewhere in the network path and
+//! released all at once -- loss-equivalent evidence the current rate doesn't
+//! fit the path, the same way a dropped TCP segment is evidence a window was
+//! too large.
+//!
+//! A client's keyframe-request (`SignalingMessage::RequestKeyframe`) is
+//! deliberately *not* a congestion signal. It fires whenever the client's
+//! decode queue backs up, but in the browser that is dominated by transient
+//! main-thread stalls (e.g. Firefox's synchronous GPU readback on the
+//! VideoFrame->canvas blit), not by the rate being too high -- the native
+//! client decodes the same stream without ever backing up. Treating it as
+//! congestion let a purely local rendering hiccup cut the shared encoder's
+//! rate and then kept it suppressed for seconds while AIMD crawled back. The
+//! keyframe request now only forces an IDR so the client can resync; it has
+//! no bitrate effect.
 //!
 //! Client-reported decode latency is a secondary, softer signal: it can't
 //! trigger a cut on its own (a single slow decode doesn't mean the rate is
 //! wrong), but it holds off growth while elevated so the controller doesn't
-//! keep climbing into a backlog that just hasn't produced a keyframe
-//! request yet.
+//! keep climbing into a backlog that just hasn't shown up as bursty
+//! arrival yet.
 //!
 //! All decisions live in `BitrateAlgorithm`, which takes plain `Instant`s
 //! and returns the new target without touching any channel -- this keeps
@@ -40,17 +51,13 @@ use crate::encoder::EncoderControl;
 /// Signal fed into the controller from the server's signaling handlers.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BitrateEvent {
-    /// A client's decoder fell behind and asked for a keyframe resync.
-    KeyframeRequested,
     /// The client reported several frames landing within milliseconds of
     /// each other (see `SignalingMessage::Latency::burst_count` in
-    /// src/server.rs) even though its decode queue never backs up. That
-    /// combination means the congestion is in the network path -- packets
-    /// queuing up somewhere between server and client and releasing all at
-    /// once -- not in the decoder, so `KeyframeRequested` (driven by
-    /// decode-queue depth) never fires for it. Cut exactly like a keyframe
-    /// request: from the algorithm's perspective both just mean "this rate
-    /// doesn't fit the path right now."
+    /// src/server.rs): a batch that queued up somewhere in the network path
+    /// between server and client and released all at once. This is the
+    /// controller's congestion signal -- it means the current rate doesn't
+    /// fit the path right now, the same way a dropped TCP segment means a
+    /// window was too large.
     ArrivalStall,
     /// A client's self-reported average decode latency (ms) over its most
     /// recent reporting window.
@@ -68,13 +75,13 @@ pub struct AdaptiveBitrateConfig {
     pub min_bitrate: usize,
     pub max_bitrate: usize,
     pub initial_bitrate: usize,
-    /// Multiplicative cut applied to the current bitrate on a keyframe
-    /// request. TCP Reno halves cwnd (0.5); video is less elastic and
+    /// Multiplicative cut applied to the current bitrate on a congestion
+    /// signal. TCP Reno halves cwnd (0.5); video is less elastic and
     /// x264's VBV cap already bounds the worst-case frame size, so this
     /// defaults to a gentler cut.
     pub decrease_factor: f64,
-    /// Minimum spacing between cuts -- coalesces a burst of keyframe
-    /// requests from the same underlying drop into a single cut, and gives
+    /// Minimum spacing between cuts -- coalesces a burst of congestion
+    /// signals from the same underlying stall into a single cut, and gives
     /// the new rate a moment to settle before growth resumes.
     pub decrease_cooldown: Duration,
     /// Per-tick multiplicative growth while in slow start.
@@ -142,10 +149,11 @@ impl BitrateAlgorithm {
             .is_some_and(|last| now.duration_since(last) < self.config.decrease_cooldown)
     }
 
-    /// Apply a keyframe-request (congestion) signal. Returns the new target
-    /// bitrate if it changed, or `None` if this was coalesced into an
-    /// already-active cooldown or the rate was already at the floor.
-    pub fn on_keyframe_requested(&mut self, now: Instant) -> Option<usize> {
+    /// Apply a congestion signal (bursty arrival -- see
+    /// `BitrateEvent::ArrivalStall`). Returns the new target bitrate if it
+    /// changed, or `None` if this was coalesced into an already-active
+    /// cooldown or the rate was already at the floor.
+    pub fn on_congestion(&mut self, now: Instant) -> Option<usize> {
         if self.in_cooldown(now) {
             return None;
         }
@@ -246,8 +254,8 @@ impl AdaptiveBitrateController {
             tokio::select! {
                 event = self.event_rx.recv() => {
                     match event {
-                        Some(BitrateEvent::KeyframeRequested) | Some(BitrateEvent::ArrivalStall) => {
-                            if let Some(new_rate) = self.algo.on_keyframe_requested(Instant::now()) {
+                        Some(BitrateEvent::ArrivalStall) => {
+                            if let Some(new_rate) = self.algo.on_congestion(Instant::now()) {
                                 self.apply(new_rate).await;
                             }
                         }

@@ -43,37 +43,37 @@ fn slow_start_grows_multiplicatively_until_the_ceiling() {
 }
 
 #[test]
-fn keyframe_request_cuts_bitrate_multiplicatively() {
+fn congestion_cuts_bitrate_multiplicatively() {
     let mut algo = BitrateAlgorithm::new(config());
     let t0 = Instant::now();
 
-    let new_rate = algo.on_keyframe_requested(t0).expect("should cut");
+    let new_rate = algo.on_congestion(t0).expect("should cut");
     assert_eq!(new_rate, (2_000_000.0 * 0.75) as usize);
     assert_eq!(algo.current_bitrate(), new_rate);
 }
 
 #[test]
-fn repeated_keyframe_requests_within_cooldown_are_coalesced() {
+fn repeated_congestion_within_cooldown_are_coalesced() {
     let mut algo = BitrateAlgorithm::new(config());
     let t0 = Instant::now();
 
-    let first_cut = algo.on_keyframe_requested(t0).expect("should cut");
+    let first_cut = algo.on_congestion(t0).expect("should cut");
 
-    // A second request 500ms later (well inside the 2s cooldown) is the
-    // same underlying drop event, not a fresh one -- shouldn't cut again.
-    let second = algo.on_keyframe_requested(t0 + Duration::from_millis(500));
+    // A second signal 500ms later (well inside the 2s cooldown) is the
+    // same underlying stall, not a fresh one -- shouldn't cut again.
+    let second = algo.on_congestion(t0 + Duration::from_millis(500));
     assert_eq!(second, None);
     assert_eq!(algo.current_bitrate(), first_cut);
 }
 
 #[test]
-fn keyframe_request_after_cooldown_cuts_again() {
+fn congestion_after_cooldown_cuts_again() {
     let mut algo = BitrateAlgorithm::new(config());
     let t0 = Instant::now();
 
-    let first_cut = algo.on_keyframe_requested(t0).expect("should cut");
+    let first_cut = algo.on_congestion(t0).expect("should cut");
     let second_cut = algo
-        .on_keyframe_requested(t0 + Duration::from_secs(3))
+        .on_congestion(t0 + Duration::from_secs(3))
         .expect("cooldown elapsed, should cut again");
 
     assert_eq!(second_cut, (first_cut as f64 * 0.75) as usize);
@@ -84,7 +84,7 @@ fn growth_holds_during_post_cut_cooldown() {
     let mut algo = BitrateAlgorithm::new(config());
     let t0 = Instant::now();
 
-    algo.on_keyframe_requested(t0).expect("should cut");
+    algo.on_congestion(t0).expect("should cut");
     let cut_rate = algo.current_bitrate();
 
     // A tick 1s later is still inside the 2s cooldown -- bitrate should
@@ -109,7 +109,7 @@ fn growth_holds_while_latency_is_elevated() {
 }
 
 #[test]
-fn keyframe_request_floors_at_min_bitrate() {
+fn congestion_floors_at_min_bitrate() {
     let mut algo = BitrateAlgorithm::new(AdaptiveBitrateConfig {
         initial_bitrate: 600_000,
         min_bitrate: 500_000,
@@ -120,7 +120,7 @@ fn keyframe_request_floors_at_min_bitrate() {
 
     // Repeated cuts should floor at min_bitrate, never go below it.
     for _ in 0..10 {
-        algo.on_keyframe_requested(now);
+        algo.on_congestion(now);
         now += Duration::from_secs(10);
     }
     assert_eq!(algo.current_bitrate(), 500_000);
@@ -135,7 +135,7 @@ fn switches_to_additive_increase_after_a_cut() {
     algo.tick(t0 + Duration::from_secs(1));
     algo.tick(t0 + Duration::from_secs(2));
 
-    algo.on_keyframe_requested(t0 + Duration::from_secs(2));
+    algo.on_congestion(t0 + Duration::from_secs(2));
     let post_cut = algo.current_bitrate();
 
     // Past the cooldown, growth should now be the fixed additive step
