@@ -161,7 +161,27 @@ impl H264Decoder {
         let (_, _, scaler) = self.scaler.as_mut().expect("just set");
         scaler.run(&raw, &mut self.rgb).context("swscale run")?;
 
-        let pixels = self.rgb.data(0).to_vec();
+        // swscale's `alloc` pads each row to an alignment boundary, so the
+        // frame's stride (`linesize[0]`) can exceed `width*4` whenever the
+        // width isn't already aligned (e.g. 850*4=3400 is not a multiple of
+        // 32/64). Copy row-by-row to strip that padding and produce the
+        // tightly-packed `width*height*4` buffer the renderer relies on
+        // (see the module/`DecodedFrame` docs). Copying the raw plane with
+        // `to_vec()` would leak the padding into the stream and skew every
+        // row, producing a diagonal-striped image at non-aligned sizes.
+        let stride = self.rgb.stride(0);
+        let row_bytes = width as usize * 4;
+        let data = self.rgb.data(0);
+        let pixels = if stride == row_bytes {
+            data.to_vec()
+        } else {
+            let mut packed = Vec::with_capacity(row_bytes * height as usize);
+            for y in 0..height as usize {
+                let start = y * stride;
+                packed.extend_from_slice(&data[start..start + row_bytes]);
+            }
+            packed
+        };
         Ok(Some(DecodedFrame {
             width,
             height,

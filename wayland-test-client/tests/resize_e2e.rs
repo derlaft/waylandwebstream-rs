@@ -234,9 +234,9 @@ async fn run_pipeline_async(port: u16) -> Result<()> {
         "resize_e2e: Resize({resized_w},{resized_h}) sent to server; waiting for new frames…"
     );
 
-    // ── Phase 3: wait for post-resize rendering ────────────────────────────────
-    let elapsed = wait_for_render_count(
-        &display, pre_resize_count + 3, POST_RESIZE_FRAME_TIMEOUT, &decoded_count,
+    // ── Phase 3: confirm pipeline works at new size (still white) ─────────────
+    wait_for_render_count(
+        &display, pre_resize_count + 2, POST_RESIZE_FRAME_TIMEOUT, &decoded_count,
     )
     .await
     .map_err(|e| {
@@ -244,32 +244,75 @@ async fn run_pipeline_async(port: u16) -> Result<()> {
         let decoded = decoded_count.load(Ordering::Relaxed);
         anyhow!(
             "{e} (render_count before={pre_resize_count} after={after} decoded={decoded}). \
-             Black screen after resize: renderer not accepting frames at {resized_w}×{resized_h}. \
+             No frames after resize: renderer not accepting frames at {resized_w}×{resized_h}. \
              Check {SERVER_LOG} / {SERVER_ERR}"
         )
     })?;
     eprintln!(
-        "resize_e2e: {} new frames in {elapsed:.1?} after resize",
+        "resize_e2e: {} frame(s) rendered at new size",
         display.render_counter.load(Ordering::Relaxed) - pre_resize_count,
     );
+
+    // ── Phase 4: switch payload to black — catch stale/wrong-size frames ──────
+    // Writing "black" makes payload-client commit a black buffer at the
+    // already-resized compositor size.  If the server never received our Resize
+    // (or is encoding at the wrong dimensions), the renderer will reject
+    // old-size frames and the screenshot will NOT be mostly dark → test fails.
+    let post_resize_count = display.render_counter.load(Ordering::Relaxed);
+    std::fs::write(CONTROL_FILE, "black").context("switch payload to black")?;
+    eprintln!("resize_e2e: payload switched to black; waiting for dark frames…");
+
+    wait_for_render_count(
+        &display, post_resize_count + 3, POST_RESIZE_FRAME_TIMEOUT, &decoded_count,
+    )
+    .await
+    .map_err(|e| {
+        let after = display.render_counter.load(Ordering::Relaxed);
+        let decoded = decoded_count.load(Ordering::Relaxed);
+        anyhow!(
+            "{e} (render={after} decoded={decoded}). \
+             Dark frames never arrived after payload color switch. \
+             Check {SERVER_LOG} / {SERVER_ERR}"
+        )
+    })?;
+    // Extra settle time — pipeline needs to flush the color-switch through
+    // encode → transport → decode → render before the screenshot.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     grim_screenshot(SCREENSHOT_RESIZED)?;
-    let post_white = ppm_white_fraction(SCREENSHOT_RESIZED)?;
-    eprintln!("resize_e2e: post-resize screenshot — {:.1}% white", post_white * 100.0);
-    if post_white < COLOR_THRESHOLD {
+    let post_dark = ppm_black_fraction(SCREENSHOT_RESIZED)?;
+    eprintln!("resize_e2e: post-switch screenshot — {:.1}% dark", post_dark * 100.0);
+    if post_dark < COLOR_THRESHOLD {
         return Err(anyhow!(
-            "post-resize screenshot only {:.1}% white (expected ≥{:.0}%). \
-             Black screen or corruption after resize. See {SCREENSHOT_RESIZED}",
-            post_white * 100.0,
+            "post-resize screenshot only {:.1}% dark after switching payload to black \
+             (expected ≥{:.0}%). Stale or wrong-size buffer still displayed. \
+             See {SCREENSHOT_RESIZED}",
+            post_dark * 100.0,
             COLOR_THRESHOLD * 100.0,
         ));
     }
 
+    // ── Phase 5: verify server logged the resize at the correct dimensions ─────
+    // The server's tracing-subscriber writes to stdout → SERVER_LOG.
+    let resize_entry = format!("Resize complete: {resized_w}x{resized_h}");
+    let server_log = std::fs::read_to_string(SERVER_LOG).unwrap_or_default();
+    if !server_log.contains(&resize_entry) {
+        let tail: Vec<&str> = server_log.lines().rev().take(20).collect();
+        let tail: Vec<&str> = tail.into_iter().rev().collect();
+        return Err(anyhow!(
+            "server log ({SERVER_LOG}) never contained \"{resize_entry}\".\n\
+             Server did not process the resize to {resized_w}×{resized_h}.\n\
+             Server log tail:\n{}",
+            tail.join("\n")
+        ));
+    }
+    eprintln!("resize_e2e: server confirmed resize to {resized_w}×{resized_h}");
+
     eprintln!(
-        "resize_e2e: PASS — initial {:.0}% white, post-resize {:.0}% white",
+        "resize_e2e: PASS — initial {:.0}% white, post-resize {:.0}% dark, \
+         server confirmed resize to {resized_w}×{resized_h}",
         initial_white * 100.0,
-        post_white * 100.0,
+        post_dark * 100.0,
     );
     Ok(())
 }
@@ -367,6 +410,10 @@ fn wlr_randr_set_mode(w: u32, h: u32) -> Result<()> {
 
 fn ppm_white_fraction(path: &str) -> Result<f64> {
     ppm_color_fraction(path, |r, g, b| r > 240 && g > 240 && b > 240)
+}
+
+fn ppm_black_fraction(path: &str) -> Result<f64> {
+    ppm_color_fraction(path, |r, g, b| r < 15 && g < 15 && b < 15)
 }
 
 fn ppm_color_fraction(path: &str, pred: impl Fn(u8, u8, u8) -> bool) -> Result<f64> {
