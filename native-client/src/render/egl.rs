@@ -256,18 +256,18 @@ impl EglRenderer {
             anyhow::bail!("eglInitialize failed");
         }
 
-        // ── EGL config (RGB888 opaque, window surface, GLES2) ─────────
-        // EGL_ALPHA_SIZE = 0 selects an XRGB (opaque) visual so the
-        // compositor treats the surface as fully opaque.  With alpha=8
-        // the compositor picks ARGB and alpha-blends the surface; if the
-        // alpha channel is ever 0 (zero-init buffer, format mismatch, etc.)
-        // the window goes fully transparent.
+        // ── EGL config (RGBA8888, window surface, GLES2) ──────────────
+        // Keep EGL_ALPHA_SIZE = 8 (ARGB8888).  Requesting 0 selects an
+        // XRGB config that triggers a crash in Mesa's Wayland EGL backend
+        // on this platform.  Transparency is fixed via the fragment shader
+        // (outputs alpha=1.0 unconditionally) and by clearing to alpha=1
+        // at the start of every render_frame.
         #[rustfmt::skip]
         let config_attribs: [i32; 13] = [
             EGL_RED_SIZE,        8,
             EGL_GREEN_SIZE,      8,
             EGL_BLUE_SIZE,       8,
-            EGL_ALPHA_SIZE,      0,
+            EGL_ALPHA_SIZE,      8,
             EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
             EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
             EGL_NONE,
@@ -426,6 +426,10 @@ impl EglRenderer {
     fn render_frame(&mut self, frame: &DecodedFrame) -> Result<()> {
         unsafe {
             glViewport(0, 0, self.width as i32, self.height as i32);
+            // Clear with alpha=1 before drawing so the framebuffer never
+            // has alpha=0, which the compositor would blend as transparent.
+            glClearColor(0.0, 0.0, 0.0, 1.0);
+            glClear(GL_COLOR_BUFFER_BIT);
 
             // Upload BGRA frame data as GL_RGBA (swizzle in fragment shader).
             glActiveTexture(GL_TEXTURE0);
