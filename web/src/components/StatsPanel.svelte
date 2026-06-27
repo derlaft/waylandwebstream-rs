@@ -2,9 +2,24 @@
   import { streamStats } from '../lib/stats';
 </script>
 
+{#if $streamStats.videoPipeline !== null}
+  {@const v = $streamStats.videoPipeline}
+  <details class="info-debug">
+    <summary>Video pipeline</summary>
+    <dl class="stats">
+      <dt>Mode</dt>
+      <dd>{v.pipelineMode === 'worker' ? 'worker (off main thread)' : 'main thread'}</dd>
+      <dt>Renderer</dt>
+      <dd>{v.rendererBackend === '2d' ? '2D canvas (readback)' : v.rendererBackend}</dd>
+      <dt>Worker WebGL</dt>
+      <dd>{v.workerWebgl === null ? 'n/a' : v.workerWebgl ? 'yes' : 'no'}</dd>
+    </dl>
+  </details>
+{/if}
+
 {#if $streamStats.cursorDebug !== null}
   {@const c = $streamStats.cursorDebug}
-  <details open class="cursor-debug">
+  <details open class="info-debug">
     <summary>Cursor debug</summary>
     <dl class="stats">
       <dt>Messages</dt><dd>{c.count}</dd>
@@ -75,11 +90,11 @@
     font-variant-numeric: tabular-nums;
   }
 
-  .cursor-debug {
+  .info-debug {
     margin-bottom: 12px;
   }
 
-  .cursor-debug summary {
+  .info-debug summary {
     font-size: 12px;
     color: #aaa;
     cursor: pointer;

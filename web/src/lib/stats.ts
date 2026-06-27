@@ -12,9 +12,24 @@ export interface CursorDebug {
   imgW: number; imgH: number; // overlay dimensions
 }
 
+/// How the video is being decoded and painted, for the debug panel. Lets you
+/// confirm at a glance which path a given browser/device actually took --
+/// worker isolation vs main thread, and WebGL vs the 2D readback fallback.
+export interface VideoPipelineInfo {
+  /// Whether decode+render run in a worker (`worker`) or on the main thread.
+  pipelineMode: 'worker' | 'main';
+  /// The live render backend. `2d` means the slow readback fallback.
+  rendererBackend: 'webgl' | 'webgl2' | '2d';
+  /// Probe result: did a worker manage to create a WebGL context? `false`
+  /// means the worker path was abandoned for the main thread; `null` means a
+  /// worker was never attempted (no Worker/OffscreenCanvas support).
+  workerWebgl: boolean | null;
+}
+
 export interface StreamStats {
   connectionState: ConnectionState;
   cursorDebug: CursorDebug | null;
+  videoPipeline: VideoPipelineInfo | null;
   /// Glass-to-glass: ping round-trip (network + whole server pipeline,
   /// measured via the embedded-timestamp ping/echo in stream.ts) plus this
   /// client's own decode time. See `VideoStream.flushDiagnostics`.
@@ -42,6 +57,7 @@ export interface StreamStats {
 const initialStats: StreamStats = {
   connectionState: 'connecting',
   cursorDebug: null,
+  videoPipeline: null,
   endToEndLatencyMs: 0,
   resolution: null,
   arrivalGapAvgMs: 0,
@@ -64,6 +80,10 @@ export function setConnectionState(state: ConnectionState): void {
 
 export function setResolution(width: number, height: number): void {
   streamStats.update((s) => ({ ...s, resolution: { width, height } }));
+}
+
+export function setVideoPipelineInfo(info: VideoPipelineInfo): void {
+  streamStats.update((s) => ({ ...s, videoPipeline: info }));
 }
 
 export function reportEndToEndLatency(ms: number): void {

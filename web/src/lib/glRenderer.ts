@@ -15,6 +15,14 @@
 // reach for 2D when `getContext('webgl')` returns null (no context was
 // created), never after a WebGL context exists.
 
+// Both the on-screen canvas (main-thread fallback) and the worker's
+// OffscreenCanvas (Stage B) are valid render targets; everything the renderer
+// touches -- getContext, width/height, the context-loss events -- exists on
+// both.
+export type RenderCanvas = HTMLCanvasElement | OffscreenCanvas;
+
+export type RendererBackend = 'webgl' | 'webgl2' | '2d';
+
 export interface VideoRenderer {
   /// Upload and draw one decoded frame to the canvas. The canvas backing
   /// size is owned by the caller (see `ensureCanvasSize` in stream.ts); the
@@ -22,7 +30,7 @@ export interface VideoRenderer {
   draw(frame: VideoFrame): void;
   /// Which backend is live. Surfaced for diagnostics (e.g. confirming the
   /// fast path is actually in use on a given browser).
-  readonly backend: 'webgl' | '2d';
+  readonly backend: RendererBackend;
 }
 
 const VERTEX_SHADER = `
@@ -55,9 +63,9 @@ const QUAD = new Float32Array([
 ]);
 
 class WebGlVideoRenderer implements VideoRenderer {
-  readonly backend = 'webgl' as const;
+  readonly backend: 'webgl' | 'webgl2';
 
-  private readonly canvas: HTMLCanvasElement;
+  private readonly canvas: RenderCanvas;
   private readonly gl: WebGLRenderingContext;
   private program: WebGLProgram | null = null;
   private buffer: WebGLBuffer | null = null;
@@ -70,9 +78,10 @@ class WebGlVideoRenderer implements VideoRenderer {
   private lastW = -1;
   private lastH = -1;
 
-  constructor(canvas: HTMLCanvasElement, gl: WebGLRenderingContext) {
+  constructor(canvas: RenderCanvas, gl: WebGLRenderingContext, backend: 'webgl' | 'webgl2') {
     this.canvas = canvas;
     this.gl = gl;
+    this.backend = backend;
     canvas.addEventListener('webglcontextlost', this.onContextLost);
     canvas.addEventListener('webglcontextrestored', this.onContextRestored);
     this.initResources();
@@ -176,10 +185,13 @@ class WebGlVideoRenderer implements VideoRenderer {
 
 class Canvas2dVideoRenderer implements VideoRenderer {
   readonly backend = '2d' as const;
-  private readonly ctx: CanvasRenderingContext2D;
+  private readonly ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 
-  constructor(canvas: HTMLCanvasElement) {
-    const ctx = canvas.getContext('2d');
+  constructor(canvas: RenderCanvas) {
+    // getContext's overloads don't resolve cleanly over the canvas union;
+    // narrow to one member for the call (both return a drawImage-capable 2D
+    // context at runtime).
+    const ctx = (canvas as HTMLCanvasElement).getContext('2d');
     if (!ctx) throw new Error('2D canvas context unavailable');
     this.ctx = ctx;
   }
@@ -189,25 +201,49 @@ class Canvas2dVideoRenderer implements VideoRenderer {
   }
 }
 
-export function createVideoRenderer(canvas: HTMLCanvasElement): VideoRenderer {
-  // Opaque (video has no transparency), no depth/stencil, and a couple of
-  // latency hints. `desynchronized` asks the browser to skip the normal
-  // compositor sync for lower display latency; it's silently ignored where
-  // unsupported.
-  const gl = canvas.getContext('webgl', {
+// Acquire a WebGL context for the canvas, or null if WebGL isn't available.
+//
+// Only the plain opaque/no-buffer attributes are requested. We deliberately do
+// NOT ask for `desynchronized` (a low-latency presentation hint) or a
+// `powerPreference`: those are meant to be ignored when unsupported, but in
+// practice some Android Chrome builds return *null* for `desynchronized` -- on
+// the worker OffscreenCanvas and on the on-screen canvas alike -- which would
+// drop a perfectly WebGL-capable device to the slow 2D readback path. The
+// marginal latency win isn't worth losing WebGL over.
+//
+// `'experimental-webgl'` is not tried: it's valid on a regular canvas but
+// *throws* on an OffscreenCanvas (not in its context-id enum), and no
+// WebCodecs-capable browser needs it. Each getContext is still wrapped
+// defensively so nothing can throw out of acquisition and crash the worker.
+function acquireWebGl(
+  canvas: RenderCanvas,
+): { gl: WebGLRenderingContext; id: 'webgl' | 'webgl2' } | null {
+  const attrs: WebGLContextAttributes = {
     alpha: false,
     depth: false,
     stencil: false,
     antialias: false,
-    desynchronized: true,
-    powerPreference: 'high-performance',
-  }) as WebGLRenderingContext | null;
-
-  if (gl) {
+  };
+  // getContext's overloads don't resolve over the canvas union; narrow to one
+  // member for the call -- both expose the same context ids at runtime.
+  const target = canvas as HTMLCanvasElement;
+  for (const id of ['webgl', 'webgl2'] as const) {
+    let gl: WebGLRenderingContext | null = null;
     try {
-      const renderer = new WebGlVideoRenderer(canvas, gl);
-      console.info('Video renderer: WebGL');
-      return renderer;
+      gl = target.getContext(id, attrs) as WebGLRenderingContext | null;
+    } catch {
+      gl = null;
+    }
+    if (gl) return { gl, id };
+  }
+  return null;
+}
+
+export function createVideoRenderer(canvas: RenderCanvas): VideoRenderer {
+  const acquired = acquireWebGl(canvas);
+  if (acquired) {
+    try {
+      return new WebGlVideoRenderer(canvas, acquired.gl, acquired.id);
     } catch (e) {
       // The canvas is now WebGL-tainted, so we can't get a 2D context from
       // it. This only happens if a live context fails to compile a trivial
@@ -218,7 +254,10 @@ export function createVideoRenderer(canvas: HTMLCanvasElement): VideoRenderer {
     }
   }
 
-  // No WebGL at all: the canvas was never tainted, so 2D is still available.
-  console.info('Video renderer: 2D canvas (WebGL unavailable)');
+  // No WebGL: the canvas was never tainted, so 2D is still available. (On the
+  // worker path this is pre-empted by the WebGL probe in videoClient.ts, which
+  // keeps a worker that can't render off the canvas; this fallback is mainly
+  // the main-thread path on a WebGL-less browser.) The active backend is
+  // surfaced in the stats panel rather than logged.
   return new Canvas2dVideoRenderer(canvas);
 }

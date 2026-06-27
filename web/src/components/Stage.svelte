@@ -5,7 +5,7 @@
   import { attachInput } from '../lib/input';
   import type { ClientMessage, CursorUpdate } from '../lib/protocol';
   import { setCursorDebug } from '../lib/stats';
-  import { VideoStream } from '../lib/stream';
+  import { createVideoPipeline, type VideoPipeline } from '../lib/videoClient';
   import { Viewport } from '../lib/viewport';
 
   let canvas: HTMLCanvasElement;
@@ -19,11 +19,15 @@
   let cursorMsgCount = 0;
 
   let client: ClientChannel | null = null;
-  let stream: VideoStream | null = null;
+  let pipeline: VideoPipeline | null = null;
   let audio: AudioStream | null = null;
   let viewport: Viewport | null = null;
   let detachInput: (() => void) | null = null;
   let removeCursorListeners: (() => void) | null = null;
+  // The video pipeline resolves asynchronously (it probes worker WebGL before
+  // committing the canvas). If the component is torn down during that probe,
+  // this flag tells the pending resolution to drop the pipeline it built.
+  let disposed = false;
 
   function sendControl(msg: ClientMessage): void {
     client?.send(msg);
@@ -82,14 +86,15 @@
   }
 
   function teardown(): void {
+    disposed = true;
     removeCursorListeners?.();
     removeCursorListeners = null;
     detachInput?.();
     detachInput = null;
     viewport?.stop();
     viewport = null;
-    stream?.close();
-    stream = null;
+    pipeline?.close();
+    pipeline = null;
     audio?.close();
     audio = null;
     client?.close();
@@ -97,25 +102,38 @@
   }
 
   onMount(() => {
-    stream = new VideoStream({ canvas, sendControl });
     audio = new AudioStream();
+    audio.start();
 
+    // Construct the channel now (so the initial resize/ready buffer in its
+    // send queue) but connect it only once the pipeline is ready -- see below.
+    // Its callbacks reach `pipeline` lazily, and no video frames arrive until
+    // connect(), so there's no window where a frame could be dropped.
     client = new ClientChannel({
-      onCodec: (codec) => stream?.setCodec(codec),
+      onCodec: (codec) => pipeline?.setCodec(codec),
       onCursor: applyCursor,
-      onVideoFrame: (frame) => stream?.handleVideoFrame(frame),
+      onVideoFrame: (frame) => pipeline?.handleVideoFrame(frame),
       onAudioFrame: (frame) => audio?.handleAudioFrame(frame),
     });
-    client.connect();
-
-    // Start the decoder pipelines after the channel has connected -- mirrors
-    // the old behavior where VideoStream.connect()/AudioStream.connect()
-    // paired with their respective WebSocket opens.
-    stream.start();
-    audio.start();
 
     viewport = new Viewport({ canvas, sendControl });
     viewport.start();
+
+    // Building the pipeline is async: it may probe worker WebGL and, on the
+    // worker path, call transferControlToOffscreen (after which the main
+    // thread can't draw to the canvas -- only Viewport's CSS sizing and the
+    // input listeners still touch it, which stay valid). Connect the channel
+    // only after the decoder is up so the server's initial keyframe isn't
+    // delivered into a not-yet-ready pipeline.
+    createVideoPipeline({ canvas, sendControl }).then((p) => {
+      if (disposed) {
+        p.close();
+        return;
+      }
+      pipeline = p;
+      p.start();
+      client?.connect();
+    });
 
     detachInput = attachInput(canvas, sendControl);
 

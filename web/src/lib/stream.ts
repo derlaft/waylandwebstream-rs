@@ -4,13 +4,37 @@
 // them onto the supplied canvas. Keeping the decoder logic here, separate
 // from the socket owner, mirrors how the Rust server splits the encoder
 // thread off from the broadcast stream.
-import { createVideoRenderer, type VideoRenderer } from './glRenderer';
+import { createVideoRenderer, type RenderCanvas, type RendererBackend, type VideoRenderer } from './glRenderer';
 import {
   DECODER_CONFIG,
   type ClientMessage,
   type VideoFramePayload,
 } from './protocol';
-import { reportArrivalStats, reportDecodeStats, reportEndToEndLatency, setResolution } from './stats';
+
+// Diagnostics sinks, injected rather than imported from ./stats directly so
+// the same VideoStream can run on the main thread (sinks = the stats.ts store
+// updaters) or inside the Stage B worker (sinks = postMessage to the main
+// thread, which then updates the store). Keeping ./stats out of this module
+// also keeps svelte/store out of the worker bundle.
+export interface ArrivalStats {
+  avgMs: number;
+  p95Ms: number;
+  maxMs: number;
+  burstCount: number;
+  maxQueue: number;
+  maxFrameBytes: number;
+}
+export interface DecodeStats {
+  decodeAvgMs: number;
+  blitAvgMs: number;
+  blitP95Ms: number;
+}
+export interface StreamReporters {
+  setResolution(width: number, height: number): void;
+  reportArrivalStats(stats: ArrivalStats): void;
+  reportDecodeStats(stats: DecodeStats): void;
+  reportEndToEndLatency(ms: number): void;
+}
 
 // VideoDecoder's internal decode queue has no cap of its own: if frames
 // arrive faster than they can be decoded (bursty/slow remote network,
@@ -35,7 +59,7 @@ const PING_INTERVAL_MS = 1000;
 // correctly-sized frame); this instead just keeps comparing against the
 // frame actually in hand.
 export function ensureCanvasSize(
-  canvas: HTMLCanvasElement,
+  canvas: RenderCanvas,
   width: number,
   height: number,
 ): boolean {
@@ -48,17 +72,22 @@ export function ensureCanvasSize(
 }
 
 export interface VideoStreamOptions {
-  canvas: HTMLCanvasElement;
+  canvas: RenderCanvas;
   /// Used to send `request_keyframe` and periodic `latency` reports. The
   /// transport is owned by lib/client.ts; this is just the typed send
   /// callback so we don't reach back into ClientChannel from here.
   sendControl: (msg: ClientMessage) => void;
+  /// Where diagnostics go (resolution, arrival/decode/end-to-end stats). See
+  /// `StreamReporters` -- main-thread wiring passes the ./stats updaters; the
+  /// worker passes postMessage shims.
+  reporters: StreamReporters;
 }
 
 export class VideoStream {
-  private readonly canvas: HTMLCanvasElement;
+  private readonly canvas: RenderCanvas;
   private readonly renderer: VideoRenderer;
   private readonly sendControl: (msg: ClientMessage) => void;
+  private readonly reporters: StreamReporters;
 
   private decoder: VideoDecoder | null = null;
   // Updated via `setCodec` when the server reports a new H.264 level (e.g.
@@ -105,6 +134,14 @@ export class VideoStream {
     this.canvas = opts.canvas;
     this.renderer = createVideoRenderer(this.canvas);
     this.sendControl = opts.sendControl;
+    this.reporters = opts.reporters;
+  }
+
+  /// The live render backend ('webgl' / 'webgl2' / '2d'). Surfaced so the
+  /// pipeline coordinator can report it to the stats panel -- on the worker
+  /// path this is read inside the worker and posted across.
+  get rendererBackend(): RendererBackend {
+    return this.renderer.backend;
   }
 
   /// Called by lib/client.ts when the socket opens. Idempotent: a fresh
@@ -182,7 +219,7 @@ export class VideoStream {
 
   private handleFrame(frame: VideoFrame): void {
     if (ensureCanvasSize(this.canvas, frame.displayWidth, frame.displayHeight)) {
-      setResolution(frame.displayWidth, frame.displayHeight);
+      this.reporters.setResolution(frame.displayWidth, frame.displayHeight);
     }
     // Stamp before the blit so decode latency excludes it. `timestamp` is the
     // performance.now()*1000 set on the chunk in `handleVideoFrame`.
@@ -285,7 +322,7 @@ export class VideoStream {
       const burstCount = this.arrivalGapSamples.filter((g) => g < 3).length;
       this.lastBurstCount = burstCount;
 
-      reportArrivalStats({
+      this.reporters.reportArrivalStats({
         avgMs,
         p95Ms,
         maxMs,
@@ -320,13 +357,13 @@ export class VideoStream {
       this.decodeLatencySamples.reduce((a, b) => a + b, 0) / decodeN;
     this.decodeLatencySamples = [];
 
-    reportDecodeStats({ decodeAvgMs, blitAvgMs, blitP95Ms });
+    this.reporters.reportDecodeStats({ decodeAvgMs, blitAvgMs, blitP95Ms });
 
     // Glass-to-glass: ping round-trip (network + capture→encode→send on the
     // server, all folded in -- see the wire format doc in protocol.ts) plus
     // this client's own decode time.
     const totalMs = this.lastRttMs + decodeAvgMs;
-    reportEndToEndLatency(totalMs);
+    this.reporters.reportEndToEndLatency(totalMs);
     this.sendControl({
       type: 'latency',
       network_ms: this.lastRttMs,
