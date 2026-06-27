@@ -194,6 +194,19 @@ fn run_display_loop(
                 .unwrap_or_else(|| "<no renderer>".into()),
         );
 
+        // Read and dispatch Wayland events FIRST so wl_buffer::Release
+        // events are processed before try_drain tries to pick a slot.
+        // With only 2 SHM slots and a 60 Hz compositor (Release latency
+        // ~16-32 ms vs. 33 ms frame interval), the Release for the just-
+        // displayed slot can arrive in the same 1 ms tick as the next
+        // decoded frame. If we rendered first, both slots would still
+        // appear held and the frame would be dropped needlessly.
+        if let Some(guard) = event_queue.prepare_read() {
+            let _ = guard.read(); // non-blocking: returns Ok(0) if no data
+        }
+        let _ = event_queue.dispatch_pending(&mut state);
+        event_queue.flush().ok();
+
         let frames_drained = match state
             .renderer
             .as_mut()
@@ -208,11 +221,6 @@ fn run_display_loop(
             }
         };
         if frames_drained > 0 {
-            // Reset the "no frames" timer whenever we successfully
-            // render. The stale-frame warning below uses this to
-            // distinguish "server is producing frames but renderer is
-            // stuck" (which would still hit frames_drained > 0 here)
-            // from "server is silent" (which never does).
             state.last_render = Some(std::time::Instant::now());
         }
 
@@ -224,11 +232,6 @@ fn run_display_loop(
         }
 
         // Periodically warn if no frames have been rendered for >2s.
-        // This catches the "server has nothing to send" case
-        // (compositor idle, no Wayland clients attached) which
-        // otherwise looks indistinguishable from a renderer bug: the
-        // user sees a static picture and assumes the renderer is
-        // stuck, when actually the upstream is silent.
         if let Some(last) = state.last_render {
             let elapsed = last.elapsed();
             if elapsed > std::time::Duration::from_secs(2) {
@@ -239,20 +242,13 @@ fn run_display_loop(
                     elapsed.as_secs_f32(),
                     std::env::var("WAYLAND_DISPLAY").unwrap_or_default(),
                 );
-                state.last_render = Some(std::time::Instant::now()); // suppress repeat
+                state.last_render = Some(std::time::Instant::now());
             }
         }
 
-        // `dispatch_pending` alone does NOT read from the socket — it
-        // only dispatches already-buffered events. Without prepare_read
-        // + read, wl_buffer::Release events never arrive and both SHM
-        // slots stay held indefinitely (slot starvation).
-        if let Some(guard) = event_queue.prepare_read() {
-            let _ = guard.read(); // non-blocking: returns Ok(0) if no data
-        }
-        let _ = event_queue.dispatch_pending(&mut state);
         // Brief sleep so we don't spin at 100% CPU.
         std::thread::sleep(Duration::from_millis(1));
+        // Flush the commit from try_drain's render() call.
         event_queue.flush().ok();
     }
 

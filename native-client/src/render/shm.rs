@@ -21,7 +21,12 @@ use crate::decode::sw::DecodedFrame;
 /// `1` only -- the renderer is hardcoded to 2 buffers.
 pub(crate) type SlotId = u32;
 
-const NUM_SLOTS: usize = 2;
+// Three slots instead of two: with a 60 Hz compositor the Release for
+// a submitted buffer arrives ~16-32 ms later, leaving only ~1-17 ms of
+// slack before the next 30 fps frame (33 ms interval). A third slot
+// means there is always a free slot even when two are in flight, so
+// tight Release timing never starves the renderer.
+const NUM_SLOTS: usize = 3;
 
 /// One half of the double buffer. Owned by `ShmRenderer`; its
 /// `wl_buffer` carries the slot's index as user data so the Dispatch
@@ -101,7 +106,7 @@ impl ShmRenderer {
         let mut renderer = Self {
             shm,
             surface,
-            slots: [None, None],
+            slots: [None, None, None],
             width,
             height,
             next_idx: 0,
@@ -260,10 +265,10 @@ impl ShmRenderer {
         // Pick the next non-zombie, released slot. Zombie slots have
         // the right index but stale dimensions; writing into them would
         // corrupt memory and violate the protocol.
-        let released: [bool; NUM_SLOTS] = [
-            self.slots[0].as_ref().map(|s| s.released && !s.zombie).unwrap_or(false),
-            self.slots[1].as_ref().map(|s| s.released && !s.zombie).unwrap_or(false),
-        ];
+        let mut released = [false; NUM_SLOTS];
+        for (i, slot) in self.slots.iter().enumerate() {
+            released[i] = slot.as_ref().map(|s| s.released && !s.zombie).unwrap_or(false);
+        }
         let Some(idx) = pick_next_released(&released, self.next_idx) else {
             // Both slots held — compositor hasn't released the previous
             // buffer yet (usually <1 vsync). Sustained spamming means
@@ -312,7 +317,8 @@ impl ShmRenderer {
             Some(b) if b.released => "released",
             Some(_) => "held",
         };
-        format!("[{},{}]", fmt(&self.slots[0]), fmt(&self.slots[1]))
+        let parts: Vec<&str> = self.slots.iter().map(fmt).collect();
+        format!("[{}]", parts.join(","))
     }
 }
 
@@ -452,30 +458,34 @@ mod tests {
 
     #[test]
     fn pick_next_released_prefers_preferred_when_released() {
-        assert_eq!(pick_next_released(&[true, true], 0), Some(0));
-        assert_eq!(pick_next_released(&[true, true], 1), Some(1));
+        assert_eq!(pick_next_released(&[true, true, true], 0), Some(0));
+        assert_eq!(pick_next_released(&[true, true, true], 1), Some(1));
+        assert_eq!(pick_next_released(&[true, true, true], 2), Some(2));
     }
 
     #[test]
     fn pick_next_released_falls_back_when_preferred_held() {
         // preferred=0 held, 1 free -> use 1
-        assert_eq!(pick_next_released(&[false, true], 0), Some(1));
-        // preferred=1 held, 0 free -> use 0
-        assert_eq!(pick_next_released(&[true, false], 1), Some(0));
+        assert_eq!(pick_next_released(&[false, true, true], 0), Some(1));
+        // preferred=1 held, 2 free -> use 2
+        assert_eq!(pick_next_released(&[true, false, true], 1), Some(2));
+        // preferred=2 held, 0 free -> use 0
+        assert_eq!(pick_next_released(&[true, true, false], 2), Some(0));
     }
 
     #[test]
     fn pick_next_released_returns_none_when_all_held() {
-        assert_eq!(pick_next_released(&[false, false], 0), None);
-        assert_eq!(pick_next_released(&[false, false], 1), None);
+        assert_eq!(pick_next_released(&[false, false, false], 0), None);
+        assert_eq!(pick_next_released(&[false, false, false], 1), None);
+        assert_eq!(pick_next_released(&[false, false, false], 2), None);
     }
 
     #[test]
     fn pick_next_released_rotates_correctly() {
-        // preferred=1 but slot 1 held -> try 0 -> free
-        assert_eq!(pick_next_released(&[true, false], 1), Some(0));
-        // preferred=0 but slot 0 held -> try 1 -> free
-        assert_eq!(pick_next_released(&[false, true], 0), Some(1));
+        // preferred=1 held, 2 held -> falls through to 0
+        assert_eq!(pick_next_released(&[true, false, false], 1), Some(0));
+        // preferred=0 held, 1 held -> falls through to 2
+        assert_eq!(pick_next_released(&[false, false, true], 0), Some(2));
     }
 
     /// Run blit_into against a heap-allocated buffer. Returns the
