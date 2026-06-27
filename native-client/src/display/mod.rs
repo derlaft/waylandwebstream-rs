@@ -331,14 +331,23 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for DisplayState {
 impl Dispatch<xdg_wm_base_protocol::XdgWmBase, ()> for DisplayState {
     fn event(
         _: &mut Self,
-        _: &xdg_wm_base_protocol::XdgWmBase,
-        _: xdg_wm_base_protocol::Event,
+        wm_base: &xdg_wm_base_protocol::XdgWmBase,
+        event: xdg_wm_base_protocol::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // xdg_wm_base::ping is the only event; we don't respond (our
-        // compositor is well-behaved and we're not running away).
+        // The xdg-shell spec requires us to respond to every ping
+        // with pong(serial). Compositors use this to detect clients
+        // that have stopped responding to events -- if we ignore
+        // pings, the WM flags our surface as "Not Responding" (and
+        // some compositors will eventually kill the connection,
+        // which is why the user reported "first and only picture
+        // appears" -- after the connection dies, blocking_dispatch
+        // wakes up on the disconnect and the display thread exits).
+        if let xdg_wm_base_protocol::Event::Ping { serial } = event {
+            wm_base.pong(serial);
+        }
     }
 }
 
