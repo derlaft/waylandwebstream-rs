@@ -5,4 +5,5 @@
 // alternative -- a single buffer -- stalls because `wl_surface::attach`
 // to a buffer the compositor is currently reading is a protocol error.
 
+pub mod egl;
 pub mod shm;

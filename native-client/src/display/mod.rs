@@ -18,7 +18,7 @@ use wayland_client::{
         wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
         wl_shm_pool, wl_surface,
     },
-    Connection, Dispatch, QueueHandle, WEnum,
+    Connection, Dispatch, Proxy, QueueHandle, WEnum,
 };
 use wayland_protocols::xdg::shell::client::xdg_surface as xdg_surface_protocol;
 use wayland_protocols::xdg::shell::client::xdg_toplevel as xdg_toplevel_protocol;
@@ -26,8 +26,67 @@ use wayland_protocols::xdg::shell::client::xdg_wm_base as xdg_wm_base_protocol;
 
 use crate::decode::sw::DecodedFrame;
 use crate::input::keymap::evdev_to_code;
+use crate::render::egl::EglRenderer;
 use crate::render::shm::{ShmRenderer, SlotId};
 use crate::types::{KeyboardEvent, MouseEvent, PointerPoint, SignalingMessage};
+
+/// Which rendering backend to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RendererKind {
+    /// CPU blit into shared memory via wl_shm (default, no GPU required).
+    Shm,
+    /// OpenGL ES 2.0 via EGL (GPU-composited fullscreen quad).
+    Egl,
+}
+
+/// Unified renderer handle: either SHM or EGL.
+enum ActiveRenderer {
+    Shm(ShmRenderer),
+    Egl(EglRenderer),
+}
+
+impl ActiveRenderer {
+    fn try_drain(
+        &mut self,
+        qh: &QueueHandle<DisplayState>,
+        frame_rx: &mpsc::Receiver<DecodedFrame>,
+    ) -> anyhow::Result<usize> {
+        match self {
+            Self::Shm(r) => r.try_drain(qh, frame_rx),
+            Self::Egl(r) => r.drain_frames(frame_rx),
+        }
+    }
+
+    fn resize(&mut self, w: u32, h: u32) {
+        match self {
+            Self::Shm(r) => r.resize(w, h),
+            Self::Egl(r) => r.resize(w, h),
+        }
+    }
+
+    fn slot_state(&self) -> String {
+        match self {
+            Self::Shm(r) => r.slot_state(),
+            Self::Egl(_) => "egl".into(),
+        }
+    }
+
+    /// Initial buffer commit so the compositor maps the surface before the
+    /// first decoded frame arrives (SHM only; EGL has no pre-frame buffer).
+    fn prime(&mut self) -> bool {
+        match self {
+            Self::Shm(r) => r.prime(),
+            Self::Egl(_) => true,
+        }
+    }
+
+    /// Mark slot `idx` as released (SHM only; no-op for EGL).
+    fn release_slot(&mut self, idx: SlotId) {
+        if let Self::Shm(r) = self {
+            r.release_slot(idx);
+        }
+    }
+}
 
 /// Handle to the Wayland display thread. Returned by
 /// [`spawn_display_thread`]; the rest of the client reads window size and
@@ -79,6 +138,7 @@ pub struct DisplayHandle {
 pub fn spawn_display_thread(
     initial_size: (u32, u32),
     frame_rx: mpsc::Receiver<DecodedFrame>,
+    renderer_kind: RendererKind,
 ) -> Result<DisplayHandle> {
     let (size_tx, size_rx) = watch::channel(initial_size);
     let (close_tx, close_rx) = watch::channel(false);
@@ -102,9 +162,15 @@ pub fn spawn_display_thread(
     thread::Builder::new()
         .name("wws-display".into())
         .spawn(move || {
-            if let Err(e) =
-                run_display_loop(initial_size, size_tx, close_tx, frame_rx, counters, input_tx)
-            {
+            if let Err(e) = run_display_loop(
+                initial_size,
+                size_tx,
+                close_tx,
+                frame_rx,
+                counters,
+                input_tx,
+                renderer_kind,
+            ) {
                 warn!("display thread exited: {e:#}");
             }
         })
@@ -135,9 +201,12 @@ fn run_display_loop(
     frame_rx: mpsc::Receiver<DecodedFrame>,
     counters: DisplayCounters,
     input_tx: tokio::sync::mpsc::Sender<SignalingMessage>,
+    renderer_kind: RendererKind,
 ) -> Result<()> {
     let conn = Connection::connect_to_env()
         .context("could not connect to Wayland compositor (is $WAYLAND_DISPLAY set?)")?;
+    // Raw wl_display* needed by EGL (only accessible with the system backend).
+    let wl_display_ptr = conn.backend().display_ptr() as *mut std::ffi::c_void;
     let display = conn.display();
     let mut event_queue = conn.new_event_queue();
     let qh = event_queue.handle();
@@ -161,10 +230,6 @@ fn run_display_loop(
     if state.seat.is_none() {
         warn!("wl_seat global missing -- input forwarding will not work");
     }
-    let shm = state
-        .shm
-        .take()
-        .context("wl_shm global missing -- cannot render")?;
 
     let surface = compositor.create_surface(&qh, ());
     let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
@@ -184,10 +249,38 @@ fn run_display_loop(
         .roundtrip(&mut state)
         .context("configure roundtrip")?;
 
-    let mut renderer =
-        ShmRenderer::new(shm, surface.clone(), &qh, state.width, state.height, counters.render.clone())
+    let mut renderer = match renderer_kind {
+        RendererKind::Shm => {
+            let shm = state.shm.take().context("wl_shm global missing -- cannot render")?;
+            let r = ShmRenderer::new(
+                shm,
+                surface.clone(),
+                &qh,
+                state.width,
+                state.height,
+                counters.render.clone(),
+            )
             .context("create SHM renderer")?;
-    info!("window created: {}x{}", state.width, state.height);
+            ActiveRenderer::Shm(r)
+        }
+        RendererKind::Egl => {
+            // surface.id().as_ptr() gives the raw wl_surface* (sys backend only).
+            let wl_surface_ptr = surface.id().as_ptr() as *mut std::ffi::c_void;
+            let r = EglRenderer::new(
+                wl_display_ptr,
+                wl_surface_ptr,
+                state.width,
+                state.height,
+                counters.render.clone(),
+            )
+            .context("create EGL renderer")?;
+            ActiveRenderer::Egl(r)
+        }
+    };
+    info!(
+        "window created: {}x{} (renderer={:?})",
+        state.width, state.height, renderer_kind
+    );
     if !renderer.prime() {
         warn!("renderer: no free slot for initial commit");
     }
@@ -301,7 +394,7 @@ struct DisplayState {
     /// commit to apply each configure.
     surface: Option<wl_surface::WlSurface>,
 
-    renderer: Option<ShmRenderer>,
+    renderer: Option<ActiveRenderer>,
     /// Resize requests from xdg_toplevel::Configure are applied on the
     /// next loop tick (after any in-flight render) so we never resize
     /// mid-blit. Stored here, drained at the top of each tick.

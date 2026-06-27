@@ -29,7 +29,7 @@ mod types;
 
 use audio::AudioPlayer;
 use decode::sw::{spawn_decoder_thread, DecodedFrame};
-use display::spawn_display_thread;
+use display::{spawn_display_thread, RendererKind};
 use latency::LatencyTracker;
 use transport::{Frame, Transport};
 use types::SignalingMessage;
@@ -52,6 +52,10 @@ struct Args {
     /// Disable audio playback (skip PipeWire initialization).
     #[arg(long)]
     no_audio: bool,
+
+    /// Rendering backend: `shm` (CPU blit, default) or `egl` (OpenGL ES).
+    #[arg(long, default_value = "shm")]
+    renderer: String,
 }
 
 #[tokio::main]
@@ -64,7 +68,11 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let transport_spec = parse_transport(&args.transport)?;
-    info!("wws-client starting ({:?})", transport_spec);
+    let renderer_kind = match args.renderer.as_str() {
+        "egl" => RendererKind::Egl,
+        _ => RendererKind::Shm,
+    };
+    info!("wws-client starting ({:?}, renderer={:?})", transport_spec, renderer_kind);
 
     // --- channels ---
     // capacity 4: small but not 1; absorbs one-frame scheduler jitter
@@ -73,8 +81,8 @@ async fn main() -> Result<()> {
     let (frame_tx, frame_rx) = mpsc::sync_channel::<DecodedFrame>(1);
 
     // --- Wayland display (Phase 4+) + input channel (Phase 7) ---
-    let mut display =
-        spawn_display_thread(INITIAL_WINDOW_SIZE, frame_rx).context("Wayland display")?;
+    let mut display = spawn_display_thread(INITIAL_WINDOW_SIZE, frame_rx, renderer_kind)
+        .context("Wayland display")?;
     let initial_size = *display.size_rx.borrow();
     info!("window initial size: {}x{}", initial_size.0, initial_size.1);
 

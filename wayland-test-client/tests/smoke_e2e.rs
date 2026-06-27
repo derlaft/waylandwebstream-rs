@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use native_client::display::spawn_display_thread;
+use native_client::display::{spawn_display_thread, RendererKind};
 use native_client::transport::websocket::WsTransport;
 use native_client::transport::{Frame, Transport};
 use native_client::types::SignalingMessage;
@@ -126,7 +126,8 @@ fn run_visual_pipeline(port: u16) -> Result<()> {
 
         let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel(1);
         let display =
-            spawn_display_thread((1280, 720), frame_rx).context("spawn display thread")?;
+            spawn_display_thread((1280, 720), frame_rx, RendererKind::Shm)
+                .context("spawn display thread")?;
         let _decoder = spawn_decoder(transport, frame_tx).await?;
 
         let elapsed = wait_for_render_count(&display, 1, FIRST_FRAME_TIMEOUT).await?;
