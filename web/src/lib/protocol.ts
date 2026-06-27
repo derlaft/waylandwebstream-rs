@@ -1,9 +1,9 @@
 // Mirrors the wire protocol implemented by the Rust server. Keep this file
-// in sync with the source of truth: src/server.rs (SignalingMessage),
-// src/input/touch.rs (TouchEvent/TouchPoint), src/input/mouse.rs
-// (MouseEvent/PointerPoint), src/input/keyboard.rs (KeyboardEvent), and the
-// /stream binary frame format documented in src/server.rs next to
-// `encode_video_frame`.
+// in sync with the source of truth: src/server.rs (SignalingMessage /
+// ServerMessage), src/proto.rs (header constants), src/input/* (TouchEvent /
+// MouseEvent / KeyboardEvent), and the per-message payload layouts documented
+// next to `encode_unified_video_frame` / `encode_unified_audio_frame` /
+// `encode_unified_control` in src/server.rs.
 
 export interface TouchPoint {
   identifier: number;
@@ -44,7 +44,9 @@ export type KeyMessage =
   | { eventType: 'keydown'; code: string }
   | { eventType: 'keyup'; code: string };
 
-/// Messages the client sends over the `/ws` control channel.
+/// Client→server messages, sent over the `/client` unified WebSocket inside
+/// a `MSG_CLIENT_MSG` frame whose payload is the JSON encoding of this type.
+/// Mirrors `SignalingMessage` in src/server.rs.
 export type ClientMessage =
   | { type: 'ready' }
   | { type: 'resize'; width: number; height: number }
@@ -60,7 +62,7 @@ export type ClientMessage =
       jitter_buffer_ms?: number;
       decoding_ms?: number;
       total_ms: number;
-      // Count of /stream frame arrivals within ~3ms of the previous one
+      // Count of /client frame arrivals within ~3ms of the previous one
       // this window -- see VideoStream.flushDiagnostics and the server's
       // SignalingMessage::Latency::burst_count doc.
       burst_count?: number;
@@ -86,39 +88,132 @@ export type CursorUpdate =
       rgba: string;
     };
 
-/// Messages the server pushes to the client over `/ws`.
+/// Server→client control messages, sent inside a `MSG_CONTROL` frame whose
+/// payload is the JSON encoding of this type. Mirrors `ServerMessage` in
+/// src/server.rs.
 export type ServerMessage =
   | { type: 'bitrate'; bps: number }
   | { type: 'codec'; codec: string }
   | { type: 'cursor'; cursor: CursorUpdate };
 
-/// `/stream` binary frame format, one WebSocket message per H.264 frame:
-///   byte 0     : frame_type (0 = delta, 1 = key)
-///   bytes 1-4  : frame_id (u32, big-endian)
-///   byte 5     : has_ping_echo (0 or 1)
-///   bytes 6-13 : ping_echo_client_ts (f64, big-endian; valid only if byte 5 == 1)
-///   bytes 14.. : raw Annex-B H.264 for the whole frame
-///
-/// The ping echo round-trips a `ping` this client sent (see `VideoStream.sendPing`)
-/// back on whichever frame next leaves the server's encoder -- comparing
-/// `pingEchoClientTs` against this client's own clock on arrival gives a
-/// round-trip latency measurement spanning network + the whole server
-/// pipeline, without needing synchronized clocks.
-export const STREAM_FRAME_HEADER_BYTES = 14;
+// ─── Unified binary protocol framing ─────────────────────────────────────────
+//
+// Every WebSocket message on `/client` is a single framed message:
+//
+//   byte 0      : msg_type (u8)
+//   byte 1      : flags    (u8; meaning depends on msg_type)
+//   bytes 2-3   : reserved (u16, always 0)
+//   bytes 4-7   : payload_len (u32, little-endian)
+//   bytes 8..   : payload   (payload_len bytes)
+//
+// Mirrors src/proto.rs. Constants must stay in sync with the server.
 
-export interface StreamFrameHeader {
+export const HEADER_LEN = 8;
+
+export const MSG_VIDEO_FRAME = 0x01;
+export const MSG_AUDIO_FRAME = 0x02;
+export const MSG_CONTROL = 0x03;
+export const MSG_CLIENT_MSG = 0x10;
+
+export const FLAG_KEYFRAME = 0b0000_0001;
+export const FLAG_HAS_PING = 0b0000_0010;
+
+export interface UnifiedHeader {
+  msgType: number;
+  flags: number;
+  payloadLen: number;
+}
+
+export function parseUnifiedHeader(buf: ArrayBuffer): UnifiedHeader {
+  if (buf.byteLength < HEADER_LEN) {
+    throw new Error(`unified frame too short: ${buf.byteLength} bytes (need >= ${HEADER_LEN})`);
+  }
+  const view = new DataView(buf);
+  return {
+    msgType: view.getUint8(0),
+    flags: view.getUint8(1),
+    payloadLen: view.getUint32(4, true),
+  };
+}
+
+/// Encodes a complete framed message into a freshly-allocated ArrayBuffer.
+/// Layout must match `proto::encode_msg` in src/proto.rs byte-for-byte, so a
+/// server built against either side parses the other's output identically.
+export function encodeUnifiedFrame(msgType: number, flags: number, payload: ArrayBuffer | Uint8Array): ArrayBuffer {
+  const payloadBytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
+  const buf = new ArrayBuffer(HEADER_LEN + payloadBytes.byteLength);
+  const view = new DataView(buf);
+  view.setUint8(0, msgType);
+  view.setUint8(1, flags);
+  view.setUint16(2, 0, true); // reserved
+  view.setUint32(4, payloadBytes.byteLength, true);
+  new Uint8Array(buf, HEADER_LEN).set(payloadBytes);
+  return buf;
+}
+
+export function encodeClientMessage(msg: ClientMessage): ArrayBuffer {
+  // TextEncoder is available in browsers and (the relevant subset of) Node
+  // test environments; the JSON payload is what the server's
+  // `serde_json::from_slice::<SignalingMessage>` expects.
+  const json = new TextEncoder().encode(JSON.stringify(msg));
+  return encodeUnifiedFrame(MSG_CLIENT_MSG, 0, json);
+}
+
+/// Decoded payload of a `MSG_VIDEO_FRAME` from the `/client` endpoint.
+/// Layout (after the 8-byte proto header, big-endian unless noted):
+///   bytes 0-3   : frame_id (u32 BE)
+///   bytes 4-11  : ping_echo_client_ts (f64 BE; 0.0 when flags & FLAG_HAS_PING == 0)
+///   bytes 12-19 : capture_to_encode_ms (f64 BE)
+///   bytes 20..  : raw Annex-B H.264 NAL data
+export interface VideoFramePayload {
   isKeyframe: boolean;
   frameId: number;
   pingEchoClientTs: number | null;
+  captureToEncodeMs: number;
+  /** Annex-B H.264 data starting from offset 20 of the framed payload. */
+  data: Uint8Array;
 }
 
-export function parseStreamFrameHeader(buf: ArrayBuffer): StreamFrameHeader {
-  const view = new DataView(buf);
-  const hasPingEcho = view.getUint8(5) === 1;
+export function parseVideoFramePayload(payload: ArrayBuffer, flags: number): VideoFramePayload {
+  if (payload.byteLength < 20) {
+    throw new Error(`MSG_VIDEO_FRAME payload too short: ${payload.byteLength} (need >= 20)`);
+  }
+  const view = new DataView(payload);
+  const isKeyframe = (flags & FLAG_KEYFRAME) !== 0;
+  const hasPing = (flags & FLAG_HAS_PING) !== 0;
+  const frameId = view.getUint32(0, false);
+  const pingRaw = view.getFloat64(4, false);
+  const captureToEncodeMs = view.getFloat64(12, false);
   return {
-    isKeyframe: view.getUint8(0) === 1,
-    frameId: view.getUint32(1, false),
-    pingEchoClientTs: hasPingEcho ? view.getFloat64(6, false) : null,
+    isKeyframe,
+    frameId,
+    pingEchoClientTs: hasPing ? pingRaw : null,
+    captureToEncodeMs,
+    data: new Uint8Array(payload, 20, payload.byteLength - 20),
+  };
+}
+
+/// Decoded payload of a `MSG_AUDIO_FRAME` from the `/client` endpoint.
+/// Layout (after the 8-byte proto header):
+///   bytes 0-7  : pts_us (u64 BE)
+///   bytes 8..  : raw Opus packet
+export interface AudioFramePayload {
+  ptsUs: number;
+  data: Uint8Array;
+}
+
+export function parseAudioFramePayload(payload: ArrayBuffer): AudioFramePayload {
+  if (payload.byteLength < 8) {
+    throw new Error(`MSG_AUDIO_FRAME payload too short: ${payload.byteLength} (need >= 8)`);
+  }
+  const view = new DataView(payload);
+  // JS numbers can exactly represent integers up to 2^53; PTS values for
+  // audio (microseconds from stream start) stay well within that range.
+  const high = view.getUint32(0, false);
+  const low = view.getUint32(4, false);
+  return {
+    ptsUs: high * 2 ** 32 + low,
+    data: new Uint8Array(payload, 8, payload.byteLength - 8),
   };
 }
 
@@ -132,17 +227,3 @@ export const DECODER_CONFIG: VideoDecoderConfig = {
   codec: 'avc1.42E01F',
   optimizeForLatency: true,
 };
-
-/// `/audio` binary frame format, one WebSocket message per Opus packet (20 ms):
-///   bytes 0-7  : pts_us (u64, big-endian) — presentation timestamp in microseconds
-///   bytes 8..  : raw Opus packet
-export const AUDIO_FRAME_HEADER_BYTES = 8;
-
-export function parseAudioPts(buf: ArrayBuffer): number {
-  const view = new DataView(buf);
-  // JS numbers can exactly represent integers up to 2^53; PTS values for
-  // audio (microseconds from stream start) stay well within that range.
-  const high = view.getUint32(0, false);
-  const low = view.getUint32(4, false);
-  return high * 2 ** 32 + low;
-}

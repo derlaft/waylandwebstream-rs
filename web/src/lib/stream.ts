@@ -1,13 +1,13 @@
-// Connects to `/stream`, decodes H.264 via WebCodecs, and paints onto a
-// canvas. Ported behavior-for-behavior from the old src/web/client.html
-// (see git history) into a typed module; see comments below for the policy
-// each piece of logic encodes.
-import { nextBackoffDelayMs } from './backoff';
+// H.264 VideoDecoder + canvas blit. The transport (the `/client` unified
+// WebSocket) lives in lib/client.ts; this module consumes `VideoFramePayload`
+// objects that client.ts hands it, decodes them via WebCodecs, and paints
+// them onto the supplied canvas. Keeping the decoder logic here, separate
+// from the socket owner, mirrors how the Rust server splits the encoder
+// thread off from the broadcast stream.
 import {
   DECODER_CONFIG,
-  STREAM_FRAME_HEADER_BYTES,
-  parseStreamFrameHeader,
   type ClientMessage,
+  type VideoFramePayload,
 } from './protocol';
 import { reportArrivalStats, reportDecodeStats, reportEndToEndLatency, setResolution } from './stats';
 
@@ -28,11 +28,11 @@ const PING_INTERVAL_MS = 1000;
 // Resizing the canvas *bitmap* (not its CSS size) on every frame whose
 // dimensions actually changed -- rather than once, gated by an external
 // "did we just request a resize" signal -- is what makes this self-healing:
-// the /stream and /ws sockets connect independently, so the very first
-// decoded frame can land at the server's old/default resolution before a
-// just-sent resize takes effect. A one-shot flag would latch onto that
-// stale size forever (stretching every later, correctly-sized frame); this
-// instead just keeps comparing against the frame actually in hand.
+// the very first decoded frame can land at the server's old/default
+// resolution before a just-sent resize takes effect. A one-shot flag would
+// latch onto that stale size forever (stretching every later,
+// correctly-sized frame); this instead just keeps comparing against the
+// frame actually in hand.
 export function ensureCanvasSize(
   canvas: HTMLCanvasElement,
   width: number,
@@ -48,9 +48,9 @@ export function ensureCanvasSize(
 
 export interface VideoStreamOptions {
   canvas: HTMLCanvasElement;
-  /// Used to send `request_keyframe` and periodic `latency` reports over
-  /// the `/ws` control channel. Decoupled from a concrete socket here
-  /// because lib/control.ts (the /ws owner) lands in a later phase.
+  /// Used to send `request_keyframe` and periodic `latency` reports. The
+  /// transport is owned by lib/client.ts; this is just the typed send
+  /// callback so we don't reach back into ClientChannel from here.
   sendControl: (msg: ClientMessage) => void;
 }
 
@@ -59,7 +59,6 @@ export class VideoStream {
   private readonly ctx: CanvasRenderingContext2D;
   private readonly sendControl: (msg: ClientMessage) => void;
 
-  private ws: WebSocket | null = null;
   private decoder: VideoDecoder | null = null;
   // Updated via `setCodec` when the server reports a new H.264 level (e.g.
   // after a resolution change); DECODER_CONFIG is just the startup default.
@@ -92,7 +91,7 @@ export class VideoStream {
   // (bursty arrival with a shallow decode queue) that the decode-queue
   // depth check above can't see on its own. Burst count, not arrival-gap
   // p95: on an idle screen the server only sends a frame every
-  // `keyframe_interval` ticks (no damage to capture), so a long gap there
+  // keyframe_interval ticks (no damage to capture), so a long gap there
   // is expected silence, not a stall -- p95 would false-positive on every
   // idle period. A burst (several frames landing within ~3ms of each
   // other) can only happen if frames actually piled up somewhere and got
@@ -100,13 +99,6 @@ export class VideoStream {
   // nothing queued to release.
   private lastBurstCount = 0;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
-
-  private reconnectAttempt = 0;
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  // Distinguishes an intentional `close()` (e.g. page teardown) from the
-  // socket closing on its own -- only the latter should trigger a
-  // reconnect.
-  private closedByCaller = false;
 
   constructor(opts: VideoStreamOptions) {
     this.canvas = opts.canvas;
@@ -118,20 +110,24 @@ export class VideoStream {
     this.sendControl = opts.sendControl;
   }
 
-  connect(): void {
-    this.closedByCaller = false;
+  /// Called by lib/client.ts when the socket opens. Idempotent: a fresh
+  /// decoder is created so any leftover state from a dropped connection
+  /// (queued chunks in flight, half-configured decoder) is discarded.
+  start(): void {
     this.setupDecoder();
-    this.connectSocket();
     this.diagnosticsTimer = setInterval(() => this.flushDiagnostics(), DIAGNOSTICS_INTERVAL_MS);
     this.pingTimer = setInterval(() => this.sendPing(), PING_INTERVAL_MS);
+    // A fresh session starts a brand-new frame sequence server-side, so
+    // drop everything tracked about the old one: a stale `keyframeSeen`/
+    // pending request would misroute frames from the new sequence, and the
+    // gap left by the outage itself isn't congestion (would otherwise read
+    // as exactly that on the first frame back).
+    this.keyframeSeen = false;
+    this.keyframeRequestPending = false;
+    this.lastArrivalTime = null;
   }
 
   close(): void {
-    this.closedByCaller = true;
-    if (this.reconnectTimer !== null) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
     if (this.diagnosticsTimer !== null) {
       clearInterval(this.diagnosticsTimer);
       this.diagnosticsTimer = null;
@@ -140,8 +136,6 @@ export class VideoStream {
       clearInterval(this.pingTimer);
       this.pingTimer = null;
     }
-    this.ws?.close();
-    this.ws = null;
     if (this.decoder && this.decoder.state !== 'closed') {
       this.decoder.close();
     }
@@ -182,8 +176,9 @@ export class VideoStream {
       this.decoder.configure(this.codecConfig);
     }
     // The server emits a fresh IDR with the new SPS right after switching
-    // levels, but `/ws` (this message) and `/stream` (the frame) are
-    // independent sockets -- request one explicitly rather than racing it.
+    // levels, but the codec update and the matching frame are independent
+    // messages on the same socket -- request one explicitly rather than
+    // racing them.
     this.keyframeSeen = false;
     this.requestKeyframe();
   }
@@ -193,7 +188,7 @@ export class VideoStream {
       setResolution(frame.displayWidth, frame.displayHeight);
     }
     // Stamp before drawImage so decode latency excludes the blit. `timestamp`
-    // is the performance.now()*1000 set on the chunk in `onStreamMessage`.
+    // is the performance.now()*1000 set on the chunk in `handleVideoFrame`.
     const decodeDoneMs = performance.now();
     this.decodeLatencySamples.push(decodeDoneMs - frame.timestamp / 1000);
     this.ctx.drawImage(frame, 0, 0);
@@ -214,47 +209,13 @@ export class VideoStream {
     this.sendControl({ type: 'request_keyframe' });
   }
 
-  private connectSocket(): void {
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${wsProtocol}//${window.location.host}/stream`;
-
-    const ws = new WebSocket(url);
-    ws.binaryType = 'arraybuffer';
-    ws.onopen = () => {
-      this.reconnectAttempt = 0;
-    };
-    ws.onmessage = (event) => this.onStreamMessage(event.data as ArrayBuffer);
-    ws.onerror = (e) => console.error('Video stream error:', e);
-    // `onerror` always precedes `onclose` for a failed/dropped connection
-    // (per the WebSocket spec), so reconnect scheduling lives only here --
-    // otherwise a single drop would queue two attempts.
-    ws.onclose = () => this.scheduleReconnect();
-    this.ws = ws;
-  }
-
-  private scheduleReconnect(): void {
-    if (this.closedByCaller) return;
-    // A fresh `/stream` connection starts a brand-new frame sequence
-    // server-side (connecting always forces a fresh keyframe -- see
-    // `video_stream_handler` in src/server.rs), so drop everything tracked
-    // about the old one: a stale `keyframeSeen`/pending request would
-    // misroute frames from the new sequence, and the gap left by the outage
-    // itself isn't congestion (`onStreamMessage` would otherwise read it as
-    // exactly that on the first frame back).
-    this.keyframeSeen = false;
-    this.keyframeRequestPending = false;
-    this.lastArrivalTime = null;
-    const delay = nextBackoffDelayMs(this.reconnectAttempt);
-    this.reconnectAttempt += 1;
-    console.info(`Video stream closed, reconnecting in ${Math.round(delay)}ms`);
-    this.reconnectTimer = setTimeout(() => this.connectSocket(), delay);
-  }
-
-  private onStreamMessage(buf: ArrayBuffer): void {
+  /// Called by lib/client.ts for every MSG_VIDEO_FRAME it dispatches.
+  /// Stateless w.r.t. the socket: the same payload sequence arriving over a
+  /// freshly reconnected socket should produce the same decoded output as
+  /// the old one.
+  handleVideoFrame(payload: VideoFramePayload): void {
     const decoder = this.decoder;
     if (!decoder) return;
-
-    const { isKeyframe, pingEchoClientTs } = parseStreamFrameHeader(buf);
 
     const arrivalNow = performance.now();
     if (this.lastArrivalTime !== null) {
@@ -264,14 +225,17 @@ export class VideoStream {
     // Recorded regardless of what happens to this frame below (dropped for
     // backlog, gated pending a keyframe, etc.) -- it's measuring this
     // frame's transit time, not whether we end up decoding it.
-    if (pingEchoClientTs !== null) {
-      this.rttSamples.push(arrivalNow - pingEchoClientTs);
+    if (payload.pingEchoClientTs !== null) {
+      this.rttSamples.push(arrivalNow - payload.pingEchoClientTs);
     }
     this.maxQueueSeenInWindow = Math.max(this.maxQueueSeenInWindow, decoder.decodeQueueSize);
-    this.maxFrameBytesInWindow = Math.max(this.maxFrameBytesInWindow, buf.byteLength);
+    this.maxFrameBytesInWindow = Math.max(
+      this.maxFrameBytesInWindow,
+      20 + payload.data.byteLength,
+    );
 
     if (decoder.decodeQueueSize > MAX_DECODE_QUEUE) {
-      if (!isKeyframe) {
+      if (!payload.isKeyframe) {
         // Already backlogged -- drop this delta rather than add to the
         // queue, and ask for a fresh keyframe to resync instead of waiting
         // out the rest of the GOP.
@@ -286,22 +250,20 @@ export class VideoStream {
       decoder.configure(this.codecConfig);
     }
 
-    const data = new Uint8Array(buf, STREAM_FRAME_HEADER_BYTES);
-
-    if (!isKeyframe && !this.keyframeSeen) {
+    if (!payload.isKeyframe && !this.keyframeSeen) {
       return;
     }
-    if (isKeyframe) {
+    if (payload.isKeyframe) {
       this.keyframeSeen = true;
       this.keyframeRequestPending = false;
     }
 
     const chunk = new EncodedVideoChunk({
-      type: isKeyframe ? 'key' : 'delta',
+      type: payload.isKeyframe ? 'key' : 'delta',
       // No presentation clock to sync to here; arrival time just needs to
       // be monotonic microseconds, and doubles as a decode-latency stamp.
       timestamp: Math.round(performance.now() * 1000),
-      data,
+      data: payload.data,
     });
 
     try {

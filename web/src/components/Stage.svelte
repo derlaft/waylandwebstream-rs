@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import { AudioStream } from '../lib/audio';
-  import { ControlChannel } from '../lib/control';
+  import { ClientChannel } from '../lib/client';
   import { attachInput } from '../lib/input';
   import type { ClientMessage, CursorUpdate } from '../lib/protocol';
   import { setCursorDebug } from '../lib/stats';
@@ -18,7 +18,7 @@
   let cursorSurfaceActive = false;
   let cursorMsgCount = 0;
 
-  let control: ControlChannel | null = null;
+  let client: ClientChannel | null = null;
   let stream: VideoStream | null = null;
   let audio: AudioStream | null = null;
   let viewport: Viewport | null = null;
@@ -26,7 +26,7 @@
   let removeCursorListeners: (() => void) | null = null;
 
   function sendControl(msg: ClientMessage): void {
-    control?.send(msg);
+    client?.send(msg);
   }
 
   // Applies a compositor cursor update. For surface cursors the RGBA pixels
@@ -92,22 +92,27 @@
     stream = null;
     audio?.close();
     audio = null;
-    control?.close();
-    control = null;
+    client?.close();
+    client = null;
   }
 
   onMount(() => {
-    control = new ControlChannel({
+    stream = new VideoStream({ canvas, sendControl });
+    audio = new AudioStream();
+
+    client = new ClientChannel({
       onCodec: (codec) => stream?.setCodec(codec),
       onCursor: applyCursor,
+      onVideoFrame: (frame) => stream?.handleVideoFrame(frame),
+      onAudioFrame: (frame) => audio?.handleAudioFrame(frame),
     });
-    control.connect();
+    client.connect();
 
-    stream = new VideoStream({ canvas, sendControl });
-    stream.connect();
-
-    audio = new AudioStream();
-    audio.connect();
+    // Start the decoder pipelines after the channel has connected -- mirrors
+    // the old behavior where VideoStream.connect()/AudioStream.connect()
+    // paired with their respective WebSocket opens.
+    stream.start();
+    audio.start();
 
     viewport = new Viewport({ canvas, sendControl });
     viewport.start();

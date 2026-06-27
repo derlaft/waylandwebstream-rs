@@ -1,20 +1,22 @@
-// Connects to /audio, decodes Opus via WebCodecs AudioDecoder, and schedules
-// decoded PCM for gapless playback via Web Audio API precision scheduling.
-//
-// Wire format: [u64 pts_us BE][raw Opus bytes]
-// One WebSocket message = one 20 ms Opus frame.
-//
-// Reconnect behavior mirrors VideoStream: exponential back-off, full state
-// reset on reconnect, no reconnect when close() is called intentionally.
+// Opus AudioDecoder + Web Audio playback scheduling. The transport (the
+// `/client` unified WebSocket) lives in lib/client.ts; this module consumes
+// `AudioFramePayload` objects that client.ts hands it, decodes them via
+// WebCodecs, and schedules the PCM onto the AudioContext. Mirror of
+// stream.ts for the audio half.
 //
 // AudioContext lifecycle: deferred until the first user gesture (pointerdown
-// or keydown).  Creating it then guarantees it starts in 'running' state
-// with no autoplay warning.  Opus packets that arrive before the first
-// gesture are silently dropped — a non-issue in practice because the user
+// or keydown). Creating it then guarantees it starts in 'running' state
+// with no autoplay warning. Opus packets that arrive before the first
+// gesture are silently dropped -- a non-issue in practice because the user
 // has to interact with the page to control the remote desktop.
+//
+// Reconnect behavior: managed by ClientChannel. After a reconnect we
+// receive fresh `handleAudioFrame` calls and may receive any in-flight
+// audio packets the client happened to grab during the outage; since we
+// always create a fresh decoder on `start()`, the old decoder's pending
+// output callbacks are discarded cleanly.
 
-import { nextBackoffDelayMs } from './backoff';
-import { AUDIO_FRAME_HEADER_BYTES, parseAudioPts } from './protocol';
+import type { AudioFramePayload } from './protocol';
 
 const SAMPLE_RATE = 48_000;
 const CHANNELS = 2;
@@ -23,36 +25,32 @@ const CHANNELS = 2;
 const SCHEDULE_AHEAD_S = 0.05;
 
 export class AudioStream {
-  private ws: WebSocket | null = null;
   private decoder: AudioDecoder | null = null;
   private audioCtx: AudioContext | null = null;
   // Wall-clock time at which the next decoded buffer should start playing.
   private nextPlayTime = 0;
 
-  private reconnectAttempt = 0;
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private closedByCaller = false;
-
   // Capture-phase gesture listeners that create the AudioContext on first
   // interaction. Stored so they can be cleaned up on close().
   private gestureHandlers: Array<[string, EventListener]> = [];
 
-  connect(): void {
-    this.closedByCaller = false;
-    this.connectSocket();
+  constructor() {
     this.installGestureCreate();
   }
 
+  /// Called by ClientChannel after the socket has connected and started
+  /// delivering frames. No-op until the first user gesture (see
+  /// `installGestureCreate`).
+  start(): void {
+    // Fresh decoder / state for a new session, in case a previous close()
+    // left something behind. The AudioContext is intentionally created
+    // later (on first gesture), so nothing to do here.
+    this.nextPlayTime = 0;
+  }
+
   close(): void {
-    this.closedByCaller = true;
-    if (this.reconnectTimer !== null) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    this.ws?.close();
-    this.ws = null;
     if (this.decoder && this.decoder.state !== 'closed') {
-      this.decoder.close();
+      try { this.decoder.close(); } catch (_) { /* ignore */ }
     }
     this.decoder = null;
     this.audioCtx?.close();
@@ -88,6 +86,10 @@ export class AudioStream {
   }
 
   private removeGestureHandlers(): void {
+    // `capture: true` must match the registration flags exactly; otherwise
+    // the DOM silently keeps the listener around and a stale one from a
+    // previous test will fire alongside the new one, creating two
+    // AudioContexts (this was a real failure mode caught in the audio tests).
     for (const [type, h] of this.gestureHandlers) {
       document.removeEventListener(type, h, { capture: true });
     }
@@ -136,7 +138,7 @@ export class AudioStream {
     audioData.close();
 
     // Gapless precision scheduling: each buffer starts right after the previous
-    // one.  If we've fallen behind (e.g. reconnect or context-resume after
+    // one. If we've fallen behind (e.g. reconnect or context-resume after
     // suspension), snap to now + lookahead so we don't schedule in the past.
     const startAt = Math.max(ctx.currentTime + SCHEDULE_AHEAD_S, this.nextPlayTime);
     this.nextPlayTime = startAt + buffer.duration;
@@ -147,58 +149,20 @@ export class AudioStream {
     source.start(startAt);
   }
 
-  private connectSocket(): void {
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${wsProtocol}//${window.location.host}/audio`;
-
-    const ws = new WebSocket(url);
-    ws.binaryType = 'arraybuffer';
-    ws.onopen = () => {
-      this.reconnectAttempt = 0;
-      this.nextPlayTime = 0;
-    };
-    ws.onmessage = (event) => this.onAudioMessage(event.data as ArrayBuffer);
-    ws.onerror = (e) => console.error('Audio stream error:', e);
-    ws.onclose = (event) => {
-      // Server sends this when PipeWire capture failed to start at launch.
-      // Reconnecting won't help — audio capture is a one-time init.
-      if (event.reason === 'audio capture not available') {
-        console.info('Audio capture not available on server; audio disabled.');
-        return;
-      }
-      this.scheduleReconnect();
-    };
-    this.ws = ws;
-  }
-
-  private scheduleReconnect(): void {
-    if (this.closedByCaller) return;
-    // Only recover the decoder if the AudioContext already exists (i.e. the
-    // user has already interacted). Before the first gesture, decoder is null
-    // and packets are dropped anyway, so there is nothing to recover.
-    if (this.audioCtx) {
-      this.recoverDecoder();
-    }
-    this.nextPlayTime = 0;
-    const delay = nextBackoffDelayMs(this.reconnectAttempt);
-    this.reconnectAttempt += 1;
-    console.info(`Audio stream closed, reconnecting in ${Math.round(delay)}ms`);
-    this.reconnectTimer = setTimeout(() => this.connectSocket(), delay);
-  }
-
-  private onAudioMessage(buf: ArrayBuffer): void {
+  /// Called by lib/client.ts for every MSG_AUDIO_FRAME it dispatches.
+  /// Silently drops packets that arrive before the AudioContext exists (no
+  /// user gesture yet) -- those would be unplayable anyway, and the
+  /// WebCodecs decoder is intentionally not created until then either.
+  handleAudioFrame(payload: AudioFramePayload): void {
     const decoder = this.decoder;
     if (!decoder || decoder.state === 'closed') return;
-
-    const pts_us = parseAudioPts(buf);
-    const data = new Uint8Array(buf, AUDIO_FRAME_HEADER_BYTES);
 
     const chunk = new EncodedAudioChunk({
       // Opus doesn't have I/P frame distinction; every packet is independently
       // decodable after the decoder is configured.
       type: 'key',
-      timestamp: pts_us,
-      data,
+      timestamp: payload.ptsUs,
+      data: payload.data,
     });
 
     try {
