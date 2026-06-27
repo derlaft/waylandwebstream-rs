@@ -4,8 +4,11 @@
 // integration tests under `tests/` we re-export the same modules
 // here so they can `use native_client::decode::...`.
 
+pub mod audio;
 pub mod decode;
 pub mod display;
+pub mod input;
+pub mod latency;
 pub mod proto;
 pub mod render;
 pub mod transport;

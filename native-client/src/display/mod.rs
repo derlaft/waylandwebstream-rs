@@ -14,15 +14,20 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 use wayland_client::{
-    protocol::{wl_buffer, wl_compositor, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface},
-    Connection, Dispatch, QueueHandle,
+    protocol::{
+        wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
+        wl_shm_pool, wl_surface,
+    },
+    Connection, Dispatch, QueueHandle, WEnum,
 };
 use wayland_protocols::xdg::shell::client::xdg_surface as xdg_surface_protocol;
 use wayland_protocols::xdg::shell::client::xdg_toplevel as xdg_toplevel_protocol;
 use wayland_protocols::xdg::shell::client::xdg_wm_base as xdg_wm_base_protocol;
 
 use crate::decode::sw::DecodedFrame;
+use crate::input::keymap::evdev_to_code;
 use crate::render::shm::{ShmRenderer, SlotId};
+use crate::types::{KeyboardEvent, MouseEvent, PointerPoint, SignalingMessage};
 
 /// Handle to the Wayland display thread. Returned by
 /// [`spawn_display_thread`]; the rest of the client reads window size and
@@ -54,6 +59,9 @@ pub struct DisplayHandle {
     /// of free slots and `pick_next_released` keeps returning None.
     #[allow(dead_code)] // read by integration tests, not by the main binary
     pub release_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Input events (pointer, keyboard) translated to SignalingMessage and
+    /// ready to forward to the server. Phase 7.
+    pub input_rx: tokio::sync::mpsc::Receiver<SignalingMessage>,
 }
 
 /// Spawn the Wayland display thread. `frame_rx` is consumed by the
@@ -81,6 +89,12 @@ pub fn spawn_display_thread(
     let render_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let release_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+    // Input events from the Wayland event loop (pointer, keyboard) go
+    // here; the tokio recv task forwards them to the server. Capacity
+    // 64: typing a burst of keys or a fast pointer drag should never
+    // fill it before the send loop drains it.
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<SignalingMessage>(64);
+
     let counters = DisplayCounters {
         render: render_counter.clone(),
         release: release_counter.clone(),
@@ -89,7 +103,7 @@ pub fn spawn_display_thread(
         .name("wws-display".into())
         .spawn(move || {
             if let Err(e) =
-                run_display_loop(initial_size, size_tx, close_tx, frame_rx, counters)
+                run_display_loop(initial_size, size_tx, close_tx, frame_rx, counters, input_tx)
             {
                 warn!("display thread exited: {e:#}");
             }
@@ -101,6 +115,7 @@ pub fn spawn_display_thread(
         close_rx,
         render_counter,
         release_counter,
+        input_rx,
     })
 }
 
@@ -119,6 +134,7 @@ fn run_display_loop(
     close_tx: watch::Sender<bool>,
     frame_rx: mpsc::Receiver<DecodedFrame>,
     counters: DisplayCounters,
+    input_tx: tokio::sync::mpsc::Sender<SignalingMessage>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env()
         .context("could not connect to Wayland compositor (is $WAYLAND_DISPLAY set?)")?;
@@ -126,7 +142,7 @@ fn run_display_loop(
     let mut event_queue = conn.new_event_queue();
     let qh = event_queue.handle();
 
-    let mut state = DisplayState::new(initial_size, size_tx, close_tx.clone(), counters.clone());
+    let mut state = DisplayState::new(initial_size, size_tx, close_tx.clone(), counters.clone(), input_tx);
 
     // First roundtrip: bind wl_compositor, xdg_wm_base, wl_seat, wl_shm.
     display.get_registry(&qh, ());
@@ -265,8 +281,19 @@ struct DisplayState {
     compositor: Option<wl_compositor::WlCompositor>,
     wm_base: Option<xdg_wm_base_protocol::XdgWmBase>,
     shm: Option<wl_shm::WlShm>,
-    #[allow(dead_code)]
-    seat: Option<wl_seat::WlSeat>, // bound for Phase 7 input forwarding
+    seat: Option<wl_seat::WlSeat>,
+
+    /// Active wl_pointer object; present once the seat advertises
+    /// Capability::Pointer and we call seat.get_pointer().
+    pointer: Option<wl_pointer::WlPointer>,
+    /// Active wl_keyboard object; present once the seat advertises
+    /// Capability::Keyboard and we call seat.get_keyboard().
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+
+    /// Last pointer position (normalized 0..1 in surface coordinates).
+    /// Updated on Enter and Motion events.
+    pointer_x: f64,
+    pointer_y: f64,
 
     /// The wl_surface for the main window. Set before the configure
     /// roundtrip so the xdg_surface::Configure handler can call
@@ -286,6 +313,8 @@ struct DisplayState {
     /// Counters shared with `DisplayHandle` for observability (smoke
     /// tests, future metrics). Cloned from the Arc the caller sees.
     counters: DisplayCounters,
+    /// Sends translated input events to the tokio send loop.
+    input_tx: tokio::sync::mpsc::Sender<SignalingMessage>,
 }
 
 impl DisplayState {
@@ -294,6 +323,7 @@ impl DisplayState {
         size_tx: watch::Sender<(u32, u32)>,
         close_tx: watch::Sender<bool>,
         counters: DisplayCounters,
+        input_tx: tokio::sync::mpsc::Sender<SignalingMessage>,
     ) -> Self {
         Self {
             initial_size,
@@ -305,11 +335,26 @@ impl DisplayState {
             wm_base: None,
             shm: None,
             seat: None,
+            pointer: None,
+            keyboard: None,
+            pointer_x: 0.5,
+            pointer_y: 0.5,
             surface: None,
             renderer: None,
             pending_resize: None,
             last_render: None,
             counters,
+            input_tx,
+        }
+    }
+
+    /// Send an input event to the tokio send loop. Uses `try_send`
+    /// to avoid blocking the Wayland event loop thread; drops silently
+    /// if the channel is full (64 slots, very unlikely during normal
+    /// pointer/keyboard use).
+    fn send_input(&self, msg: SignalingMessage) {
+        if self.input_tx.try_send(msg).is_err() {
+            debug!("input channel full; dropping event");
         }
     }
 }
@@ -464,14 +509,156 @@ impl Dispatch<xdg_toplevel_protocol::XdgToplevel, ()> for DisplayState {
 
 impl Dispatch<wl_seat::WlSeat, ()> for DisplayState {
     fn event(
-        _: &mut Self,
-        _: &wl_seat::WlSeat,
-        _: wl_seat::Event,
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities { capabilities } = event {
+            let caps = match capabilities {
+                WEnum::Value(c) => c,
+                WEnum::Unknown(_) => return,
+            };
+            if caps.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
+                debug!("seat: pointer capability -> get_pointer");
+                state.pointer = Some(seat.get_pointer(qh, ()));
+            }
+            if caps.contains(wl_seat::Capability::Keyboard) && state.keyboard.is_none() {
+                debug!("seat: keyboard capability -> get_keyboard");
+                state.keyboard = Some(seat.get_keyboard(qh, ()));
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_pointer::WlPointer, ()> for DisplayState {
+    fn event(
+        state: &mut Self,
+        pointer: &wl_pointer::WlPointer,
+        event: wl_pointer::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // Seat is bound for future input forwarding; no events handled yet.
+        match event {
+            wl_pointer::Event::Enter {
+                serial,
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                // Hide the native cursor so only the remote app's cursor shows.
+                pointer.set_cursor(serial, None, 0, 0);
+                state.pointer_x = surface_x / state.width as f64;
+                state.pointer_y = surface_y / state.height as f64;
+            }
+            wl_pointer::Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                state.pointer_x = surface_x / state.width as f64;
+                state.pointer_y = surface_y / state.height as f64;
+                let x = state.pointer_x;
+                let y = state.pointer_y;
+                state.send_input(SignalingMessage::Pointer {
+                    event: MouseEvent::Move {
+                        pointer: PointerPoint {
+                            x,
+                            y,
+                            button: 0,
+                            pointer_type: "mouse".into(),
+                            pressure: 0.0,
+                        },
+                    },
+                });
+            }
+            wl_pointer::Event::Button {
+                button,
+                state: btn_state,
+                ..
+            } => {
+                // Linux button codes → browser button index
+                let browser_button = match button {
+                    0x110 => 0, // BTN_LEFT
+                    0x111 => 2, // BTN_RIGHT
+                    0x112 => 1, // BTN_MIDDLE
+                    _ => 0,
+                };
+                let x = state.pointer_x;
+                let y = state.pointer_y;
+                let pp = PointerPoint {
+                    x,
+                    y,
+                    button: browser_button,
+                    pointer_type: "mouse".into(),
+                    pressure: 0.0,
+                };
+                let mouse_event = match btn_state {
+                    WEnum::Value(wl_pointer::ButtonState::Pressed) => {
+                        MouseEvent::Down { pointer: pp }
+                    }
+                    WEnum::Value(wl_pointer::ButtonState::Released) => {
+                        MouseEvent::Up { pointer: pp }
+                    }
+                    _ => return,
+                };
+                state.send_input(SignalingMessage::Pointer { event: mouse_event });
+            }
+            wl_pointer::Event::Axis { axis, value, .. } => {
+                let (delta_x, delta_y) = match axis {
+                    WEnum::Value(wl_pointer::Axis::VerticalScroll) => (0.0, value),
+                    WEnum::Value(wl_pointer::Axis::HorizontalScroll) => (value, 0.0),
+                    _ => return,
+                };
+                let x = state.pointer_x;
+                let y = state.pointer_y;
+                state.send_input(SignalingMessage::Pointer {
+                    event: MouseEvent::Wheel {
+                        x,
+                        y,
+                        delta_x,
+                        delta_y,
+                    },
+                });
+            }
+            _ => {} // Leave, Frame, AxisSource, AxisStop, AxisDiscrete, etc.
+        }
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for DisplayState {
+    fn event(
+        state: &mut Self,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_keyboard::Event::Key { key, state: key_state, .. } = event {
+            let code = match evdev_to_code(key) {
+                Some(c) => c,
+                None => {
+                    debug!("unknown evdev keycode {key}; skipping");
+                    return;
+                }
+            };
+            let kb_event = match key_state {
+                WEnum::Value(wl_keyboard::KeyState::Pressed) => {
+                    KeyboardEvent::Down { code: code.to_string() }
+                }
+                WEnum::Value(wl_keyboard::KeyState::Released) => {
+                    KeyboardEvent::Up { code: code.to_string() }
+                }
+                _ => return,
+            };
+            state.send_input(SignalingMessage::Key { event: kb_event });
+        }
+        // Keymap, Enter, Leave, Modifiers, RepeatInfo: no-ops.
+        // We use a static reverse table (input/keymap.rs), not xkbcommon.
     }
 }
 

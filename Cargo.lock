@@ -992,6 +992,8 @@ dependencies = [
  "ffmpeg-next",
  "futures-util",
  "libc",
+ "opus",
+ "pipewire",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

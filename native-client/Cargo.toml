@@ -48,3 +48,9 @@ libc = "0.2"
 # match the server (src/encoder/mod.rs) so the wire format and decoder
 # agree on H.264 profile/level without a separate feature-flag dance.
 ffmpeg-next = "8.1"
+
+# Audio decode + playback for Phase 6. Versions pinned to the server's
+# deps (root Cargo.toml) so the Opus format and PipeWire API are
+# consistent.
+opus = "0.3"
+pipewire = "0.10"
