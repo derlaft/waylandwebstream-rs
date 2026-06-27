@@ -1,13 +1,11 @@
 // Wayland display wiring for the native client.
 //
-// Owns the synchronous Wayland event loop and the wl_surface/xdg_toplevel
-// plumbing, plus (Phase 5+) the SHM renderer that blits decoded frames
-// into wl_shm buffers. The display loop runs on a dedicated OS thread
-// because wayland-client 0.31 is synchronous (no async). The tokio
-// side feeds it via `frame_rx` (decoded H.264 frames) and reads back
-// window size + close state through `tokio::sync::watch` channels in
-// `DisplayHandle`. That keeps `event_queue.dispatch_pending` off the
-// async executor entirely -- see AGENTS.md "two execution domains".
+// Owns the synchronous Wayland event loop, wl_surface/xdg_toplevel plumbing,
+// and the SHM renderer that blits decoded frames into wl_shm buffers. Runs on
+// a dedicated OS thread (wayland-client 0.31 is synchronous). The tokio side
+// feeds it decoded frames via `frame_rx` and reads back window size + close
+// state through `tokio::sync::watch` channels -- keeping Wayland dispatch off
+// the async executor entirely (see AGENTS.md "two execution domains").
 
 use anyhow::{Context, Result};
 use std::sync::mpsc;
@@ -170,12 +168,9 @@ fn run_display_loop(
         .roundtrip(&mut state)
         .context("configure roundtrip")?;
 
-    let mut renderer = ShmRenderer::new(shm, surface.clone(), &qh, state.width, state.height)
-        .context("create SHM renderer")?;
-    // Replace the renderer's internal counter with the shared one
-    // so the DisplayHandle returned to the caller observes the same
-    // increments. Cheap: just an Arc swap.
-    renderer.install_render_counter(counters.render.clone());
+    let mut renderer =
+        ShmRenderer::new(shm, surface.clone(), &qh, state.width, state.height, counters.render.clone())
+            .context("create SHM renderer")?;
     info!("window created: {}x{}", state.width, state.height);
     if !renderer.prime() {
         warn!("renderer: no free slot for initial commit");

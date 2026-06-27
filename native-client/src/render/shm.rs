@@ -54,6 +54,17 @@ struct BufferSlot {
     zombie: bool,
 }
 
+impl Drop for BufferSlot {
+    fn drop(&mut self) {
+        // SAFETY: pixels_ptr was returned by mmap with mmap_size bytes.
+        // The mmap outlives any wl_buffer reference because we only drop
+        // slots after the compositor sends Release (or on process exit).
+        unsafe {
+            libc::munmap(self.pixels_ptr as *mut libc::c_void, self.mmap_size);
+        }
+    }
+}
+
 // SAFETY: BufferSlot holds a raw mmap pointer + proxies. The pointer
 // is never dereferenced off the display thread (the renderer always
 // lives there). `wl_*` proxies are `Send`/`Sync` per wayland-client.
@@ -74,15 +85,13 @@ pub struct ShmRenderer {
 }
 
 impl ShmRenderer {
-    /// Build a renderer at `width x height`. Allocates both slots
-    /// immediately so the very first commit can hand the compositor a
-    /// real buffer.
     pub fn new<State>(
         shm: wl_shm::WlShm,
         surface: wl_surface::WlSurface,
         qh: &QueueHandle<State>,
         width: u32,
         height: u32,
+        render_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<Self>
     where
         State: Dispatch<wl_shm_pool::WlShmPool, u32>
@@ -96,24 +105,15 @@ impl ShmRenderer {
             width,
             height,
             next_idx: 0,
-            render_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            render_count,
         };
         renderer.recreate_slots(qh)?;
         Ok(renderer)
     }
 
-    /// Replace the render counter with one supplied by the caller.
-    /// `spawn_display_thread` uses this so the `DisplayHandle`
-    /// returned to the caller observes the same increments.
-    pub fn install_render_counter(
-        &mut self,
-        counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    ) {
-        self.render_count = counter;
-    }
-
-    /// Drop and reallocate both slots at the current `width x height`.
-    /// Called from `new` and from `resize`.
+    /// Allocate a new slot for every `None` entry. Skips `Some` entries
+    /// (including zombies) — overwriting a zombie would drop its WlBuffer
+    /// while the compositor still holds it, bypassing the zombie invariant.
     fn recreate_slots<State>(
         &mut self,
         qh: &QueueHandle<State>,
@@ -124,9 +124,12 @@ impl ShmRenderer {
             + 'static,
     {
         for idx in 0..NUM_SLOTS {
-            let slot = create_buffer_slot(&self.shm, qh, idx as SlotId, self.width, self.height)
-                .with_context(|| format!("create buffer slot {idx}"))?;
-            self.slots[idx] = Some(slot);
+            if self.slots[idx].is_none() {
+                let slot =
+                    create_buffer_slot(&self.shm, qh, idx as SlotId, self.width, self.height)
+                        .with_context(|| format!("create buffer slot {idx}"))?;
+                self.slots[idx] = Some(slot);
+            }
         }
         Ok(())
     }
@@ -262,12 +265,9 @@ impl ShmRenderer {
             self.slots[1].as_ref().map(|s| s.released && !s.zombie).unwrap_or(false),
         ];
         let Some(idx) = pick_next_released(&released, self.next_idx) else {
-            // Both slots are held by the compositor. This happens
-            // briefly after a commit (the compositor hasn't released
-            // the previous buffer yet, usually <1 vsync). If this
-            // log line is spammed, the compositor is *not* sending
-            // wl_buffer::Release for our buffers -- which is the bug
-            // we hit before fixing dispatch_pending -> blocking_dispatch.
+            // Both slots held — compositor hasn't released the previous
+            // buffer yet (usually <1 vsync). Sustained spamming means
+            // wl_buffer::Release events aren't reaching dispatch_pending.
             tracing::debug!(
                 "no released slot; dropping frame (slot_state={})",
                 self.slot_state()
