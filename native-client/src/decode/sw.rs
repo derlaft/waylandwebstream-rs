@@ -42,17 +42,28 @@ pub struct DecodedFrame {
 /// channel -- see "The video broadcast channel is intentionally tiny
 /// (cap 3)" in AGENTS.md).
 ///
-/// Returns the OS thread's `JoinHandle` so tests / cleanup can wait on
-/// it; `main` ignores it because the program exits when its tokio
-/// runtime drops.
+/// Returns `(JoinHandle, Arc<AtomicU64>)`. The atomic is a counter
+/// of `DecodedFrame`s the decoder successfully produced (i.e.
+/// `Ok(Some(_))` returns). Tests use this to localize "no frames
+/// reaching the renderer" failures: if `decoded_count == 0` the
+/// decoder never produced output (ffmpeg issue or wrong format);
+/// if `decoded_count > 0 && rendered == 0` the chain breaks
+/// between decoder output and surface commit (display/render
+/// side). `main` ignores the counter.
 pub fn spawn_decoder_thread(
     packet_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     frame_tx: std::sync::mpsc::SyncSender<DecodedFrame>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
+) -> (
+    std::thread::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    let decoded_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let decoded_for_thread = decoded_count.clone();
+    let join = std::thread::Builder::new()
         .name("wws-h264-decoder".into())
-        .spawn(move || run_decoder_thread(packet_rx, frame_tx))
-        .expect("failed to spawn decoder thread")
+        .spawn(move || run_decoder_thread(packet_rx, frame_tx, decoded_for_thread))
+        .expect("failed to spawn decoder thread");
+    (join, decoded_count)
 }
 
 /// Owns the ffmpeg decoder + scaler + a reusable destination frame.
@@ -165,6 +176,7 @@ impl H264Decoder {
 fn run_decoder_thread(
     packet_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     frame_tx: std::sync::mpsc::SyncSender<DecodedFrame>,
+    decoded_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     let mut decoder = match H264Decoder::new() {
         Ok(d) => d,
@@ -189,6 +201,7 @@ fn run_decoder_thread(
                 continue;
             }
         };
+        decoded_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // try_send: if the renderer is slow, drop the new frame. The
         // next keyframe (~1s away) will resync the picture cheaply.
         if frame_tx.try_send(frame).is_err() {

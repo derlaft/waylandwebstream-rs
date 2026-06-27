@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
     // from `packet_rx` (one H.264 Annex-B NAL unit per message) and
     // pushes `DecodedFrame`s through `frame_tx` to the display
     // thread's renderer.
-    let _decoder_join = spawn_decoder_thread(packet_rx, frame_tx);
+    let (_decoder_join, _decoder_count) = spawn_decoder_thread(packet_rx, frame_tx);
     debug!("decoder thread spawned");
 
     loop {

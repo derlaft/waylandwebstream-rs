@@ -47,6 +47,14 @@ pub struct DisplayHandle {
     /// lazily in tests that need it.
     #[allow(dead_code)] // read by integration tests, not by the main binary
     pub render_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Counter of `wl_buffer::Release` events dispatched (i.e. the
+    /// compositor told us a buffer is free to reuse). Should be
+    /// `>= render_counter - 1` after steady state: every render
+    /// after the first produces a Release for the previous buffer.
+    /// If `release_count` is much lower, the renderer is starved
+    /// of free slots and `pick_next_released` keeps returning None.
+    #[allow(dead_code)] // read by integration tests, not by the main binary
+    pub release_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Spawn the Wayland display thread. `frame_rx` is consumed by the
@@ -72,13 +80,17 @@ pub fn spawn_display_thread(
     // without borrowing the renderer directly. See
     // `DisplayHandle::render_counter`.
     let render_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let release_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    let counter_for_thread = render_counter.clone();
+    let counters = DisplayCounters {
+        render: render_counter.clone(),
+        release: release_counter.clone(),
+    };
     thread::Builder::new()
         .name("wws-display".into())
         .spawn(move || {
             if let Err(e) =
-                run_display_loop(initial_size, size_tx, close_tx, frame_rx, counter_for_thread)
+                run_display_loop(initial_size, size_tx, close_tx, frame_rx, counters)
             {
                 warn!("display thread exited: {e:#}");
             }
@@ -89,7 +101,17 @@ pub fn spawn_display_thread(
         size_rx,
         close_rx,
         render_counter,
+        release_counter,
     })
+}
+
+/// Counters shared between the display thread (writer) and the
+/// outside world (reader). Bundled so we can pass them to
+/// `run_display_loop` in one move instead of two.
+#[derive(Clone)]
+struct DisplayCounters {
+    render: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    release: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 fn run_display_loop(
@@ -97,7 +119,7 @@ fn run_display_loop(
     size_tx: watch::Sender<(u32, u32)>,
     close_tx: watch::Sender<bool>,
     frame_rx: mpsc::Receiver<DecodedFrame>,
-    render_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    counters: DisplayCounters,
 ) -> Result<()> {
     let conn = Connection::connect_to_env()
         .context("could not connect to Wayland compositor (is $WAYLAND_DISPLAY set?)")?;
@@ -105,7 +127,7 @@ fn run_display_loop(
     let mut event_queue = conn.new_event_queue();
     let qh = event_queue.handle();
 
-    let mut state = DisplayState::new(initial_size, size_tx, close_tx.clone());
+    let mut state = DisplayState::new(initial_size, size_tx, close_tx.clone(), counters.clone());
 
     // First roundtrip: bind wl_compositor, xdg_wm_base, wl_seat, wl_shm.
     display.get_registry(&qh, ());
@@ -148,7 +170,7 @@ fn run_display_loop(
     // Replace the renderer's internal counter with the shared one
     // so the DisplayHandle returned to the caller observes the same
     // increments. Cheap: just an Arc swap.
-    renderer.install_render_counter(render_counter.clone());
+    renderer.install_render_counter(counters.render.clone());
     if !renderer.prime() {
         warn!("renderer could not prime initial buffer");
     } else {
@@ -164,6 +186,17 @@ fn run_display_loop(
             info!("window closed by compositor");
             break;
         }
+        // Verbose loop logging (debug level) so a stuck loop is
+        // visible in --nocapture output. Disabled by default to
+        // avoid log spam in production.
+        tracing::trace!(
+            "display tick: slot_state={}",
+            state
+                .renderer
+                .as_ref()
+                .map(|r| r.slot_state())
+                .unwrap_or_else(|| "<no renderer>".into()),
+        );
 
         // Drain decoded frames first (fast, non-blocking). This is
         // what makes the window *show* new pictures -- if no frame is
@@ -265,6 +298,9 @@ struct DisplayState {
     /// "no frame in N seconds" warning below to distinguish a stuck
     /// renderer from a silent upstream.
     last_render: Option<std::time::Instant>,
+    /// Counters shared with `DisplayHandle` for observability (smoke
+    /// tests, future metrics). Cloned from the Arc the caller sees.
+    counters: DisplayCounters,
 }
 
 impl DisplayState {
@@ -272,6 +308,7 @@ impl DisplayState {
         initial_size: (u32, u32),
         size_tx: watch::Sender<(u32, u32)>,
         close_tx: watch::Sender<bool>,
+        counters: DisplayCounters,
     ) -> Self {
         Self {
             initial_size,
@@ -286,6 +323,7 @@ impl DisplayState {
             renderer: None,
             pending_resize: None,
             last_render: None,
+            counters,
         }
     }
 }
@@ -513,6 +551,10 @@ impl Dispatch<wl_buffer::WlBuffer, SlotId> for DisplayState {
         _: &QueueHandle<Self>,
     ) {
         if let wl_buffer::Event::Release = event {
+            state.counters.release.fetch_add(
+                1,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             tracing::info!("wl_buffer::Release for slot={slot_id}");
             if let Some(renderer) = state.renderer.as_mut() {
                 renderer.release_slot(*slot_id);
