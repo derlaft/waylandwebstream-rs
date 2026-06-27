@@ -133,12 +133,32 @@ fn locate_server_binary() -> std::path::PathBuf {
     );
 }
 
-fn spawn_server(port: u16, wayland_display: &str) -> Child {
+fn spawn_server(port: u16, _wayland_display: &str) -> Child {
     let bin = locate_server_binary();
+    // The server is itself a Wayland compositor -- `--display-name`
+    // names the socket it listens on for *its own* Wayland clients,
+    // i.e. apps rendering into the server's captured framebuffer.
+    // We give it a unique, never-used socket name (`wayland-smoke-e2e`)
+    // rather than pointing it at the test's `WAYLAND_DISPLAY`:
+    //
+    //   1. The test's `WAYLAND_DISPLAY` is the wws-client's surface
+    //      -- if the server attached to that, we'd have the server
+    //      and the client fighting over the same Wayland session
+    //      (and the server would try to capture the wws-client
+    //      window as part of its own output, which is circular).
+    //   2. The user's labwc/waypipe session is the production
+    //      surface; the test shouldn't attach to it.
+    //
+    // The server binds to `wayland-smoke-e2e` (or rather: tells
+    // Smithay to create a listening socket by that name), which
+    // becomes a fresh Wayland session no other process is using.
+    // Nothing connects to it during the test -- that's intentional,
+    // the server produces just an initial keyframe and the test's
+    // pass criteria don't require continuous damage.
     Command::new(bin)
         .args([
             "--display-name",
-            wayland_display,
+            "wayland-smoke-e2e",
             "--port",
             &port.to_string(),
             "--listen-addr",
@@ -146,7 +166,10 @@ fn spawn_server(port: u16, wayland_display: &str) -> Child {
             "--encoder",
             "x264",
         ])
-        .env("WAYLAND_DISPLAY", wayland_display)
+        // Note: we deliberately do NOT pass `WAYLAND_DISPLAY=...` to
+        // the server. The server picks up its socket name from
+        // `--display-name`; the env var would only matter if it
+        // were *connecting* to another compositor (which it isn't).
         .env("RUST_LOG", "info")
         .stdout(Stdio::from(std::fs::File::create("/tmp/wws-smoke-server.log").unwrap()))
         .stderr(Stdio::from(std::fs::File::create("/tmp/wws-smoke-server.err").unwrap()))
