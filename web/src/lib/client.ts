@@ -7,10 +7,11 @@
 //                 MSG_AUDIO_FRAME -> onAudioFrame,
 //                 MSG_CONTROL     -> onCodec/onCursor/onBitrate
 //
-// Reconnect behavior mirrors the old ControlChannel: exponential back-off
-// with full jitter (lib/backoff.ts), full state reset on reconnect, no
-// reconnect when close() is called intentionally.
-import { nextBackoffDelayMs } from './backoff';
+// Reconnect behavior: the server allows only one client at a time and kicks
+// the previous one when a new connection arrives, so automatic reconnection
+// is deliberately disabled -- a dropped or kicked connection stays closed
+// until the user explicitly reconnects (Stage wires canvas click/tap/keydown
+// to reconnect()). close() (intentional teardown) never reconnects either.
 import {
   MSG_AUDIO_FRAME,
   MSG_CONTROL,
@@ -42,6 +43,12 @@ export interface ClientChannelOptions {
   /// Called for every `MSG_AUDIO_FRAME` payload (pts_us + raw Opus bytes).
   /// The caller feeds the Opus to an AudioDecoder.
   onAudioFrame?: (frame: AudioFramePayload) => void;
+  /// Called when the socket closes unexpectedly (dropped or kicked by the
+  /// server because another client connected), not on an intentional
+  /// close(). Auto-reconnect is disabled, so the caller uses this to prompt
+  /// the user to reconnect (e.g. show an overlay) and to arm reconnect() on
+  /// the next canvas interaction.
+  onClosed?: () => void;
 }
 
 export class ClientChannel {
@@ -54,12 +61,18 @@ export class ClientChannel {
   private readonly onCursor?: (cursor: CursorUpdate) => void;
   private readonly onVideoFrame?: (frame: VideoFramePayload) => void;
   private readonly onAudioFrame?: (frame: AudioFramePayload) => void;
+  private readonly onClosed?: () => void;
 
-  private reconnectAttempt = 0;
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // Connection lifecycle:
+  //   'idle'       — constructed, connect() not yet called. Sends are buffered
+  //                  (the initial ready/resize emitted before connect()).
+  //   'connecting' — socket opening; sends are buffered until OPEN.
+  //   'open'       — socket OPEN; sends go out immediately.
+  //   'closed'     — socket closed (dropped, kicked, or intentional). Sends
+  //                  are dropped; reconnect() re-opens unless closedByCaller.
+  private phase: 'idle' | 'connecting' | 'open' | 'closed' = 'idle';
   // Distinguishes an intentional `close()` (e.g. page teardown) from the
-  // socket closing on its own -- only the latter should trigger a
-  // reconnect.
+  // socket closing on its own -- only the latter arms reconnect().
   private closedByCaller = false;
 
   constructor(opts: ClientChannelOptions = {}) {
@@ -67,6 +80,7 @@ export class ClientChannel {
     this.onCursor = opts.onCursor;
     this.onVideoFrame = opts.onVideoFrame;
     this.onAudioFrame = opts.onAudioFrame;
+    this.onClosed = opts.onClosed;
   }
 
   connect(): void {
@@ -74,7 +88,18 @@ export class ClientChannel {
     this.openSocket();
   }
 
+  /// Re-open the connection after an unexpected close. No-op if a socket is
+  /// already connecting/open, or if the channel was closed intentionally via
+  /// close(). Stage calls this on the first canvas interaction (click, tap,
+  /// or keypress) after a disconnect -- reconnecting kicks whatever other
+  /// client is currently attached, since the server allows only one.
+  reconnect(): void {
+    if (this.phase !== 'closed' || this.closedByCaller) return;
+    this.openSocket();
+  }
+
   private openSocket(): void {
+    this.phase = 'connecting';
     setConnectionState('connecting');
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${wsProtocol}//${window.location.host}/client`;
@@ -82,7 +107,7 @@ export class ClientChannel {
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
     ws.onopen = () => {
-      this.reconnectAttempt = 0;
+      this.phase = 'open';
       setConnectionState('open');
       this.send({ type: 'ready' });
       const queued = this.sendQueue;
@@ -95,40 +120,43 @@ export class ClientChannel {
       console.error('Client WebSocket error:', e);
     };
     // `onerror` always precedes `onclose` for a failed/dropped connection
-    // (per the WebSocket spec), so reconnect scheduling lives only here --
-    // otherwise a single drop would queue two attempts.
-    ws.onclose = () => this.scheduleReconnect();
+    // (per the WebSocket spec), so close handling lives only here.
+    ws.onclose = () => this.handleClose();
     ws.onmessage = (event) => this.onUnifiedFrame(event.data as ArrayBuffer);
     this.ws = ws;
   }
 
-  private scheduleReconnect(): void {
-    if (this.closedByCaller) {
-      setConnectionState('closed');
-      return;
+  private handleClose(): void {
+    this.ws = null;
+    this.phase = 'closed';
+    // Queued sends are stale once the socket is gone; clear them so a later
+    // reconnect doesn't replay input from before the disconnect.
+    this.sendQueue = [];
+    setConnectionState('closed');
+    // Auto-reconnect is disabled. Only notify on an unexpected close so the
+    // caller can prompt the user; an intentional close() is silent.
+    if (!this.closedByCaller) {
+      this.onClosed?.();
     }
-    setConnectionState('reconnecting');
-    const delay = nextBackoffDelayMs(this.reconnectAttempt);
-    this.reconnectAttempt += 1;
-    console.info(`Client WebSocket closed, reconnecting in ${Math.round(delay)}ms`);
-    this.reconnectTimer = setTimeout(() => this.openSocket(), delay);
   }
 
   send(msg: ClientMessage): void {
     const framed = encodeClientMessage(msg);
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+    if (this.phase === 'open' && this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(framed);
-    } else {
+    } else if (this.phase === 'idle' || this.phase === 'connecting') {
+      // Buffer until the socket opens (e.g. the initial ready/resize emitted
+      // before connect(), or input in the first ms after connect()).
       this.sendQueue.push(framed);
     }
+    // phase === 'closed': drop. There's no socket and we won't reconnect
+    // until the user interacts, by which point this input is stale.
   }
 
   close(): void {
     this.closedByCaller = true;
-    if (this.reconnectTimer !== null) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
+    this.phase = 'closed';
+    this.sendQueue = [];
     this.ws?.close();
     this.ws = null;
   }

@@ -138,53 +138,52 @@ describe('ClientChannel', () => {
   });
 
   describe('reconnect', () => {
-    it('reconnects after an unexpected close, growing the delay each time and resetting it after a successful open', () => {
-      vi.spyOn(Math, 'random').mockReturnValue(1);
+    it('does not auto-reconnect after an unexpected close', () => {
       const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
-
       const channel = new ClientChannel();
       channel.connect();
       expect(FakeWebSocket.instances).toHaveLength(1);
 
       FakeWebSocket.instances[0].simulateClose();
-      expect(setTimeoutSpy).toHaveBeenLastCalledWith(expect.any(Function), 500);
-      expect(FakeWebSocket.instances).toHaveLength(1);
-
-      vi.runOnlyPendingTimers();
-      expect(FakeWebSocket.instances).toHaveLength(2);
-
-      FakeWebSocket.instances[1].simulateClose();
-      expect(setTimeoutSpy).toHaveBeenLastCalledWith(expect.any(Function), 1000);
-
-      vi.runOnlyPendingTimers();
-      expect(FakeWebSocket.instances).toHaveLength(3);
-
-      // A successful open resets the attempt counter, so the next close
-      // backs off from the start again (1000ms -> 500ms, not 2000ms).
-      FakeWebSocket.instances[2].simulateOpen();
-      FakeWebSocket.instances[2].simulateClose();
-      expect(setTimeoutSpy).toHaveBeenLastCalledWith(expect.any(Function), 500);
-      channel.close();
-    });
-
-    it('does not reconnect after an intentional close()', () => {
-      const channel = new ClientChannel();
-      channel.connect();
-      channel.close();
+      // No timer scheduled and no new socket: the connection stays closed
+      // until reconnect() is called explicitly.
+      expect(setTimeoutSpy).not.toHaveBeenCalled();
       vi.runAllTimers();
       expect(FakeWebSocket.instances).toHaveLength(1);
+      channel.close();
     });
 
-    it('flushes queued sends once a reconnect succeeds', () => {
+    it('fires onClosed on an unexpected close but not on intentional close()', () => {
+      const onClosed = vi.fn();
+      const channel = new ClientChannel({ onClosed });
+      channel.connect();
+      FakeWebSocket.instances[0].simulateOpen();
+
+      FakeWebSocket.instances[0].simulateClose();
+      expect(onClosed).toHaveBeenCalledTimes(1);
+
+      // reconnect() opens a fresh socket; an intentional close() must not
+      // fire onClosed.
+      channel.reconnect();
+      expect(FakeWebSocket.instances).toHaveLength(2);
+      channel.close();
+      expect(onClosed).toHaveBeenCalledTimes(1);
+    });
+
+    it('reconnect() re-opens after an unexpected close and flushes queued sends', () => {
       const channel = new ClientChannel();
       channel.connect();
       FakeWebSocket.instances[0].simulateOpen();
       FakeWebSocket.instances[0].simulateClose();
 
+      // Sends while closed are dropped (stale input from the disconnect).
       channel.send({ type: 'request_keyframe' });
-      vi.runOnlyPendingTimers();
 
+      channel.reconnect();
       const reconnected = FakeWebSocket.instances[1];
+      expect(reconnected).toBeDefined();
+      // A send queued after reconnect() (while CONNECTING) flushes on open.
+      channel.send({ type: 'request_keyframe' });
       expect(reconnected.sent).toHaveLength(0);
       reconnected.simulateOpen();
       // `ready` (sent on every open) plus the queued request_keyframe.
@@ -192,6 +191,20 @@ describe('ClientChannel', () => {
       expect(readClientMessageSent([reconnected.sent[0]])).toEqual({ type: 'ready' });
       expect(readClientMessageSent([reconnected.sent[1]])).toEqual({ type: 'request_keyframe' });
       channel.close();
+    });
+
+    it('reconnect() is a no-op while open or after an intentional close()', () => {
+      const channel = new ClientChannel();
+      channel.connect();
+      FakeWebSocket.instances[0].simulateOpen();
+      // Open: no new socket.
+      channel.reconnect();
+      expect(FakeWebSocket.instances).toHaveLength(1);
+
+      // Intentional close: reconnect() must not revive it.
+      channel.close();
+      channel.reconnect();
+      expect(FakeWebSocket.instances).toHaveLength(1);
     });
   });
 

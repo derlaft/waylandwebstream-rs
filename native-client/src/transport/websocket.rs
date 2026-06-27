@@ -34,10 +34,25 @@ impl Transport for WsTransport {
                 Some(Err(e)) => return Err(anyhow!(e)),
                 None => return Err(anyhow!(FrameError::Closed)),
             };
-            // Only binary frames carry framed messages. Text / Ping / Pong /
-            // Close from the server are ignored on the receive side -- the
-            // server doesn't send any of those today and if it ever did,
-            // they'd be control-plane noise that doesn't affect decode.
+            // A Close frame is how the server kicks us (only one client is
+            // allowed at a time) or signals shutdown. Surface the reason --
+            // it's an expected, graceful end, not a transport error -- then
+            // return Closed so the caller exits cleanly.
+            if let Message::Close(frame) = &msg {
+                match frame {
+                    Some(f) => tracing::info!(
+                        "server closed connection: code={} reason={:?}",
+                        f.code,
+                        f.reason
+                    ),
+                    None => tracing::info!("server closed connection"),
+                }
+                return Err(anyhow!(FrameError::Closed));
+            }
+            // Only binary frames carry framed messages. Text / Ping / Pong
+            // from the server are ignored on the receive side -- the server
+            // doesn't send any of those today and if it ever did, they'd be
+            // control-plane noise that doesn't affect decode.
             if let Message::Binary(data) = msg {
                 return parse_frame(&data).map_err(|e| anyhow!(e));
             }

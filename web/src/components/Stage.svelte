@@ -4,7 +4,7 @@
   import { ClientChannel } from '../lib/client';
   import { attachInput } from '../lib/input';
   import type { ClientMessage, CursorUpdate } from '../lib/protocol';
-  import { setCursorDebug } from '../lib/stats';
+  import { setCursorDebug, streamStats } from '../lib/stats';
   import { createVideoPipeline, type VideoPipeline } from '../lib/videoClient';
   import { Viewport } from '../lib/viewport';
 
@@ -114,6 +114,13 @@
       onCursor: applyCursor,
       onVideoFrame: (frame) => pipeline?.handleVideoFrame(frame),
       onAudioFrame: (frame) => audio?.handleAudioFrame(frame),
+      onClosed: () => {
+        // The server allows one client at a time and disabled auto-reconnect,
+        // so a dropped/kicked connection stays closed. The overlay (bound to
+        // connectionState) prompts the user; the interaction listeners below
+        // reconnect on the next click/tap/keypress.
+        console.info('Connection closed; click the canvas to reconnect.');
+      },
     });
 
     viewport = new Viewport({ canvas, sendControl });
@@ -161,9 +168,23 @@
 
     canvas.addEventListener('pointermove', onMove);
     canvas.addEventListener('pointerleave', onLeave);
+
+    // Reconnect on canvas interaction after a disconnect. reconnect() is a
+    // no-op while the connection is open/connecting, so these can stay
+    // attached for the lifetime of the component. Registered before
+    // attachInput's listeners so the socket is already re-opening when the
+    // same event is forwarded as input (it buffers until OPEN).
+    const onReconnectIntent = () => client?.reconnect();
+    canvas.addEventListener('pointerdown', onReconnectIntent);
+    canvas.addEventListener('touchstart', onReconnectIntent);
+    canvas.addEventListener('keydown', onReconnectIntent);
+
     removeCursorListeners = () => {
       canvas.removeEventListener('pointermove', onMove);
       canvas.removeEventListener('pointerleave', onLeave);
+      canvas.removeEventListener('pointerdown', onReconnectIntent);
+      canvas.removeEventListener('touchstart', onReconnectIntent);
+      canvas.removeEventListener('keydown', onReconnectIntent);
     };
 
     window.addEventListener('beforeunload', teardown);
@@ -188,6 +209,14 @@
     src="data:,"
     style="display: none; transform: translate(0, 0);"
   />
+  {#if $streamStats.connectionState === 'closed'}
+    <!-- pointer-events:none so the click/tap that dismisses this overlay
+         reaches the canvas underneath, which triggers reconnect(). -->
+    <div class="disconnected-overlay">
+      <p>Disconnected</p>
+      <p class="hint">Click, tap, or press a key to reconnect</p>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -218,5 +247,32 @@
     user-select: none;
     image-rendering: pixelated;
     will-change: transform;
+  }
+
+  .disconnected-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    pointer-events: none;
+    background: rgba(0, 0, 0, 0.6);
+    color: #fff;
+    font-family: system-ui, sans-serif;
+    text-align: center;
+  }
+
+  .disconnected-overlay p {
+    margin: 0;
+    font-size: 1.5rem;
+    font-weight: 600;
+  }
+
+  .disconnected-overlay .hint {
+    font-size: 1rem;
+    font-weight: 400;
+    opacity: 0.8;
   }
 </style>

@@ -31,7 +31,7 @@ use audio::AudioPlayer;
 use decode::sw::{spawn_decoder_thread, DecodedFrame};
 use display::{spawn_display_thread, RendererKind};
 use latency::LatencyTracker;
-use transport::{Frame, Transport};
+use transport::{Frame, FrameError, Transport};
 use types::SignalingMessage;
 
 const INITIAL_WINDOW_SIZE: (u32, u32) = (1280, 720);
@@ -145,7 +145,16 @@ async fn main() -> Result<()> {
                 match frame {
                     Ok(f) => handle_frame(f, &packet_tx, audio.as_mut(), &mut tracker),
                     Err(e) => {
-                        warn!("recv error: {}; exiting", e);
+                        // A clean server-side close (kicked because another
+                        // client connected, or server shutdown) is an
+                        // expected, graceful exit -- not an error. There's no
+                        // auto-reconnect in the native client, so we just
+                        // exit either way.
+                        if matches!(e.downcast_ref::<FrameError>(), Some(FrameError::Closed)) {
+                            info!("connection closed by server; exiting");
+                        } else {
+                            warn!("recv error: {}; exiting", e);
+                        }
                         break;
                     }
                 }

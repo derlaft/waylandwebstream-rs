@@ -17,7 +17,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -241,6 +241,14 @@ pub struct SignalingState {
     /// `ServerMessage::Cursor` messages. A new client also receives the
     /// current cursor immediately on connect.
     cursor_rx: watch::Receiver<CursorUpdate>,
+    /// Monotonic counter identifying the most recent `/client` connection.
+    /// Only one client is allowed at a time: each new `/client` connection
+    /// claims the next generation here and publishes it on `client_gen_tx`,
+    /// which kicks every older connection (see `unified_client_handler`).
+    client_gen: Arc<AtomicU64>,
+    /// Broadcasts the latest claimed client generation so older `/client`
+    /// connections notice they've been superseded and close themselves.
+    client_gen_tx: watch::Sender<u64>,
 }
 
 impl SignalingState {
@@ -267,6 +275,9 @@ impl SignalingState {
         let last_keyframe_force = Instant::now()
             .checked_sub(KEYFRAME_FORCE_COOLDOWN)
             .unwrap_or_else(Instant::now);
+        // Generation 0 is the "no client yet" sentinel; the first connection
+        // claims generation 1.
+        let (client_gen_tx, _) = watch::channel(0u64);
         Self {
             resize_tx,
             touch_tx,
@@ -285,6 +296,8 @@ impl SignalingState {
             last_keyframe_force: Arc::new(Mutex::new(last_keyframe_force)),
             audio_tx,
             cursor_rx,
+            client_gen: Arc::new(AtomicU64::new(0)),
+            client_gen_tx,
         }
     }
 
@@ -612,7 +625,19 @@ async fn handle_unified_client(
 }
 
 async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
-    info!("Unified client connected");
+    // Only one client at a time: claim the next generation from the
+    // monotonic `client_gen` counter, then publish on the watch channel to
+    // wake every other `/client` connection. Each woken connection re-reads
+    // the atomic counter (not the watch *value*, which can momentarily
+    // regress if two connections' publishes race) and closes itself if the
+    // counter has moved past its own generation -- so exactly the
+    // highest-generation (newest) connection survives. See the
+    // `client_gen_rx.changed()` arm below. Subscribe before publishing so our
+    // own publish can't slip through unobserved.
+    let my_gen = state.client_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut client_gen_rx = state.client_gen_tx.subscribe();
+    let _ = state.client_gen_tx.send(my_gen);
+    info!("Unified client connected (generation {my_gen})");
     state.session.ensure_started().await;
 
     let (mut sender, mut receiver) = socket.split();
@@ -754,6 +779,22 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
                 let Ok(signal) = parse_client_message(&data) else { continue; };
                 dispatch_signaling_message(signal, &state).await;
             }
+            changed = client_gen_rx.changed() => {
+                // Sender lives in `SignalingState` for the server's lifetime,
+                // so `changed()` only errors if the whole server is gone --
+                // nothing useful to do but stop watching.
+                if changed.is_err() {
+                    continue;
+                }
+                if state.client_gen.load(Ordering::SeqCst) != my_gen {
+                    info!("Unified client (generation {my_gen}) replaced by a newer client; closing");
+                    let _ = sender.send(Message::Close(Some(CloseFrame {
+                        code: close_code::POLICY,
+                        reason: "replaced by a newer client".into(),
+                    }))).await;
+                    break;
+                }
+            }
             _ = shutdown_rx.changed() => {
                 let _ = sender.send(Message::Close(Some(CloseFrame {
                     code: close_code::AWAY,
@@ -764,7 +805,7 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
         }
     }
 
-    info!("Unified client disconnected");
+    info!("Unified client (generation {my_gen}) disconnected");
     // Cancel any in-progress touches so the next session doesn't inherit
     // phantom active-touch entries from a session that closed mid-gesture.
     // wl_touch.cancel is a global reset -- the empty-list form clears all
@@ -1310,6 +1351,45 @@ mod tests {
                 "payload length must match the header's payload_len"
             );
         }
+    }
+
+    /// Only one `/client` may be connected at a time: when a second client
+    /// connects, the server closes the first with POLICY (1008) and the
+    /// "replaced by a newer client" reason. This is the single-client
+    /// enforcement -- the newest connection always wins.
+    #[tokio::test]
+    async fn client_endpoint_kicks_previous_client_on_new_connection() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let state = make_signaling_state(shutdown_rx, shutdown_tx, None);
+        let server = SignalingServer::new(state);
+
+        let addr = "127.0.0.1:27360";
+        tokio::spawn(async move {
+            server.serve("127.0.0.1", 27360, std::future::pending()).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut first = ws_handshake(addr, "/client").await;
+        // Let the first connection's generation be claimed and published
+        // before the second connects.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let _second = ws_handshake(addr, "/client").await;
+
+        // The first client must eventually receive a close frame. It may have
+        // queued initial CONTROL frames ahead of it, so skip any binary
+        // frames until the close arrives.
+        let (code, reason) = loop {
+            let (opcode, payload) = read_ws_frame(&mut first).await;
+            if opcode == 8 {
+                assert!(payload.len() >= 2, "close frame must carry a status code");
+                let code = u16::from_be_bytes([payload[0], payload[1]]);
+                let reason = String::from_utf8(payload[2..].to_vec()).unwrap_or_default();
+                break (code, reason);
+            }
+        };
+        assert_eq!(code, close_code::POLICY, "expected POLICY close code");
+        assert_eq!(reason, "replaced by a newer client");
     }
 
     /// /client delivers an `EncodedPacket` over the unified framing,
