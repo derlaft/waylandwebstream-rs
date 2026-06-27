@@ -56,3 +56,7 @@ ffmpeg-next = "8.1"
 # consistent.
 opus = "0.3"
 pipewire = "0.10"
+
+# EGL renderer (Phase 9). wayland-egl 0.32 is the companion crate to
+# wayland-client 0.31 (same smithay release train).
+wayland-egl = "0.32"

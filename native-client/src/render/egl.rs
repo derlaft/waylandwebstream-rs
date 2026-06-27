@@ -2,11 +2,11 @@
 //
 // Uploads decoded BGRA frames as GL_RGBA textures and blits them via a
 // fullscreen two-triangle quad.  The fragment shader swizzles B↔R so
-// BGRA bytes uploaded as RGBA channels appear with the correct colors.
+// BGRA bytes (from ffmpeg) uploaded as RGBA channels appear correctly.
 //
-// Requires wayland-client with features = ["system"] (raw wl_display* /
-// wl_surface* pointers needed for EGL surface creation).  libEGL.so,
-// libGLESv2.so, and libwayland-egl.so are linked directly via #[link].
+// Window management uses `wayland-egl 0.32` (official smithay companion
+// to wayland-client 0.31).  Raw EGL and GLES2 entry points are linked
+// directly from libEGL.so / libGLESv2.so.
 
 use anyhow::{Context, Result};
 use std::ffi::c_void;
@@ -16,9 +16,11 @@ use std::sync::{
 };
 use std::sync::mpsc;
 
+use wayland_client::backend::ObjectId;
+
 use crate::decode::sw::DecodedFrame;
 
-// ── EGL constants ────────────────────────────────────────────────────────────
+// ── EGL constants ─────────────────────────────────────────────────────────────
 
 const EGL_FALSE: u32 = 0;
 const EGL_NO_DISPLAY: *mut c_void = std::ptr::null_mut();
@@ -38,6 +40,7 @@ const EGL_OPENGL_ES_API: u32 = 0x30A0;
 
 // ── GLES2 constants ───────────────────────────────────────────────────────────
 
+const GL_COLOR_BUFFER_BIT: u32 = 0x00004000;
 const GL_TRIANGLES: u32 = 0x0004;
 const GL_RGBA: u32 = 0x1908;
 const GL_UNSIGNED_BYTE: u32 = 0x1401;
@@ -58,7 +61,7 @@ const GL_FRAGMENT_SHADER: u32 = 0x8B30;
 const GL_LINK_STATUS: u32 = 0x8B82;
 const GL_COMPILE_STATUS: u32 = 0x8B81;
 
-// ── Raw FFI ───────────────────────────────────────────────────────────────────
+// ── Raw EGL / GLES2 FFI ───────────────────────────────────────────────────────
 
 #[allow(non_snake_case)]
 #[link(name = "EGL")]
@@ -100,6 +103,8 @@ extern "C" {
 #[allow(non_snake_case)]
 #[link(name = "GLESv2")]
 extern "C" {
+    fn glClearColor(r: f32, g: f32, b: f32, a: f32);
+    fn glClear(mask: u32);
     fn glViewport(x: i32, y: i32, width: i32, height: i32);
     fn glGenTextures(n: i32, textures: *mut u32);
     fn glDeleteTextures(n: i32, textures: *const u32);
@@ -117,30 +122,15 @@ extern "C" {
         data: *const c_void,
     );
     fn glCreateShader(type_: u32) -> u32;
-    fn glShaderSource(
-        shader: u32,
-        count: i32,
-        string: *const *const u8,
-        length: *const i32,
-    );
+    fn glShaderSource(shader: u32, count: i32, string: *const *const u8, length: *const i32);
     fn glCompileShader(shader: u32);
     fn glGetShaderiv(shader: u32, pname: u32, params: *mut i32);
-    fn glGetShaderInfoLog(
-        shader: u32,
-        buf_size: i32,
-        length: *mut i32,
-        info_log: *mut u8,
-    );
+    fn glGetShaderInfoLog(shader: u32, buf_size: i32, length: *mut i32, info_log: *mut u8);
     fn glCreateProgram() -> u32;
     fn glAttachShader(program: u32, shader: u32);
     fn glLinkProgram(program: u32);
     fn glGetProgramiv(program: u32, pname: u32, params: *mut i32);
-    fn glGetProgramInfoLog(
-        program: u32,
-        buf_size: i32,
-        length: *mut i32,
-        info_log: *mut u8,
-    );
+    fn glGetProgramInfoLog(program: u32, buf_size: i32, length: *mut i32, info_log: *mut u8);
     fn glUseProgram(program: u32);
     fn glDeleteShader(shader: u32);
     fn glDeleteProgram(program: u32);
@@ -165,14 +155,6 @@ extern "C" {
     fn glActiveTexture(texture: u32);
 }
 
-#[allow(non_snake_case)]
-#[link(name = "wayland-egl")]
-extern "C" {
-    fn wl_egl_window_create(surface: *mut c_void, width: i32, height: i32) -> *mut c_void;
-    fn wl_egl_window_destroy(window: *mut c_void);
-    fn wl_egl_window_resize(window: *mut c_void, width: i32, height: i32, dx: i32, dy: i32);
-}
-
 // ── Shaders ───────────────────────────────────────────────────────────────────
 
 // GLSL 1.00 (GLES 2.0).
@@ -186,11 +168,11 @@ void main() {
 }
 ";
 
-// Frame data is BGRA; uploaded as GL_RGBA so the channels arrive as
+// Frame data is BGRA; uploaded as GL_RGBA so channels arrive as
 //   texture.r = B,  texture.g = G,  texture.b = R,  texture.a = A
 // Swizzle c.bgra maps: out.r = tex.b = R, out.g = tex.g = G, out.b = tex.r = B.
 // Also: GL textures are bottom-row-first, frame data is top-row-first, so
-// the QUAD below inverts v to produce an upright image.
+// the QUAD below inverts v (tex v=1 at screen bottom) to produce an upright image.
 const FRAG_SRC: &str = "
 precision mediump float;
 uniform sampler2D u_tex;
@@ -202,8 +184,6 @@ void main() {
 ";
 
 // Fullscreen quad (two CCW triangles, 4 floats per vertex: pos.xy + tex.uv).
-// Texcoord v is 1 at the bottom and 0 at the top so that the image appears
-// upright despite GL's bottom-up texture convention.
 #[rustfmt::skip]
 static QUAD: [f32; 24] = [
     //  pos.x  pos.y   tex.u  tex.v
@@ -218,8 +198,8 @@ static QUAD: [f32; 24] = [
 // ── EglRenderer ──────────────────────────────────────────────────────────────
 
 pub struct EglRenderer {
-    // libwayland-egl window (wraps wl_surface for EGL)
-    wl_egl_window: *mut c_void,
+    // wayland-egl window (must outlive egl_surface; dropped after EGL teardown)
+    egl_window: wayland_egl::WlEglSurface,
     // EGL opaque handles
     egl_display: *mut c_void,
     egl_surface: *mut c_void,
@@ -228,36 +208,40 @@ pub struct EglRenderer {
     program: u32,
     vbo: u32,
     texture: u32,
-    // Cached attribute / uniform locations (set once at init)
-    a_pos: u32,
-    a_tex: u32,
+    // Attribute / uniform locations (i32 from GL; validated ≥ 0 at init)
+    a_pos: i32,
+    a_tex: i32,
     u_tex: i32,
     // Current window size; updated on resize
     width: u32,
     height: u32,
-    // Shared render counter (mirrors ShmRenderer's counter for observability)
+    // Shared render counter (matches ShmRenderer's counter for smoke tests)
     render_count: Arc<AtomicU64>,
 }
 
 // SAFETY: EGL/GL state lives on the display OS thread exclusively.
-// The raw pointers are valid for the lifetime of EglRenderer.
+// The raw EGL pointers are valid for the lifetime of EglRenderer and
+// egl_window outlives them all (dropped last, after eglTerminate).
 unsafe impl Send for EglRenderer {}
 
 impl EglRenderer {
     /// Initialise EGL + GLES2 and bind to the given Wayland objects.
     ///
-    /// Both raw pointers must come from a `wayland-client` connection
-    /// built with `features = ["system"]`:
-    /// * `wl_display_ptr` — `conn.backend().display_ptr() as *mut c_void`
-    /// * `wl_surface_ptr` — `surface.id().as_ptr() as *mut c_void`
+    /// * `wl_display_ptr` — raw `wl_display*` (`conn.backend().display_ptr() as *mut c_void`)
+    /// * `surface_id`     — the `ObjectId` of the `wl_surface` to render into
     pub fn new(
         wl_display_ptr: *mut c_void,
-        wl_surface_ptr: *mut c_void,
+        surface_id: ObjectId,
         width: u32,
         height: u32,
         render_count: Arc<AtomicU64>,
     ) -> Result<Self> {
-        // ── EGL display ────────────────────────────────────────────────
+        // ── wayland-egl window ──────────────────────────────────────────
+        let egl_window =
+            wayland_egl::WlEglSurface::new(surface_id, width as i32, height as i32)
+                .map_err(|e| anyhow::anyhow!("WlEglSurface::new: {e}"))?;
+
+        // ── EGL display + init ─────────────────────────────────────────
         let egl_display = unsafe { eglGetDisplay(wl_display_ptr) };
         if egl_display == EGL_NO_DISPLAY {
             anyhow::bail!("eglGetDisplay returned EGL_NO_DISPLAY");
@@ -272,11 +256,11 @@ impl EglRenderer {
         // ── EGL config (RGBA8888, window surface, GLES2) ───────────────
         #[rustfmt::skip]
         let config_attribs: [i32; 13] = [
-            EGL_RED_SIZE,       8,
-            EGL_GREEN_SIZE,     8,
-            EGL_BLUE_SIZE,      8,
-            EGL_ALPHA_SIZE,     8,
-            EGL_SURFACE_TYPE,   EGL_WINDOW_BIT,
+            EGL_RED_SIZE,        8,
+            EGL_GREEN_SIZE,      8,
+            EGL_BLUE_SIZE,       8,
+            EGL_ALPHA_SIZE,      8,
+            EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
             EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
             EGL_NONE,
         ];
@@ -309,31 +293,40 @@ impl EglRenderer {
             anyhow::bail!("eglCreateContext failed");
         }
 
-        // ── wl_egl_window + EGL surface ────────────────────────────────
-        let wl_egl_window = unsafe {
-            wl_egl_window_create(wl_surface_ptr, width as i32, height as i32)
-        };
-        if wl_egl_window.is_null() {
-            anyhow::bail!("wl_egl_window_create failed");
-        }
-
+        // egl_window.ptr() is *const c_void; EGL needs *mut c_void (EGLNativeWindowType).
+        // The cast is safe: EGL stores the pointer and drives it via wl_egl_window_* calls
+        // that Mesa owns; our egl_window field keeps the window alive for EGL's lifetime.
         let egl_surface = unsafe {
-            eglCreateWindowSurface(egl_display, config, wl_egl_window, std::ptr::null())
+            eglCreateWindowSurface(
+                egl_display,
+                config,
+                egl_window.ptr() as *mut c_void,
+                std::ptr::null(),
+            )
         };
         if egl_surface == EGL_NO_SURFACE {
-            unsafe { wl_egl_window_destroy(wl_egl_window) };
             anyhow::bail!("eglCreateWindowSurface failed");
         }
 
-        let ok = unsafe {
-            eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context)
-        };
+        let ok =
+            unsafe { eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context) };
         if ok == EGL_FALSE {
             anyhow::bail!("eglMakeCurrent failed");
         }
 
         // ── GL resources ───────────────────────────────────────────────
         let program = compile_program().context("compile GL program")?;
+
+        // Validate attribute and uniform locations before storing them.
+        let a_pos = unsafe { glGetAttribLocation(program, b"a_pos\0".as_ptr()) };
+        let a_tex = unsafe { glGetAttribLocation(program, b"a_tex\0".as_ptr()) };
+        let u_tex = unsafe { glGetUniformLocation(program, b"u_tex\0".as_ptr()) };
+        if a_pos < 0 || a_tex < 0 {
+            anyhow::bail!(
+                "shader attribute not found (a_pos={a_pos}, a_tex={a_tex}); \
+                 shader compiled but linker may have optimised it out"
+            );
+        }
 
         let mut texture = 0u32;
         let mut vbo = 0u32;
@@ -355,15 +348,8 @@ impl EglRenderer {
             );
         }
 
-        let a_pos =
-            unsafe { glGetAttribLocation(program, b"a_pos\0".as_ptr()) as u32 };
-        let a_tex =
-            unsafe { glGetAttribLocation(program, b"a_tex\0".as_ptr()) as u32 };
-        let u_tex =
-            unsafe { glGetUniformLocation(program, b"u_tex\0".as_ptr()) };
-
         Ok(Self {
-            wl_egl_window,
+            egl_window,
             egl_display,
             egl_surface,
             egl_context,
@@ -379,8 +365,24 @@ impl EglRenderer {
         })
     }
 
-    /// Drain all pending decoded frames from `frame_rx`, rendering the
-    /// latest one (earlier ones are dropped — same policy as ShmRenderer).
+    /// Present an initial black frame so the compositor maps the xdg surface.
+    ///
+    /// Must be called once after construction (mirrors `ShmRenderer::prime`).
+    /// Without this the compositor never receives a buffer and the window
+    /// stays unmapped until the first decoded video frame arrives.
+    pub fn prime(&self) -> Result<()> {
+        unsafe {
+            glClearColor(0.0, 0.0, 0.0, 1.0);
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
+        let ok = unsafe { eglSwapBuffers(self.egl_display, self.egl_surface) };
+        if ok == EGL_FALSE {
+            anyhow::bail!("eglSwapBuffers (initial prime) failed");
+        }
+        Ok(())
+    }
+
+    /// Drain all pending decoded frames from `frame_rx`, rendering the latest.
     pub fn drain_frames(
         &mut self,
         frame_rx: &mpsc::Receiver<DecodedFrame>,
@@ -410,7 +412,7 @@ impl EglRenderer {
         }
         self.width = w;
         self.height = h;
-        unsafe { wl_egl_window_resize(self.wl_egl_window, w as i32, h as i32, 0, 0) };
+        self.egl_window.resize(w as i32, h as i32, 0, 0);
     }
 
     fn render_frame(&mut self, frame: &DecodedFrame) -> Result<()> {
@@ -439,19 +441,29 @@ impl EglRenderer {
             let stride = (4 * std::mem::size_of::<f32>()) as i32;
             let tex_offset = (2 * std::mem::size_of::<f32>()) as *const c_void;
 
-            glEnableVertexAttribArray(self.a_pos);
-            glEnableVertexAttribArray(self.a_tex);
+            glEnableVertexAttribArray(self.a_pos as u32);
+            glEnableVertexAttribArray(self.a_tex as u32);
             glVertexAttribPointer(
-                self.a_pos, 2, GL_FLOAT, GL_FALSE_U8, stride, std::ptr::null(),
+                self.a_pos as u32,
+                2,
+                GL_FLOAT,
+                GL_FALSE_U8,
+                stride,
+                std::ptr::null(),
             );
             glVertexAttribPointer(
-                self.a_tex, 2, GL_FLOAT, GL_FALSE_U8, stride, tex_offset,
+                self.a_tex as u32,
+                2,
+                GL_FLOAT,
+                GL_FALSE_U8,
+                stride,
+                tex_offset,
             );
 
             glDrawArrays(GL_TRIANGLES, 0, 6);
 
-            glDisableVertexAttribArray(self.a_pos);
-            glDisableVertexAttribArray(self.a_tex);
+            glDisableVertexAttribArray(self.a_pos as u32);
+            glDisableVertexAttribArray(self.a_tex as u32);
         }
 
         let ok = unsafe { eglSwapBuffers(self.egl_display, self.egl_surface) };
@@ -469,17 +481,20 @@ impl Drop for EglRenderer {
             glDeleteTextures(1, &self.texture);
             glDeleteBuffers(1, &self.vbo);
             glDeleteProgram(self.program);
+            // Detach context before destroying EGL objects.
             eglMakeCurrent(
                 self.egl_display,
                 EGL_NO_SURFACE,
                 EGL_NO_SURFACE,
                 EGL_NO_CONTEXT,
             );
+            // Destroy EGL surface BEFORE egl_window field is dropped
+            // (WlEglSurface::drop calls wl_egl_window_destroy).
             eglDestroySurface(self.egl_display, self.egl_surface);
             eglDestroyContext(self.egl_display, self.egl_context);
             eglTerminate(self.egl_display);
-            wl_egl_window_destroy(self.wl_egl_window);
         }
+        // egl_window (WlEglSurface) is dropped here, after eglTerminate.
     }
 }
 

@@ -72,11 +72,17 @@ impl ActiveRenderer {
     }
 
     /// Initial buffer commit so the compositor maps the surface before the
-    /// first decoded frame arrives (SHM only; EGL has no pre-frame buffer).
+    /// first decoded frame arrives.
     fn prime(&mut self) -> bool {
         match self {
             Self::Shm(r) => r.prime(),
-            Self::Egl(_) => true,
+            Self::Egl(r) => match r.prime() {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!("EGL prime failed: {e:#}");
+                    false
+                }
+            },
         }
     }
 
@@ -264,11 +270,9 @@ fn run_display_loop(
             ActiveRenderer::Shm(r)
         }
         RendererKind::Egl => {
-            // surface.id().as_ptr() gives the raw wl_surface* (sys backend only).
-            let wl_surface_ptr = surface.id().as_ptr() as *mut std::ffi::c_void;
             let r = EglRenderer::new(
                 wl_display_ptr,
-                wl_surface_ptr,
+                surface.id(),
                 state.width,
                 state.height,
                 counters.render.clone(),
