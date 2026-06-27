@@ -1,11 +1,22 @@
-// Wayland display wiring for the native client.
+// Wayland display thread — smithay-client-toolkit 0.18 rewrite.
 //
-// Owns the synchronous Wayland event loop, wl_surface/xdg_toplevel plumbing,
-// and the SHM renderer that blits decoded frames into wl_shm buffers. Runs on
-// a dedicated OS thread (wayland-client 0.31 is synchronous). The tokio side
-// feeds it decoded frames via `frame_rx` and reads back window size + close
-// state through `tokio::sync::watch` channels -- keeping Wayland dispatch off
-// the async executor entirely (see AGENTS.md "two execution domains").
+// SCTK takes over the boilerplate that was previously implemented by hand:
+//   • wl_registry global binding
+//   • xdg_wm_base ping / pong
+//   • xdg_surface::Configure → ack_configure
+//   • xdg-decoration negotiation (server-side preferred, client-side fallback)
+//   • wl_seat capability binding → wl_keyboard / wl_pointer
+//   • keyboard via libxkbcommon (dead keys, modifiers, compose)
+//   • wl_output tracking (scale factor, transform)
+//
+// What we keep:
+//   • Dedicated OS thread with a 1 ms tight-poll loop (no calloop) for
+//     minimum render latency — each tick non-blocking-reads Wayland events,
+//     drains the decoder's frame channel, and renders.
+//   • ActiveRenderer (Shm / Egl) dispatch unchanged.
+//   • Dispatch impls for our own protocol objects (WlShmPool + WlBuffer
+//     with SlotId user data; WlBuffer with () for the EGL path).
+//   • watch channels for size + close state; mpsc for input forwarding.
 
 use anyhow::{Context, Result};
 use std::sync::mpsc;
@@ -13,16 +24,34 @@ use std::thread;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
-use wayland_client::{
-    protocol::{
-        wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
-        wl_shm_pool, wl_surface,
+
+use smithay_client_toolkit::{
+    compositor::{CompositorHandler, CompositorState},
+    delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer,
+    delegate_registry, delegate_seat, delegate_shm, delegate_xdg_shell, delegate_xdg_window,
+    output::{OutputHandler, OutputState},
+    registry::{ProvidesRegistryState, RegistryState},
+    registry_handlers,
+    seat::{
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        Capability, SeatHandler, SeatState,
     },
-    Connection, Dispatch, Proxy, QueueHandle, WEnum,
+    shell::{
+        xdg::{
+            window::{Window, WindowConfigure, WindowDecorations, WindowHandler},
+            XdgShell,
+        },
+        WaylandSurface,
+    },
+    shm::{Shm, ShmHandler},
 };
-use wayland_protocols::xdg::shell::client::xdg_surface as xdg_surface_protocol;
-use wayland_protocols::xdg::shell::client::xdg_toplevel as xdg_toplevel_protocol;
-use wayland_protocols::xdg::shell::client::xdg_wm_base as xdg_wm_base_protocol;
+
+use wayland_client::{
+    globals::registry_queue_init,
+    protocol::{wl_buffer, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm_pool, wl_surface},
+    Connection, Dispatch, Proxy, QueueHandle,
+};
 
 use crate::decode::sw::DecodedFrame;
 use crate::input::keymap::evdev_to_code;
@@ -30,7 +59,9 @@ use crate::render::egl::EglRenderer;
 use crate::render::shm::{ShmRenderer, SlotId};
 use crate::types::{KeyboardEvent, MouseEvent, PointerPoint, SignalingMessage};
 
-/// Which rendering backend to use.
+// ── Public types ──────────────────────────────────────────────────────────────
+
+/// Which rendering backend to use (passed from CLI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RendererKind {
     /// CPU blit into shared memory via wl_shm (default, no GPU required).
@@ -39,7 +70,63 @@ pub enum RendererKind {
     Egl,
 }
 
-/// Unified renderer handle: either SHM or EGL.
+/// Handle returned by [`spawn_display_thread`].
+pub struct DisplayHandle {
+    pub size_rx: watch::Receiver<(u32, u32)>,
+    pub close_rx: watch::Receiver<bool>,
+    #[allow(dead_code)]
+    pub render_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[allow(dead_code)]
+    pub release_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub input_rx: tokio::sync::mpsc::Receiver<SignalingMessage>,
+}
+
+/// Spawn the Wayland display thread.
+pub fn spawn_display_thread(
+    initial_size: (u32, u32),
+    frame_rx: mpsc::Receiver<DecodedFrame>,
+    renderer_kind: RendererKind,
+) -> Result<DisplayHandle> {
+    let (size_tx, size_rx) = watch::channel(initial_size);
+    let (close_tx, close_rx) = watch::channel(false);
+    let render_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let release_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<SignalingMessage>(64);
+
+    let counters = DisplayCounters {
+        render: render_counter.clone(),
+        release: release_counter.clone(),
+    };
+
+    thread::Builder::new()
+        .name("wws-display".into())
+        .spawn(move || {
+            if let Err(e) = run_display_loop(
+                initial_size,
+                size_tx,
+                close_tx,
+                frame_rx,
+                counters,
+                input_tx,
+                renderer_kind,
+            ) {
+                warn!("display thread exited: {e:#}");
+            }
+        })
+        .context("failed to spawn display thread")?;
+
+    Ok(DisplayHandle { size_rx, close_rx, render_counter, release_counter, input_rx })
+}
+
+// ── Private types ─────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct DisplayCounters {
+    render: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    release: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Unified renderer: either SHM or EGL.
 enum ActiveRenderer {
     Shm(ShmRenderer),
     Egl(EglRenderer),
@@ -71,8 +158,6 @@ impl ActiveRenderer {
         }
     }
 
-    /// Initial buffer commit so the compositor maps the surface before the
-    /// first decoded frame arrives.
     fn prime(&mut self) -> bool {
         match self {
             Self::Shm(r) => r.prime(),
@@ -86,7 +171,6 @@ impl ActiveRenderer {
         }
     }
 
-    /// Mark slot `idx` as released (SHM only; no-op for EGL).
     fn release_slot(&mut self, idx: SlotId) {
         if let Self::Shm(r) = self {
             r.release_slot(idx);
@@ -94,111 +178,7 @@ impl ActiveRenderer {
     }
 }
 
-/// Handle to the Wayland display thread. Returned by
-/// [`spawn_display_thread`]; the rest of the client reads window size and
-/// close state through the two `watch` receivers. The matching frame
-/// receiver (`frame_rx`) is the *second* tuple element of
-/// `spawn_display_thread` -- it's intentionally separate so the
-/// decoder thread (not the main loop) can own it.
-pub struct DisplayHandle {
-    /// Current window size in surface-local pixels, updated whenever
-    /// `xdg_toplevel::Configure` fires (or set to `initial_size` until the
-    /// first configure arrives).
-    pub size_rx: watch::Receiver<(u32, u32)>,
-    /// Flips to `true` when `xdg_toplevel::Close` fires. The display thread
-    /// then breaks out of its loop.
-    pub close_rx: watch::Receiver<bool>,
-    /// Counter of successful `ShmRenderer::render` calls (i.e. a
-    /// decoded frame was actually attached + committed to the
-    /// surface). Smoke tests use this to assert "frames are
-    /// reaching the window" without driving the compositor directly.
-    /// Set up after `spawn_display_thread` returns, so read it
-    /// lazily in tests that need it.
-    #[allow(dead_code)] // read by integration tests, not by the main binary
-    pub render_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Counter of `wl_buffer::Release` events dispatched (i.e. the
-    /// compositor told us a buffer is free to reuse). Should be
-    /// `>= render_counter - 1` after steady state: every render
-    /// after the first produces a Release for the previous buffer.
-    /// If `release_count` is much lower, the renderer is starved
-    /// of free slots and `pick_next_released` keeps returning None.
-    #[allow(dead_code)] // read by integration tests, not by the main binary
-    pub release_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Input events (pointer, keyboard) translated to SignalingMessage and
-    /// ready to forward to the server. Phase 7.
-    pub input_rx: tokio::sync::mpsc::Receiver<SignalingMessage>,
-}
-
-/// Spawn the Wayland display thread. `frame_rx` is consumed by the
-/// display thread (it's the source of decoded H.264 frames).
-/// `DisplayHandle` is returned for `main` to read window size + close
-/// state. The thread:
-///   1. Connects to `$WAYLAND_DISPLAY`, binds the globals we need
-///      (`wl_compositor`, `xdg_wm_base`, `wl_shm`).
-///   2. Creates a `wl_surface` + `xdg_toplevel` titled "waylandwebstream".
-///   3. Constructs a `ShmRenderer` (two wl_shm buffers) and commits
-///      an initial buffer so the compositor maps the surface even
-///      before the first decoded frame arrives.
-///   4. Runs forever: polls `frame_rx` for decoded frames, polls
-///      Wayland events, exits on `xdg_toplevel::Close`.
-pub fn spawn_display_thread(
-    initial_size: (u32, u32),
-    frame_rx: mpsc::Receiver<DecodedFrame>,
-    renderer_kind: RendererKind,
-) -> Result<DisplayHandle> {
-    let (size_tx, size_rx) = watch::channel(initial_size);
-    let (close_tx, close_rx) = watch::channel(false);
-    // Shared with the renderer so observers (smoke tests, the main
-    // loop's debug log) can read "frames attached to the surface"
-    // without borrowing the renderer directly. See
-    // `DisplayHandle::render_counter`.
-    let render_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let release_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-    // Input events from the Wayland event loop (pointer, keyboard) go
-    // here; the tokio recv task forwards them to the server. Capacity
-    // 64: typing a burst of keys or a fast pointer drag should never
-    // fill it before the send loop drains it.
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<SignalingMessage>(64);
-
-    let counters = DisplayCounters {
-        render: render_counter.clone(),
-        release: release_counter.clone(),
-    };
-    thread::Builder::new()
-        .name("wws-display".into())
-        .spawn(move || {
-            if let Err(e) = run_display_loop(
-                initial_size,
-                size_tx,
-                close_tx,
-                frame_rx,
-                counters,
-                input_tx,
-                renderer_kind,
-            ) {
-                warn!("display thread exited: {e:#}");
-            }
-        })
-        .context("failed to spawn display thread")?;
-
-    Ok(DisplayHandle {
-        size_rx,
-        close_rx,
-        render_counter,
-        release_counter,
-        input_rx,
-    })
-}
-
-/// Counters shared between the display thread (writer) and the
-/// outside world (reader). Bundled so we can pass them to
-/// `run_display_loop` in one move instead of two.
-#[derive(Clone)]
-struct DisplayCounters {
-    render: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    release: std::sync::Arc<std::sync::atomic::AtomicU64>,
-}
+// ── Display loop ──────────────────────────────────────────────────────────────
 
 fn run_display_loop(
     initial_size: (u32, u32),
@@ -211,122 +191,126 @@ fn run_display_loop(
 ) -> Result<()> {
     let conn = Connection::connect_to_env()
         .context("could not connect to Wayland compositor (is $WAYLAND_DISPLAY set?)")?;
-    // Raw wl_display* needed by EGL (only accessible with the system backend).
+
+    // Raw wl_display* pointer for EGL initialisation (system backend).
     let wl_display_ptr = conn.backend().display_ptr() as *mut std::ffi::c_void;
-    let display = conn.display();
-    let mut event_queue = conn.new_event_queue();
+
+    // Enumerate globals and create the event queue in one shot.
+    let (globals, mut event_queue) = registry_queue_init(&conn).context("registry_queue_init")?;
     let qh = event_queue.handle();
 
-    let mut state = DisplayState::new(initial_size, size_tx, close_tx.clone(), counters.clone(), input_tx);
+    // Bind SCTK-managed globals.
+    let compositor_state =
+        CompositorState::bind(&globals, &qh).context("wl_compositor not available")?;
+    let xdg_shell_state =
+        XdgShell::bind(&globals, &qh).context("xdg_wm_base not available")?;
+    let shm_state = Shm::bind(&globals, &qh).context("wl_shm not available")?;
 
-    // First roundtrip: bind wl_compositor, xdg_wm_base, wl_seat, wl_shm.
-    display.get_registry(&qh, ());
-    event_queue
-        .roundtrip(&mut state)
-        .context("initial Wayland roundtrip")?;
+    // Surface + window (no buffer yet; initial empty commit triggers configure).
+    let surface = compositor_state.create_surface(&qh);
+    let window =
+        xdg_shell_state.create_window(surface, WindowDecorations::RequestServer, &qh);
+    window.set_title("waylandwebstream");
+    window.set_app_id("rs.waylandwebstream.client");
+    window.set_min_size(Some((16, 16)));
+    window.commit();
 
-    let compositor = state
-        .compositor
-        .take()
-        .context("wl_compositor global missing")?;
-    let wm_base = state
-        .wm_base
-        .take()
-        .context("xdg_wm_base global missing")?;
-    if state.seat.is_none() {
-        warn!("wl_seat global missing -- input forwarding will not work");
+    let mut state = DisplayState {
+        registry_state: RegistryState::new(&globals),
+        seat_state: SeatState::new(&globals, &qh),
+        output_state: OutputState::new(&globals, &qh),
+        compositor_state,
+        xdg_shell_state,
+        shm_state,
+        window,
+        keyboard: None,
+        pointer: None,
+        pointer_pos: (0.5, 0.5),
+        initial_size,
+        width: initial_size.0,
+        height: initial_size.1,
+        configured: false,
+        size_tx,
+        close_tx,
+        input_tx,
+        counters,
+        renderer: None,
+        pending_resize: None,
+        last_render: None,
+    };
+
+    // First roundtrip: compositor delivers the initial Configure + seat capabilities.
+    event_queue.roundtrip(&mut state).context("initial roundtrip")?;
+
+    if !state.configured {
+        warn!("no initial configure; using {initial_size:?}");
     }
 
-    let surface = compositor.create_surface(&qh, ());
-    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
-    let toplevel = xdg_surface.get_toplevel(&qh, ());
-    toplevel.set_title("waylandwebstream".to_string());
-    toplevel.set_app_id("wws-client".to_string());
-
-    // Store the surface in state so the xdg_surface::Configure handler
-    // can commit after ack_configure (required by the xdg-shell spec).
-    state.surface = Some(surface.clone());
-
-    // Initial commit to trigger the first Configure. xdg_surface::Configure
-    // arrives in the next roundtrip; until then the compositor hasn't
-    // allocated us a size, so we keep `state.width/height` at initial.
-    surface.commit();
-    event_queue
-        .roundtrip(&mut state)
-        .context("configure roundtrip")?;
+    // Build renderer from the configured size.
+    let wl_shm = state.shm_state.wl_shm().clone();
+    let wl_surface = state.window.wl_surface().clone();
 
     let mut renderer = match renderer_kind {
         RendererKind::Shm => {
-            let shm = state.shm.take().context("wl_shm global missing -- cannot render")?;
             let r = ShmRenderer::new(
-                shm,
-                surface.clone(),
+                wl_shm,
+                wl_surface,
                 &qh,
                 state.width,
                 state.height,
-                counters.render.clone(),
+                state.counters.render.clone(),
             )
             .context("create SHM renderer")?;
             ActiveRenderer::Shm(r)
         }
         RendererKind::Egl => {
+            let surface_id = state.window.wl_surface().id();
             let r = EglRenderer::new(
                 wl_display_ptr,
-                surface.id(),
+                surface_id,
                 state.width,
                 state.height,
-                counters.render.clone(),
+                state.counters.render.clone(),
             )
             .context("create EGL renderer")?;
             ActiveRenderer::Egl(r)
         }
     };
+
     info!(
-        "window created: {}x{} (renderer={:?})",
+        "window ready: {}x{} renderer={:?}",
         state.width, state.height, renderer_kind
     );
+
+    // Initial commit — makes the compositor map the window before the first frame.
     if !renderer.prime() {
-        warn!("renderer: no free slot for initial commit");
+        warn!("renderer: prime failed");
     }
     state.renderer = Some(renderer);
 
+    // ── Main event loop ─────────────────────────────────────────────────────
+    // Non-blocking: read Wayland socket, dispatch pending events, drain the
+    // decoded-frame channel, render, sleep 1 ms.  No calloop overhead.
     loop {
-        if *close_tx.borrow() {
-            info!("window closed by compositor");
+        if *state.close_tx.borrow() {
+            info!("window closed");
             break;
         }
-        // Verbose loop logging (debug level) so a stuck loop is
-        // visible in --nocapture output. Disabled by default to
-        // avoid log spam in production.
+
         tracing::trace!(
-            "display tick: slot_state={}",
-            state
-                .renderer
-                .as_ref()
-                .map(|r| r.slot_state())
-                .unwrap_or_else(|| "<no renderer>".into()),
+            "tick: slot_state={}",
+            state.renderer.as_ref().map(|r| r.slot_state()).unwrap_or_default()
         );
 
-        // Read and dispatch Wayland events FIRST so wl_buffer::Release
-        // events are processed before try_drain tries to pick a slot.
-        // With only 2 SHM slots and a 60 Hz compositor (Release latency
-        // ~16-32 ms vs. 33 ms frame interval), the Release for the just-
-        // displayed slot can arrive in the same 1 ms tick as the next
-        // decoded frame. If we rendered first, both slots would still
-        // appear held and the frame would be dropped needlessly.
+        // Non-blocking socket read then dispatch.
         if let Some(guard) = event_queue.prepare_read() {
-            let _ = guard.read(); // non-blocking: returns Ok(0) if no data
+            let _ = guard.read();
         }
-        let _ = event_queue.dispatch_pending(&mut state);
+        event_queue.dispatch_pending(&mut state).context("dispatch_pending")?;
         event_queue.flush().ok();
 
-        let frames_drained = match state
-            .renderer
-            .as_mut()
-            .unwrap()
-            .try_drain(&qh, &frame_rx)
-        {
-            Ok(0) => 0usize,
+        // Render the latest decoded frame (drops older ones).
+        let frames_drained = match state.renderer.as_mut().unwrap().try_drain(&qh, &frame_rx) {
             Ok(n) => n,
             Err(e) => {
                 warn!("renderer error: {e:#}");
@@ -337,118 +321,77 @@ fn run_display_loop(
             state.last_render = Some(std::time::Instant::now());
         }
 
+        // Apply any resize that arrived in this tick's configure event.
         if let Some((w, h)) = state.pending_resize.take() {
-            debug!("applying pending resize to {w}x{h}");
+            debug!("resize → {w}x{h}");
             if let Some(r) = state.renderer.as_mut() {
                 r.resize(w, h);
             }
+            // Bare commit acknowledges the configure; the next rendered frame
+            // carries the new-size buffer.
+            state.window.wl_surface().commit();
+            event_queue.flush().ok();
         }
 
-        // Periodically warn if no frames have been rendered for >2s.
         if let Some(last) = state.last_render {
-            let elapsed = last.elapsed();
-            if elapsed > std::time::Duration::from_secs(2) {
-                tracing::warn!(
-                    "no frame rendered in {:.1}s; is the server's compositor idle? \
-                     (attach a Wayland client -- e.g. wayland-test-client -- to \
-                     WAYLAND_DISPLAY={} to generate frames)",
-                    elapsed.as_secs_f32(),
-                    std::env::var("WAYLAND_DISPLAY").unwrap_or_default(),
+            if last.elapsed() > Duration::from_secs(2) {
+                warn!(
+                    "no frame rendered in {:.1}s — is the server compositor producing frames?",
+                    last.elapsed().as_secs_f32()
                 );
                 state.last_render = Some(std::time::Instant::now());
             }
         }
 
-        // Brief sleep so we don't spin at 100% CPU.
         std::thread::sleep(Duration::from_millis(1));
-        // Flush the commit from try_drain's render() call.
         event_queue.flush().ok();
     }
 
     Ok(())
 }
 
+// ── State struct ──────────────────────────────────────────────────────────────
+
 struct DisplayState {
+    // SCTK protocol state (these own the underlying wayland objects).
+    registry_state: RegistryState,
+    seat_state: SeatState,
+    output_state: OutputState,
+    // Kept alive so the WlCompositor / XdgWmBase proxies aren't destroyed;
+    // SCTK's dispatch impls receive them via the proxy argument, not field access.
+    #[allow(dead_code)]
+    compositor_state: CompositorState,
+    #[allow(dead_code)]
+    xdg_shell_state: XdgShell,
+    shm_state: Shm,
+
+    // Top-level window (owns xdg_surface + xdg_toplevel + optional decoration).
+    window: Window,
+
+    // Input devices — present once the seat advertises the capability.
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
+    /// Last pointer position in 0..1 surface-local coordinates.
+    pointer_pos: (f64, f64),
+
     initial_size: (u32, u32),
     width: u32,
     height: u32,
+    /// Set on first WindowHandler::configure; used to gate renderer creation.
+    configured: bool,
+
     size_tx: watch::Sender<(u32, u32)>,
     close_tx: watch::Sender<bool>,
-
-    compositor: Option<wl_compositor::WlCompositor>,
-    wm_base: Option<xdg_wm_base_protocol::XdgWmBase>,
-    shm: Option<wl_shm::WlShm>,
-    seat: Option<wl_seat::WlSeat>,
-
-    /// Active wl_pointer object; present once the seat advertises
-    /// Capability::Pointer and we call seat.get_pointer().
-    pointer: Option<wl_pointer::WlPointer>,
-    /// Active wl_keyboard object; present once the seat advertises
-    /// Capability::Keyboard and we call seat.get_keyboard().
-    keyboard: Option<wl_keyboard::WlKeyboard>,
-
-    /// Last pointer position (normalized 0..1 in surface coordinates).
-    /// Updated on Enter and Motion events.
-    pointer_x: f64,
-    pointer_y: f64,
-
-    /// The wl_surface for the main window. Set before the configure
-    /// roundtrip so the xdg_surface::Configure handler can call
-    /// `surface.commit()` after `ack_configure` — the spec requires a
-    /// commit to apply each configure.
-    surface: Option<wl_surface::WlSurface>,
+    input_tx: tokio::sync::mpsc::Sender<SignalingMessage>,
+    counters: DisplayCounters,
 
     renderer: Option<ActiveRenderer>,
-    /// Resize requests from xdg_toplevel::Configure are applied on the
-    /// next loop tick (after any in-flight render) so we never resize
-    /// mid-blit. Stored here, drained at the top of each tick.
+    /// Pending resize from the most recent configure; applied on the next tick.
     pending_resize: Option<(u32, u32)>,
-    /// Wall-clock time of the last successful render. Used by the
-    /// "no frame in N seconds" warning below to distinguish a stuck
-    /// renderer from a silent upstream.
     last_render: Option<std::time::Instant>,
-    /// Counters shared with `DisplayHandle` for observability (smoke
-    /// tests, future metrics). Cloned from the Arc the caller sees.
-    counters: DisplayCounters,
-    /// Sends translated input events to the tokio send loop.
-    input_tx: tokio::sync::mpsc::Sender<SignalingMessage>,
 }
 
 impl DisplayState {
-    fn new(
-        initial_size: (u32, u32),
-        size_tx: watch::Sender<(u32, u32)>,
-        close_tx: watch::Sender<bool>,
-        counters: DisplayCounters,
-        input_tx: tokio::sync::mpsc::Sender<SignalingMessage>,
-    ) -> Self {
-        Self {
-            initial_size,
-            width: initial_size.0,
-            height: initial_size.1,
-            size_tx,
-            close_tx,
-            compositor: None,
-            wm_base: None,
-            shm: None,
-            seat: None,
-            pointer: None,
-            keyboard: None,
-            pointer_x: 0.5,
-            pointer_y: 0.5,
-            surface: None,
-            renderer: None,
-            pending_resize: None,
-            last_render: None,
-            counters,
-            input_tx,
-        }
-    }
-
-    /// Send an input event to the tokio send loop. Uses `try_send`
-    /// to avoid blocking the Wayland event loop thread; drops silently
-    /// if the channel is full (64 slots, very unlikely during normal
-    /// pointer/keyboard use).
     fn send_input(&self, msg: SignalingMessage) {
         if self.input_tx.try_send(msg).is_err() {
             debug!("input channel full; dropping event");
@@ -456,322 +399,316 @@ impl DisplayState {
     }
 }
 
-// --- Wayland Dispatch impls ---------------------------------------------
+// ── SCTK handler implementations ──────────────────────────────────────────────
 
-/// Bind required globals on registry advertisements. Version is pinned to
-/// the highest version the compositor advertises (wayland-client does that
-/// automatically via the `bind::<Interface, _, _>(name, version, ...)`
-/// call when we pass the advertised `version`).
-impl Dispatch<wl_registry::WlRegistry, ()> for DisplayState {
-    fn event(
-        state: &mut Self,
-        registry: &wl_registry::WlRegistry,
-        event: wl_registry::Event,
-        _: &(),
+impl CompositorHandler for DisplayState {
+    fn scale_factor_changed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        new_factor: i32,
+    ) {
+        debug!("scale factor → {new_factor}");
+        // TODO: forward to server for HiDPI cursor / content scaling
+    }
+
+    fn transform_changed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _new_transform: wl_output::Transform,
+    ) {
+    }
+
+    fn frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _time: u32,
+    ) {
+        // We poll every 1 ms rather than using frame callbacks; no-op here.
+    }
+}
+
+impl OutputHandler for DisplayState {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output_state
+    }
+
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn output_destroyed(
+        &mut self,
         _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_output::WlOutput,
+    ) {
+    }
+}
+
+impl WindowHandler for DisplayState {
+    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &Window) {
+        info!("xdg_toplevel::Close");
+        let _ = self.close_tx.send(true);
+    }
+
+    fn configure(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _window: &Window,
+        configure: WindowConfigure,
+        _serial: u32,
+    ) {
+        // SCTK has already sent ack_configure before calling us.
+        let w = configure.new_size.0.map(|v| v.get()).unwrap_or(self.initial_size.0);
+        let h = configure.new_size.1.map(|v| v.get()).unwrap_or(self.initial_size.1);
+
+        if !self.configured {
+            self.width = w;
+            self.height = h;
+            self.configured = true;
+            debug!("initial configure: {w}x{h} decoration={:?}", configure.decoration_mode);
+        } else if (w, h) != (self.width, self.height) {
+            debug!("resize configure: {}x{} → {w}x{h}", self.width, self.height);
+            self.width = w;
+            self.height = h;
+            let _ = self.size_tx.send((w, h));
+            self.pending_resize = Some((w, h));
+        }
+    }
+}
+
+impl SeatHandler for DisplayState {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
         qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
     ) {
-        if let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-            ..
-        } = event
-        {
-            debug!("registry global: {interface} v{version}");
-            match interface.as_str() {
-                "wl_compositor" => {
-                    state.compositor = Some(
-                        registry.bind::<wl_compositor::WlCompositor, _, _>(name, version, qh, ()),
-                    );
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            match self.seat_state.get_keyboard(qh, &seat, None) {
+                Ok(kb) => {
+                    debug!("keyboard ready");
+                    self.keyboard = Some(kb);
                 }
-                "xdg_wm_base" => {
-                    state.wm_base = Some(
-                        registry.bind::<xdg_wm_base_protocol::XdgWmBase, _, _>(
-                            name, version, qh, (),
-                        ),
-                    );
+                Err(e) => warn!("get_keyboard: {e}"),
+            }
+        }
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            match self.seat_state.get_pointer(qh, &seat) {
+                Ok(ptr) => {
+                    debug!("pointer ready");
+                    self.pointer = Some(ptr);
                 }
-                "wl_seat" => {
-                    state.seat =
-                        Some(registry.bind::<wl_seat::WlSeat, _, _>(name, version, qh, ()));
-                }
-                "wl_shm" => {
-                    state.shm =
-                        Some(registry.bind::<wl_shm::WlShm, _, _>(name, version, qh, ()));
-                }
-                _ => {} // We don't need any of the others (yet).
+                Err(e) => warn!("get_pointer: {e}"),
             }
         }
     }
-}
 
-impl Dispatch<wl_compositor::WlCompositor, ()> for DisplayState {
-    fn event(
-        _: &mut Self,
-        _: &wl_compositor::WlCompositor,
-        _: wl_compositor::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
+    fn remove_capability(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _seat: wl_seat::WlSeat,
+        capability: Capability,
     ) {
-        // wl_compositor has no events.
-    }
-}
-
-impl Dispatch<xdg_wm_base_protocol::XdgWmBase, ()> for DisplayState {
-    fn event(
-        _: &mut Self,
-        wm_base: &xdg_wm_base_protocol::XdgWmBase,
-        event: xdg_wm_base_protocol::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        // The xdg-shell spec requires us to respond to every ping
-        // with pong(serial). Compositors use this to detect clients
-        // that have stopped responding to events -- if we ignore
-        // pings, the WM flags our surface as "Not Responding" (and
-        // some compositors will eventually kill the connection,
-        // which is why the user reported "first and only picture
-        // appears" -- after the connection dies, blocking_dispatch
-        // wakes up on the disconnect and the display thread exits).
-        if let xdg_wm_base_protocol::Event::Ping { serial } = event {
-            wm_base.pong(serial);
+        if capability == Capability::Keyboard {
+            if let Some(kb) = self.keyboard.take() {
+                kb.release();
+            }
         }
-    }
-}
-
-impl Dispatch<xdg_surface_protocol::XdgSurface, ()> for DisplayState {
-    fn event(
-        state: &mut Self,
-        xdg_surface: &xdg_surface_protocol::XdgSurface,
-        event: xdg_surface_protocol::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let xdg_surface_protocol::Event::Configure { serial } = event {
-            debug!("xdg_surface::Configure serial={serial} -> ack_configure");
-            xdg_surface.ack_configure(serial);
-            // Commit so the compositor considers this configure applied.
-            if let Some(s) = &state.surface {
-                s.commit();
+        if capability == Capability::Pointer {
+            if let Some(ptr) = self.pointer.take() {
+                ptr.release();
             }
         }
     }
+
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 }
 
-impl Dispatch<xdg_toplevel_protocol::XdgToplevel, ()> for DisplayState {
-    fn event(
-        state: &mut Self,
-        _: &xdg_toplevel_protocol::XdgToplevel,
-        event: xdg_toplevel_protocol::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
+impl KeyboardHandler for DisplayState {
+    fn enter(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _surface: &wl_surface::WlSurface,
+        _serial: u32,
+        _raw: &[u32],
+        _keysyms: &[Keysym],
     ) {
-        match event {
-            xdg_toplevel_protocol::Event::Configure {
-                width,
-                height,
-                states,
-                ..
-            } => {
-                let w = if width == 0 {
-                    state.initial_size.0
-                } else {
-                    width.try_into().unwrap()
-                };
-                let h = if height == 0 {
-                    state.initial_size.1
-                } else {
-                    height.try_into().unwrap()
-                };
-                if (w, h) != (state.width, state.height) {
-                    debug!("xdg_toplevel configure: {w}x{h} states={states:?}");
-                    let _ = state.size_tx.send((w, h));
-                    state.pending_resize = Some((w, h));
-                }
-                state.width = w;
-                state.height = h;
-            }
-            xdg_toplevel_protocol::Event::Close => {
-                let _ = state.close_tx.send(true);
-            }
-            _ => {}
+    }
+
+    fn leave(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _surface: &wl_surface::WlSurface,
+        _serial: u32,
+    ) {
+    }
+
+    fn press_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        event: KeyEvent,
+    ) {
+        // raw_code is the wayland/evdev scancode — identical to what the old
+        // wl_keyboard::Event::Key { key } field carried, so evdev_to_code works as-is.
+        match evdev_to_code(event.raw_code) {
+            Some(code) => self.send_input(SignalingMessage::Key {
+                event: KeyboardEvent::Down { code: code.to_string() },
+            }),
+            None => debug!(
+                "unknown evdev scancode {} (keysym={:?})",
+                event.raw_code, event.keysym
+            ),
         }
+    }
+
+    fn release_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        event: KeyEvent,
+    ) {
+        if let Some(code) = evdev_to_code(event.raw_code) {
+            self.send_input(SignalingMessage::Key {
+                event: KeyboardEvent::Up { code: code.to_string() },
+            });
+        }
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        _modifiers: Modifiers,
+    ) {
+        // TODO: encode modifier state in SignalingMessage for Ctrl+C, etc.
     }
 }
 
-impl Dispatch<wl_seat::WlSeat, ()> for DisplayState {
-    fn event(
-        state: &mut Self,
-        seat: &wl_seat::WlSeat,
-        event: wl_seat::Event,
-        _: &(),
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-    ) {
-        if let wl_seat::Event::Capabilities { capabilities } = event {
-            let caps = match capabilities {
-                WEnum::Value(c) => c,
-                WEnum::Unknown(_) => return,
-            };
-            if caps.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
-                debug!("seat: pointer capability -> get_pointer");
-                state.pointer = Some(seat.get_pointer(qh, ()));
-            }
-            if caps.contains(wl_seat::Capability::Keyboard) && state.keyboard.is_none() {
-                debug!("seat: keyboard capability -> get_keyboard");
-                state.keyboard = Some(seat.get_keyboard(qh, ()));
-            }
-        }
-    }
-}
-
-impl Dispatch<wl_pointer::WlPointer, ()> for DisplayState {
-    fn event(
-        state: &mut Self,
+impl PointerHandler for DisplayState {
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
         pointer: &wl_pointer::WlPointer,
-        event: wl_pointer::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
+        events: &[PointerEvent],
     ) {
-        match event {
-            wl_pointer::Event::Enter {
-                serial,
-                surface_x,
-                surface_y,
-                ..
-            } => {
-                // Hide the native cursor so only the remote app's cursor shows.
-                pointer.set_cursor(serial, None, 0, 0);
-                state.pointer_x = surface_x / state.width as f64;
-                state.pointer_y = surface_y / state.height as f64;
+        let win_surface = self.window.wl_surface().clone();
+        let w = self.width as f64;
+        let h = self.height as f64;
+
+        for event in events {
+            if event.surface != win_surface {
+                continue;
             }
-            wl_pointer::Event::Motion {
-                surface_x,
-                surface_y,
-                ..
-            } => {
-                state.pointer_x = surface_x / state.width as f64;
-                state.pointer_y = surface_y / state.height as f64;
-                let x = state.pointer_x;
-                let y = state.pointer_y;
-                state.send_input(SignalingMessage::Pointer {
-                    event: MouseEvent::Move {
-                        pointer: PointerPoint {
+            match event.kind {
+                PointerEventKind::Enter { serial } => {
+                    // Hide the local OS cursor — the remote app's cursor is
+                    // composited into the video stream.
+                    pointer.set_cursor(serial, None, 0, 0);
+                    self.pointer_pos = norm(event.position, w, h);
+                }
+                PointerEventKind::Leave { .. } => {}
+                PointerEventKind::Motion { .. } => {
+                    self.pointer_pos = norm(event.position, w, h);
+                    let (x, y) = self.pointer_pos;
+                    self.send_input(SignalingMessage::Pointer {
+                        event: MouseEvent::Move {
+                            pointer: PointerPoint {
+                                x,
+                                y,
+                                button: 0,
+                                pointer_type: "mouse".into(),
+                                pressure: 0.0,
+                            },
+                        },
+                    });
+                }
+                PointerEventKind::Press { button, .. } => {
+                    let (x, y) = self.pointer_pos;
+                    self.send_input(SignalingMessage::Pointer {
+                        event: MouseEvent::Down {
+                            pointer: PointerPoint {
+                                x,
+                                y,
+                                button: linux_to_browser_button(button) as i32,
+                                pointer_type: "mouse".into(),
+                                pressure: 0.0,
+                            },
+                        },
+                    });
+                }
+                PointerEventKind::Release { button, .. } => {
+                    let (x, y) = self.pointer_pos;
+                    self.send_input(SignalingMessage::Pointer {
+                        event: MouseEvent::Up {
+                            pointer: PointerPoint {
+                                x,
+                                y,
+                                button: linux_to_browser_button(button) as i32,
+                                pointer_type: "mouse".into(),
+                                pressure: 0.0,
+                            },
+                        },
+                    });
+                }
+                PointerEventKind::Axis { horizontal, vertical, .. } => {
+                    let (x, y) = self.pointer_pos;
+                    self.send_input(SignalingMessage::Pointer {
+                        event: MouseEvent::Wheel {
                             x,
                             y,
-                            button: 0,
-                            pointer_type: "mouse".into(),
-                            pressure: 0.0,
+                            delta_x: horizontal.absolute,
+                            delta_y: vertical.absolute,
                         },
-                    },
-                });
+                    });
+                }
             }
-            wl_pointer::Event::Button {
-                button,
-                state: btn_state,
-                ..
-            } => {
-                // Linux button codes → browser button index
-                let browser_button = match button {
-                    0x110 => 0, // BTN_LEFT
-                    0x111 => 2, // BTN_RIGHT
-                    0x112 => 1, // BTN_MIDDLE
-                    _ => 0,
-                };
-                let x = state.pointer_x;
-                let y = state.pointer_y;
-                let pp = PointerPoint {
-                    x,
-                    y,
-                    button: browser_button,
-                    pointer_type: "mouse".into(),
-                    pressure: 0.0,
-                };
-                let mouse_event = match btn_state {
-                    WEnum::Value(wl_pointer::ButtonState::Pressed) => {
-                        MouseEvent::Down { pointer: pp }
-                    }
-                    WEnum::Value(wl_pointer::ButtonState::Released) => {
-                        MouseEvent::Up { pointer: pp }
-                    }
-                    _ => return,
-                };
-                state.send_input(SignalingMessage::Pointer { event: mouse_event });
-            }
-            wl_pointer::Event::Axis { axis, value, .. } => {
-                let (delta_x, delta_y) = match axis {
-                    WEnum::Value(wl_pointer::Axis::VerticalScroll) => (0.0, value),
-                    WEnum::Value(wl_pointer::Axis::HorizontalScroll) => (value, 0.0),
-                    _ => return,
-                };
-                let x = state.pointer_x;
-                let y = state.pointer_y;
-                state.send_input(SignalingMessage::Pointer {
-                    event: MouseEvent::Wheel {
-                        x,
-                        y,
-                        delta_x,
-                        delta_y,
-                    },
-                });
-            }
-            _ => {} // Leave, Frame, AxisSource, AxisStop, AxisDiscrete, etc.
         }
     }
 }
 
-impl Dispatch<wl_keyboard::WlKeyboard, ()> for DisplayState {
-    fn event(
-        state: &mut Self,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        event: wl_keyboard::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let wl_keyboard::Event::Key { key, state: key_state, .. } = event {
-            let code = match evdev_to_code(key) {
-                Some(c) => c,
-                None => {
-                    debug!("unknown evdev keycode {key}; skipping");
-                    return;
-                }
-            };
-            let kb_event = match key_state {
-                WEnum::Value(wl_keyboard::KeyState::Pressed) => {
-                    KeyboardEvent::Down { code: code.to_string() }
-                }
-                WEnum::Value(wl_keyboard::KeyState::Released) => {
-                    KeyboardEvent::Up { code: code.to_string() }
-                }
-                _ => return,
-            };
-            state.send_input(SignalingMessage::Key { event: kb_event });
-        }
-        // Keymap, Enter, Leave, Modifiers, RepeatInfo: no-ops.
-        // We use a static reverse table (input/keymap.rs), not xkbcommon.
+impl ShmHandler for DisplayState {
+    fn shm_state(&mut self) -> &mut Shm {
+        &mut self.shm_state
     }
 }
 
-impl Dispatch<wl_shm::WlShm, ()> for DisplayState {
-    fn event(
-        _: &mut Self,
-        _: &wl_shm::WlShm,
-        _: wl_shm::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        // Format advertisements; we use Argb8888 unconditionally.
+impl ProvidesRegistryState for DisplayState {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
     }
+    registry_handlers![OutputState, SeatState];
 }
 
+// ── Dispatch for our own protocol objects ─────────────────────────────────────
+
+// wl_shm_pool with SlotId user data — created by ShmRenderer.
+// SCTK's delegate_shm! only dispatches WlShm; WlShmPool is ours.
 impl Dispatch<wl_shm_pool::WlShmPool, SlotId> for DisplayState {
     fn event(
         _: &mut Self,
@@ -785,8 +722,28 @@ impl Dispatch<wl_shm_pool::WlShmPool, SlotId> for DisplayState {
     }
 }
 
-// No-op: keeps the event loop from panicking if a placeholder buffer
-// gets a Release (e.g. from a stale startup buffer).
+// wl_buffer with SlotId — ShmRenderer's double-buffered slots.
+// Release marks the slot free so the renderer can reuse it.
+impl Dispatch<wl_buffer::WlBuffer, SlotId> for DisplayState {
+    fn event(
+        state: &mut Self,
+        _: &wl_buffer::WlBuffer,
+        event: wl_buffer::Event,
+        slot_id: &SlotId,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_buffer::Event::Release = event {
+            state.counters.release.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            debug!("wl_buffer::Release slot={slot_id}");
+            if let Some(r) = state.renderer.as_mut() {
+                r.release_slot(*slot_id);
+            }
+        }
+    }
+}
+
+// wl_buffer with () — safety net for any anonymous buffers (EGL path).
 impl Dispatch<wl_buffer::WlBuffer, ()> for DisplayState {
     fn event(
         _: &mut Self,
@@ -799,36 +756,33 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for DisplayState {
     }
 }
 
-impl Dispatch<wl_buffer::WlBuffer, SlotId> for DisplayState {
-    fn event(
-        state: &mut Self,
-        _: &wl_buffer::WlBuffer,
-        event: wl_buffer::Event,
-        slot_id: &SlotId,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let wl_buffer::Event::Release = event {
-            state.counters.release.fetch_add(
-                1,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            tracing::debug!("wl_buffer::Release for slot={slot_id}");
-            if let Some(renderer) = state.renderer.as_mut() {
-                renderer.release_slot(*slot_id);
-            }
-        }
-    }
+// ── Delegate macros ───────────────────────────────────────────────────────────
+
+delegate_compositor!(DisplayState);
+delegate_output!(DisplayState);
+delegate_shm!(DisplayState);
+delegate_seat!(DisplayState);
+delegate_keyboard!(DisplayState);
+delegate_pointer!(DisplayState);
+delegate_xdg_shell!(DisplayState);
+delegate_xdg_window!(DisplayState);
+delegate_registry!(DisplayState);
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Normalise surface-local pixel position to 0..1.
+#[inline]
+fn norm(pos: (f64, f64), w: f64, h: f64) -> (f64, f64) {
+    (pos.0 / w, pos.1 / h)
 }
 
-impl Dispatch<wl_surface::WlSurface, ()> for DisplayState {
-    fn event(
-        _: &mut Self,
-        _: &wl_surface::WlSurface,
-        _: wl_surface::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
+/// Map a Linux BTN_* evdev code to a browser button index.
+#[inline]
+fn linux_to_browser_button(button: u32) -> u32 {
+    match button {
+        0x110 => 0, // BTN_LEFT   → primary
+        0x111 => 2, // BTN_RIGHT  → secondary
+        0x112 => 1, // BTN_MIDDLE → auxiliary
+        _ => 0,
     }
 }

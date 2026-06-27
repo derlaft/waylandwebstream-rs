@@ -60,3 +60,9 @@ pipewire = "0.10"
 # EGL renderer (Phase 9). wayland-egl 0.32 is the companion crate to
 # wayland-client 0.31 (same smithay release train).
 wayland-egl = "0.32"
+
+# High-level Wayland client toolkit: window decorations, xkbcommon keyboard,
+# pointer/cursor themes, output tracking, fractional scaling.
+# `default-features = false` drops the calloop event-loop integration we
+# don't need (we run our own tight-poll loop on the display thread).
+smithay-client-toolkit = { version = "0.18", default-features = false, features = ["xkbcommon"] }
