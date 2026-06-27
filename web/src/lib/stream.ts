@@ -4,6 +4,7 @@
 // them onto the supplied canvas. Keeping the decoder logic here, separate
 // from the socket owner, mirrors how the Rust server splits the encoder
 // thread off from the broadcast stream.
+import { createVideoRenderer, type VideoRenderer } from './glRenderer';
 import {
   DECODER_CONFIG,
   type ClientMessage,
@@ -56,7 +57,7 @@ export interface VideoStreamOptions {
 
 export class VideoStream {
   private readonly canvas: HTMLCanvasElement;
-  private readonly ctx: CanvasRenderingContext2D;
+  private readonly renderer: VideoRenderer;
   private readonly sendControl: (msg: ClientMessage) => void;
 
   private decoder: VideoDecoder | null = null;
@@ -102,11 +103,7 @@ export class VideoStream {
 
   constructor(opts: VideoStreamOptions) {
     this.canvas = opts.canvas;
-    const ctx = this.canvas.getContext('2d');
-    if (!ctx) {
-      throw new Error('2D canvas context unavailable');
-    }
-    this.ctx = ctx;
+    this.renderer = createVideoRenderer(this.canvas);
     this.sendControl = opts.sendControl;
   }
 
@@ -187,14 +184,15 @@ export class VideoStream {
     if (ensureCanvasSize(this.canvas, frame.displayWidth, frame.displayHeight)) {
       setResolution(frame.displayWidth, frame.displayHeight);
     }
-    // Stamp before drawImage so decode latency excludes the blit. `timestamp`
-    // is the performance.now()*1000 set on the chunk in `handleVideoFrame`.
+    // Stamp before the blit so decode latency excludes it. `timestamp` is the
+    // performance.now()*1000 set on the chunk in `handleVideoFrame`.
     const decodeDoneMs = performance.now();
     this.decodeLatencySamples.push(decodeDoneMs - frame.timestamp / 1000);
-    this.ctx.drawImage(frame, 0, 0);
-    // On Firefox, VideoFrame→2D-canvas involves a synchronous GPU→CPU→GPU
-    // readback; a large value here means the blit is the bottleneck, not the
-    // decoder.
+    this.renderer.draw(frame);
+    // With the WebGL backend this is just the texture upload + draw-call
+    // submission (the GPU work is async), so it should stay near zero. A
+    // large value means the 2D fallback is active and its VideoFrame→canvas
+    // readback is the bottleneck, not the decoder.
     this.blitLatencySamples.push(performance.now() - decodeDoneMs);
     frame.close();
   }
