@@ -146,7 +146,7 @@ on the next `cargo build`/`cargo run`.
 ## Usage
 
 ```sh
-# Start the server (defaults: 1280x720 @ 60fps, listening on 0.0.0.0:8080)
+# Start the server (defaults: 1280x720 @ 60fps, listening on 127.0.0.1:8080)
 ./waylandwebstream
 
 # Common options (run with --help for the full list):
@@ -156,10 +156,12 @@ on the next `cargo build`/`cargo run`.
 #   --bitrate 2000000               starting bitrate (adaptive by default)
 #   --crf 23                        constant-quality mode instead of a bitrate
 #   --port 8080                     HTTP/WebSocket port
-#   --listen-addr 0.0.0.0           bind address (127.0.0.1 for proxy-only)
+#   --listen-addr 127.0.0.1         bind address (widen only behind a proxy)
 ```
 
-Then open `http://<server-ip>:8080` in a browser.
+Then open `http://localhost:8080` in a browser. The server binds loopback only
+by default; to reach it from another machine, put an authenticating reverse
+proxy in front and widen `--listen-addr` (see Deployment Notes).
 
 ### Sessions
 
@@ -197,9 +199,14 @@ clipboard permission.
 
 - The server just needs its HTTP port reachable from the client -- ordinary
   WebSocket traffic over TCP, no NAT traversal required.
-- Authentication and TLS/`wss://` are out of scope by design: put it behind a
-  reverse proxy (nginx, Caddy, etc.) the same way you would any other web
-  service, and use `--listen-addr 127.0.0.1` so only the proxy can reach it.
+- **The server has no authentication of its own, and a reachable port grants
+  full keyboard, pointer, touch, and clipboard injection into the session.** It
+  therefore binds loopback (`127.0.0.1`) by default. Authentication and
+  TLS/`wss://` are out of scope by design: put it behind a reverse proxy
+  (nginx, Caddy, etc.) that adds them, the same way you would any other web
+  service, and keep `--listen-addr 127.0.0.1` so only the proxy can reach it.
+  Only widen the bind address once such a proxy is in place -- the server logs
+  a warning at startup whenever it binds to a non-loopback address.
 
 ## Testing
 

@@ -37,11 +37,12 @@ pub struct Config {
     #[arg(long, default_value = "8080")]
     pub port: u16,
 
-    /// Address the HTTP signaling server binds to. Defaults to all
-    /// interfaces; set to 127.0.0.1 to only accept connections from a local
-    /// reverse proxy (e.g. one that adds authentication) instead of exposing
-    /// the server directly.
-    #[arg(long, default_value = "0.0.0.0")]
+    /// Address the HTTP signaling server binds to. Defaults to loopback only
+    /// (127.0.0.1) because the server has no authentication of its own and a
+    /// reachable port grants full keyboard/pointer/touch/clipboard injection
+    /// into the session. Put an authenticating reverse proxy in front and only
+    /// then widen this (e.g. 0.0.0.0) to expose it beyond localhost.
+    #[arg(long, default_value = "127.0.0.1")]
     pub listen_addr: String,
 
     /// Target framerate
@@ -142,6 +143,22 @@ impl Config {
     }
 }
 
+/// Sanitizes a client-requested output resolution before it drives encoder and
+/// framebuffer allocation. Clamps each axis to `max` (the server is the
+/// authority — the request arrives over the untrusted `/client` socket), rounds
+/// down to even dimensions (YUV 4:2:0 requires them; ÷16 macroblock alignment
+/// is not needed, x264 pads internally and signals the crop in the SPS), and
+/// rejects anything below the 16×16 minimum. Returns `None` for a request that
+/// is too small to use.
+pub fn sanitize_resolution(req: (u32, u32), max: (u32, u32)) -> Option<(u32, u32)> {
+    let width = req.0.min(max.0) & !1u32;
+    let height = req.1.min(max.1) & !1u32;
+    if width < 16 || height < 16 {
+        return None;
+    }
+    Some((width, height))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +168,19 @@ mod tests {
         let config = Config::parse_from(["waylandwebstream", "--port", "9999"]);
         assert!(config.command.is_empty());
         assert_eq!(config.port, 9999);
+    }
+
+    #[test]
+    fn sanitize_resolution_clamps_to_max_and_rounds_even() {
+        // Oversized request is clamped to max; odd max rounds down to even.
+        assert_eq!(sanitize_resolution((9999, 9999), (1920, 1080)), Some((1920, 1080)));
+        assert_eq!(sanitize_resolution((3841, 2161), (3840, 2160)), Some((3840, 2160)));
+        // Within bounds but odd → rounded down.
+        assert_eq!(sanitize_resolution((1281, 721), (3840, 2160)), Some((1280, 720)));
+        // Below the 16×16 floor → rejected.
+        assert_eq!(sanitize_resolution((8, 8), (3840, 2160)), None);
+        // A tiny max can itself force the result below the floor → rejected.
+        assert_eq!(sanitize_resolution((100, 100), (10, 10)), None);
     }
 
     #[test]

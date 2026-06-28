@@ -12,7 +12,7 @@ use smithay::{
     },
     delegate_compositor, delegate_cursor_shape, delegate_dmabuf,
     delegate_keyboard_shortcuts_inhibit, delegate_output,
-    delegate_pointer_constraints, delegate_presentation, delegate_seat, delegate_shm,
+    delegate_pointer_constraints, delegate_seat, delegate_shm,
     delegate_single_pixel_buffer, delegate_viewporter, delegate_xdg_shell,
     delegate_xdg_toplevel_icon,
     desktop::{Space, Window},
@@ -48,7 +48,6 @@ use smithay::{
         viewporter::ViewporterState,
         seat::WaylandFocus,
         pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState},
-        presentation::PresentationState,
         cursor_shape::CursorShapeManagerState,
         keyboard_shortcuts_inhibit::{
             KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState,
@@ -102,8 +101,6 @@ pub struct WaylandWebStreamState {
     pub viewporter_state: ViewporterState,
     #[allow(dead_code)]
     pub pointer_constraints_state: PointerConstraintsState,
-    #[allow(dead_code)]
-    pub presentation_state: PresentationState,
     #[allow(dead_code)]
     pub keyboard_shortcuts_inhibit_state: KeyboardShortcutsInhibitState,
     #[allow(dead_code)]
@@ -178,7 +175,13 @@ impl WaylandWebStreamState {
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
         let pointer_constraints_state = PointerConstraintsState::new::<Self>(&dh);
-        let presentation_state = PresentationState::new::<Self>(&dh, 1 /* CLOCK_MONOTONIC */);
+        // NOTE: wp_presentation is intentionally NOT advertised. render()
+        // bypasses Smithay's renderer and never records a scan-out, so we have
+        // no presentation feedback to send; advertising the global while never
+        // emitting `presented`/`discarded` left timing-sensitive clients (GTK4
+        // frame clock, mpv) waiting on feedback that never came. TODO: wire
+        // real feedback from the capture loop's capture/encode timestamps and
+        // re-advertise.
         let keyboard_shortcuts_inhibit_state = KeyboardShortcutsInhibitState::new::<Self>(&dh);
         let xdg_toplevel_icon_manager = XdgToplevelIconManager::new::<Self>(&dh);
         let cursor_shape_state = CursorShapeManagerState::new::<Self>(&dh);
@@ -226,7 +229,6 @@ impl WaylandWebStreamState {
             single_pixel_buffer_state,
             viewporter_state,
             pointer_constraints_state,
-            presentation_state,
             keyboard_shortcuts_inhibit_state,
             xdg_toplevel_icon_manager,
             cursor_shape_state,
@@ -983,7 +985,6 @@ delegate_seat!(WaylandWebStreamState);
 delegate_output!(WaylandWebStreamState);
 delegate_dmabuf!(WaylandWebStreamState);
 delegate_pointer_constraints!(WaylandWebStreamState);
-delegate_presentation!(WaylandWebStreamState);
 delegate_keyboard_shortcuts_inhibit!(WaylandWebStreamState);
 delegate_xdg_toplevel_icon!(WaylandWebStreamState);
 delegate_cursor_shape!(WaylandWebStreamState);

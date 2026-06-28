@@ -104,6 +104,14 @@ async fn main() -> Result<()> {
     let (width, height) = config.get_initial_resolution()?;
     info!("Initial resolution: {}x{}", width, height);
 
+    // Upper bound enforced server-side on every client resize request. The
+    // client clamps too, but a resize arrives over the same untrusted /client
+    // socket as everything else, so the server is the authority: an unclamped
+    // request would force an encoder + framebuffer reallocation at an
+    // arbitrary size (memory DoS).
+    let (max_width, max_height) = config::Config::parse_resolution(&config.max_resolution)
+        .context("Failed to parse --max-resolution")?;
+
     // Create Wayland display and event loop
     let mut event_loop: EventLoop<CompositorState> = EventLoop::try_new()
         .context("Failed to create event loop")?;
@@ -268,7 +276,26 @@ async fn main() -> Result<()> {
     info!("╚══════════════════════════════════════════════════════════════╝\n");
 
     info!("Server starting on port {}...", config.port);
-    
+
+    // The server has no authentication of its own; a reachable port is full
+    // input + clipboard injection into the session. Warn loudly when bound to
+    // anything other than loopback so exposure is a conscious choice behind an
+    // authenticating reverse proxy. (A non-IP value, e.g. a hostname, also
+    // can't be confirmed as loopback, so it warns too.)
+    let bound_to_loopback = config
+        .listen_addr
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false);
+    if !bound_to_loopback {
+        warn!(
+            "Listening on {} (not loopback): the server has NO authentication and \
+             grants full keyboard/pointer/touch/clipboard injection to anyone who \
+             can reach it. Only do this behind an authenticating reverse proxy.",
+            config.listen_addr
+        );
+    }
+
     // Get frame sender, encoder control sender, and resize sender before moving encoder
     let frame_sender = encoder.get_frame_sender();
     let encoder_control = encoder.get_control_sender();
@@ -562,18 +589,16 @@ async fn main() -> Result<()> {
 
         // Check for resize requests (non-blocking)
         if let Ok((req_width, req_height)) = resize_rx.try_recv() {
-            // YUV 4:2:0 requires even dimensions; round down to the nearest
-            // even number.  ÷16 macroblock alignment is NOT required — x264
-            // pads internally and signals the crop via SPS.
-            let new_width = req_width & !1u32;
-            let new_height = req_height & !1u32;
-            
-            // Validate minimum dimensions (minimum 16x16 after rounding)
-            if new_width < 16 || new_height < 16 {
+            // Clamp to --max-resolution, round to even, and reject sub-16×16.
+            // The request comes off the untrusted /client socket and drives
+            // encoder/framebuffer allocation, so the server caps it here.
+            let Some((new_width, new_height)) =
+                config::sanitize_resolution((req_width, req_height), (max_width, max_height))
+            else {
                 warn!("Ignoring resize request with dimensions too small: {}x{}", req_width, req_height);
                 continue;
-            }
-            
+            };
+
             info!("Processing resize request: {}x{}", new_width, new_height);
             
             // Resize compositor output

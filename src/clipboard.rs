@@ -221,12 +221,18 @@ pub fn spawn(
         .expect("spawn clipboard-bridge thread");
 }
 
-fn socket_path(display: &str) -> PathBuf {
+fn socket_path(display: &str) -> anyhow::Result<PathBuf> {
     if display.starts_with('/') {
-        return PathBuf::from(display);
+        return Ok(PathBuf::from(display));
     }
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
-    PathBuf::from(dir).join(display)
+    // Per the XDG Base Directory spec a relative Wayland display is resolved
+    // against $XDG_RUNTIME_DIR; there is no valid fallback (the old
+    // hardcoded /run/user/1000 was wrong for any other UID), so fail loudly
+    // rather than probe a guessed path. run()'s caller logs the error as a warn.
+    let dir = std::env::var("XDG_RUNTIME_DIR").map_err(|_| {
+        anyhow::anyhow!("XDG_RUNTIME_DIR not set; cannot locate nested compositor socket '{display}'")
+    })?;
+    Ok(PathBuf::from(dir).join(display))
 }
 
 fn run(
@@ -234,7 +240,7 @@ fn run(
     to_remote: calloop::channel::Channel<ClipboardData>,
     from_remote: watch::Sender<ClipboardData>,
 ) -> anyhow::Result<()> {
-    let path = socket_path(nested_display);
+    let path = socket_path(nested_display)?;
     let stream = UnixStream::connect(&path)
         .map_err(|e| anyhow::anyhow!("connect to nested compositor {path:?}: {e}"))?;
     let conn = Connection::from_socket(stream)?;
