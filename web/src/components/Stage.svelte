@@ -112,8 +112,11 @@
     audio.start();
 
     // Clipboard sync between the device and the remote desktop. Reads/writes
-    // the device clipboard on user gestures (see lib/clipboard.ts).
-    clipboard = new ClipboardBridge(sendControl);
+    // the device clipboard on user gestures (see lib/clipboard.ts). Images go
+    // out via the channel's binary frame.
+    clipboard = new ClipboardBridge(sendControl, (mime, bytes) =>
+      client?.sendClipboardImage(mime, bytes),
+    );
 
     // Construct the channel now (so the initial resize/ready buffer in its
     // send queue) but connect it only once the pipeline is ready -- see below.
@@ -123,6 +126,7 @@
       onCodec: (codec) => pipeline?.setCodec(codec),
       onCursor: applyCursor,
       onClipboard: (text) => clipboard?.onRemoteClipboard(text),
+      onClipboardImage: (mime, bytes) => clipboard?.onRemoteImage(mime, bytes),
       onVideoFrame: (frame) => pipeline?.handleVideoFrame(frame),
       onAudioFrame: (frame) => audio?.handleAudioFrame(frame),
       onClosed: () => {

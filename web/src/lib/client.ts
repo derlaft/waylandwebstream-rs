@@ -14,10 +14,13 @@
 // to reconnect()). close() (intentional teardown) never reconnects either.
 import {
   MSG_AUDIO_FRAME,
+  MSG_CLIPBOARD_IMAGE,
   MSG_CONTROL,
   MSG_VIDEO_FRAME,
   encodeClientMessage,
+  encodeClipboardImageMessage,
   parseAudioFramePayload,
+  parseClipboardImage,
   parseUnifiedHeader,
   parseVideoFramePayload,
   type AudioFramePayload,
@@ -39,6 +42,9 @@ export interface ClientChannelOptions {
   /// Called when the remote (nested compositor) clipboard changes. The caller
   /// writes the text to the device clipboard (see lib/clipboard.ts).
   onClipboard?: (text: string) => void;
+  /// Called when the remote clipboard holds an image. The caller writes the
+  /// bytes to the device clipboard as a ClipboardItem (see lib/clipboard.ts).
+  onClipboardImage?: (mime: string, bytes: Uint8Array) => void;
   /// Called for every decoded `MSG_VIDEO_FRAME` payload (frame_id,
   /// is_keyframe, ping echo, and the raw H.264 data). The caller feeds the
   /// H.264 to a VideoDecoder.
@@ -63,6 +69,7 @@ export class ClientChannel {
   private readonly onCodec?: (codec: string) => void;
   private readonly onCursor?: (cursor: CursorUpdate) => void;
   private readonly onClipboard?: (text: string) => void;
+  private readonly onClipboardImage?: (mime: string, bytes: Uint8Array) => void;
   private readonly onVideoFrame?: (frame: VideoFramePayload) => void;
   private readonly onAudioFrame?: (frame: AudioFramePayload) => void;
   private readonly onClosed?: () => void;
@@ -83,6 +90,7 @@ export class ClientChannel {
     this.onCodec = opts.onCodec;
     this.onCursor = opts.onCursor;
     this.onClipboard = opts.onClipboard;
+    this.onClipboardImage = opts.onClipboardImage;
     this.onVideoFrame = opts.onVideoFrame;
     this.onAudioFrame = opts.onAudioFrame;
     this.onClosed = opts.onClosed;
@@ -158,6 +166,17 @@ export class ClientChannel {
     // until the user interacts, by which point this input is stale.
   }
 
+  /// Sends a clipboard image (device -> remote) as a binary
+  /// MSG_CLIENT_CLIPBOARD_IMAGE frame. Queued like send() if not yet open.
+  sendClipboardImage(mime: string, bytes: Uint8Array): void {
+    const framed = encodeClipboardImageMessage(mime, bytes);
+    if (this.phase === 'open' && this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(framed);
+    } else if (this.phase === 'idle' || this.phase === 'connecting') {
+      this.sendQueue.push(framed);
+    }
+  }
+
   close(): void {
     this.closedByCaller = true;
     this.phase = 'closed';
@@ -208,6 +227,16 @@ export class ClientChannel {
       }
       case MSG_CONTROL: {
         this.onControlPayload(payload);
+        return;
+      }
+      case MSG_CLIPBOARD_IMAGE: {
+        if (!this.onClipboardImage) return;
+        try {
+          const { mime, bytes } = parseClipboardImage(payload);
+          this.onClipboardImage(mime, bytes);
+        } catch (e) {
+          console.error('Failed to parse MSG_CLIPBOARD_IMAGE payload:', e);
+        }
         return;
       }
       default: {

@@ -119,7 +119,11 @@ export const HEADER_LEN = 8;
 export const MSG_VIDEO_FRAME = 0x01;
 export const MSG_AUDIO_FRAME = 0x02;
 export const MSG_CONTROL = 0x03;
+/// Clipboard image (binary; text clipboard stays JSON in MSG_CONTROL).
+/// Payload: mime_len (u16 LE) + mime (utf8) + raw image bytes.
+export const MSG_CLIPBOARD_IMAGE = 0x04; // server -> client
 export const MSG_CLIENT_MSG = 0x10;
+export const MSG_CLIENT_CLIPBOARD_IMAGE = 0x11; // client -> server
 
 export const FLAG_KEYFRAME = 0b0000_0001;
 export const FLAG_HAS_PING = 0b0000_0010;
@@ -163,6 +167,30 @@ export function encodeClientMessage(msg: ClientMessage): ArrayBuffer {
   // `serde_json::from_slice::<SignalingMessage>` expects.
   const json = new TextEncoder().encode(JSON.stringify(msg));
   return encodeUnifiedFrame(MSG_CLIENT_MSG, 0, json);
+}
+
+/// Encodes a client→server clipboard image as a `MSG_CLIENT_CLIPBOARD_IMAGE`
+/// frame. Payload: mime_len (u16 LE) + mime (utf8) + raw image bytes. Mirrors
+/// `proto::encode_clipboard_image_payload`.
+export function encodeClipboardImageMessage(mime: string, bytes: Uint8Array): ArrayBuffer {
+  const mimeBytes = new TextEncoder().encode(mime);
+  const payload = new Uint8Array(2 + mimeBytes.byteLength + bytes.byteLength);
+  new DataView(payload.buffer).setUint16(0, mimeBytes.byteLength, true);
+  payload.set(mimeBytes, 2);
+  payload.set(bytes, 2 + mimeBytes.byteLength);
+  return encodeUnifiedFrame(MSG_CLIENT_CLIPBOARD_IMAGE, 0, payload);
+}
+
+/// Parses a `MSG_CLIPBOARD_IMAGE` payload (the bytes after the 8-byte header)
+/// into its mime type and raw image bytes.
+export function parseClipboardImage(payload: ArrayBuffer): { mime: string; bytes: Uint8Array } {
+  if (payload.byteLength < 2) throw new Error('clipboard image payload too short');
+  const view = new DataView(payload);
+  const mimeLen = view.getUint16(0, true);
+  if (payload.byteLength < 2 + mimeLen) throw new Error('clipboard image mime truncated');
+  const mime = new TextDecoder().decode(new Uint8Array(payload, 2, mimeLen));
+  const bytes = new Uint8Array(payload, 2 + mimeLen);
+  return { mime, bytes };
 }
 
 /// Decoded payload of a `MSG_VIDEO_FRAME` from the `/client` endpoint.

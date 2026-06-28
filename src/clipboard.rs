@@ -57,6 +57,46 @@ const TEXT_MIMES: &[&str] = &[
     "TEXT",
 ];
 
+/// Image MIME types we look for, in preference order. `image/png` is the only
+/// type browsers reliably read *and* write, so it leads; any other `image/*`
+/// is read through but rarely needed.
+const IMAGE_MIMES: &[&str] = &["image/png"];
+
+/// Don't bridge clipboard payloads larger than this. Keeps a single WebSocket
+/// message under tungstenite's 16 MiB frame limit and bounds memory/abuse.
+pub const MAX_CLIPBOARD_BYTES: usize = 8 * 1024 * 1024;
+
+/// A clipboard payload flowing through the bridge in either direction. Text
+/// rides the JSON control channel; images ride a binary frame (see src/proto).
+#[derive(Clone)]
+pub enum ClipboardData {
+    Text(String),
+    Image { mime: String, bytes: Vec<u8> },
+}
+
+fn text_mimes() -> Vec<String> {
+    TEXT_MIMES.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// Picks which MIME type to read from an offer: image first (so a copied
+/// picture comes through as an image rather than its text/html fallback), else
+/// text. Returns `(mime, is_image)`.
+fn choose_read_mime(mimes: &[String]) -> Option<(String, bool)> {
+    if let Some(m) = IMAGE_MIMES.iter().find(|m| mimes.iter().any(|x| x == *m)) {
+        return Some(((*m).to_string(), true));
+    }
+    if let Some(m) = mimes.iter().find(|x| x.starts_with("image/")) {
+        return Some((m.clone(), true));
+    }
+    if let Some(m) = TEXT_MIMES.iter().find(|m| mimes.iter().any(|x| x == *m)) {
+        return Some(((*m).to_string(), false));
+    }
+    if let Some(m) = mimes.iter().find(|x| x.starts_with("text/")) {
+        return Some((m.clone(), false));
+    }
+    None
+}
+
 // ─── ext/wlr abstraction ──────────────────────────────────────────────────────
 // The two data-control protocols are byte-for-byte identical in shape; these
 // enums let the handler logic stay protocol-agnostic.
@@ -168,8 +208,8 @@ impl Offer {
 ///   device). A `watch` so a newly connected client sees the current value.
 pub fn spawn(
     nested_display: String,
-    to_remote: calloop::channel::Channel<String>,
-    from_remote: watch::Sender<String>,
+    to_remote: calloop::channel::Channel<ClipboardData>,
+    from_remote: watch::Sender<ClipboardData>,
 ) {
     std::thread::Builder::new()
         .name("clipboard-bridge".into())
@@ -191,8 +231,8 @@ fn socket_path(display: &str) -> PathBuf {
 
 fn run(
     nested_display: &str,
-    to_remote: calloop::channel::Channel<String>,
-    from_remote: watch::Sender<String>,
+    to_remote: calloop::channel::Channel<ClipboardData>,
+    from_remote: watch::Sender<ClipboardData>,
 ) -> anyhow::Result<()> {
     let path = socket_path(nested_display);
     let stream = UnixStream::connect(&path)
@@ -230,7 +270,8 @@ fn run(
         device,
         offer_mimes: HashMap::new(),
         source: None,
-        serve_text: Vec::new(),
+        serve_bytes: Vec::new(),
+        serve_mimes: Vec::new(),
         owning: false,
         last_value: None,
         from_remote,
@@ -263,47 +304,54 @@ struct ClipState {
     offer_mimes: HashMap<ObjectId, Vec<String>>,
     /// The source we currently own the selection with (device -> remote).
     source: Option<Source>,
-    /// Bytes that source serves on `send`.
-    serve_text: Vec<u8>,
+    /// Bytes that source serves on `send`, and the MIME types it advertises.
+    serve_bytes: Vec<u8>,
+    serve_mimes: Vec<String>,
     /// True while we own the selection, so the compositor's echo `selection`
     /// event for our own source isn't read back as a remote change (which
     /// would also self-deadlock, since we'd be both writer and reader).
     owning: bool,
-    /// Last text seen in either direction -- dedupes so identical values don't
-    /// loop between device and remote.
-    last_value: Option<String>,
-    from_remote: watch::Sender<String>,
+    /// Last payload bytes seen in either direction -- dedupes so identical
+    /// content doesn't loop between device and remote. Bytes-only (not keyed by
+    /// MIME) so a text/plain vs text/plain;charset=utf-8 label can't defeat it.
+    last_value: Option<Vec<u8>>,
+    from_remote: watch::Sender<ClipboardData>,
 }
 
 impl ClipState {
-    /// device -> remote: take ownership of the nest selection and serve `text`.
-    fn set_selection(&mut self, text: String) {
-        if self.last_value.as_deref() == Some(text.as_str()) {
+    /// device -> remote: take ownership of the nest selection and serve `data`.
+    fn set_selection(&mut self, data: ClipboardData) {
+        let (bytes, mimes) = match data {
+            ClipboardData::Text(text) => (text.into_bytes(), text_mimes()),
+            ClipboardData::Image { mime, bytes } => (bytes, vec![mime]),
+        };
+        if bytes.len() > MAX_CLIPBOARD_BYTES {
+            warn!("clipboard: device payload too large ({} bytes), dropping", bytes.len());
+            return;
+        }
+        if self.last_value.as_deref() == Some(bytes.as_slice()) {
             return; // already the current clipboard value; nothing to do
         }
         let source = self.manager.create_data_source(&self.qh);
-        for mime in TEXT_MIMES {
-            source.offer((*mime).to_string());
+        for mime in &mimes {
+            source.offer(mime.clone());
         }
         self.device.set_selection(Some(&source));
-        self.serve_text = text.clone().into_bytes();
+        self.serve_bytes = bytes.clone();
+        self.serve_mimes = mimes;
         self.source = Some(source);
         self.owning = true;
-        self.last_value = Some(text);
+        self.last_value = Some(bytes);
         let _ = self.conn.flush();
-        debug!("clipboard: set nested selection ({} bytes)", self.serve_text.len());
+        debug!("clipboard: set nested selection ({} bytes)", self.serve_bytes.len());
     }
 
-    /// remote -> device: read the offered text and push it to browsers.
+    /// remote -> device: read the offered selection (image preferred, else
+    /// text) and push it to browsers.
     fn read_offer(&mut self, off: &Offer) {
         let mimes = self.offer_mimes.get(&off.id()).cloned().unwrap_or_default();
-        let mime = TEXT_MIMES
-            .iter()
-            .find(|m| mimes.iter().any(|x| x == *m))
-            .map(|s| (*s).to_string())
-            .or_else(|| mimes.iter().find(|x| x.starts_with("text/")).cloned());
-        let Some(mime) = mime else {
-            debug!("clipboard: nested selection has no text mime, ignoring");
+        let Some((mime, is_image)) = choose_read_mime(&mimes) else {
+            debug!("clipboard: nested selection has no text/image mime, ignoring");
             return;
         };
 
@@ -314,23 +362,36 @@ impl ClipState {
                 return;
             }
         };
-        off.receive(mime, writer.as_fd());
+        off.receive(mime.clone(), writer.as_fd());
         drop(writer); // so the read sees EOF once the source finishes writing
         if self.conn.flush().is_err() {
             return;
         }
+        // Bounded read so a huge selection can't blow up memory or exceed the
+        // frame limit; if it overruns the cap we drop it.
         let mut buf = Vec::new();
-        if let Err(e) = reader.read_to_end(&mut buf) {
+        if let Err(e) = (&mut reader)
+            .take((MAX_CLIPBOARD_BYTES + 1) as u64)
+            .read_to_end(&mut buf)
+        {
             warn!("clipboard: reading nested selection failed: {e}");
             return;
         }
-        let text = String::from_utf8_lossy(&buf).into_owned();
-        if self.last_value.as_deref() == Some(text.as_str()) {
+        if buf.len() > MAX_CLIPBOARD_BYTES {
+            warn!("clipboard: nested selection too large (> {MAX_CLIPBOARD_BYTES} bytes), dropping");
+            return;
+        }
+        if self.last_value.as_deref() == Some(buf.as_slice()) {
             return; // unchanged / our own value coming back
         }
-        debug!("clipboard: nested selection -> device ({} bytes)", buf.len());
-        self.last_value = Some(text.clone());
-        let _ = self.from_remote.send(text);
+        debug!("clipboard: nested selection -> device ({} bytes, {mime})", buf.len());
+        self.last_value = Some(buf.clone());
+        let data = if is_image {
+            ClipboardData::Image { mime, bytes: buf }
+        } else {
+            ClipboardData::Text(String::from_utf8_lossy(&buf).into_owned())
+        };
+        let _ = self.from_remote.send(data);
     }
 
     // Shared (protocol-agnostic) device/source event handling.
@@ -355,7 +416,7 @@ impl ClipState {
         let _ = fcntl_setfl(&fd, OFlags::empty());
         let mut file = std::fs::File::from(fd);
         use std::io::Write as _;
-        if let Err(e) = file.write_all(&self.serve_text) {
+        if let Err(e) = file.write_all(&self.serve_bytes) {
             debug!("clipboard: serving selection to nest failed: {e}");
         }
     }

@@ -382,8 +382,9 @@ async fn main() -> Result<()> {
     //    the bridge drains it, dropping if the bridge never started).
     //  - out: nested compositor selection → browsers (watch; latest value,
     //    new clients see the current clipboard on connect).
-    let (clipboard_in_tx, mut clipboard_in_rx) = mpsc::channel::<String>(16);
-    let (clipboard_out_tx, clipboard_out_rx) = tokio::sync::watch::channel(String::new());
+    let (clipboard_in_tx, mut clipboard_in_rx) = mpsc::channel::<clipboard::ClipboardData>(16);
+    let (clipboard_out_tx, clipboard_out_rx) =
+        tokio::sync::watch::channel(clipboard::ClipboardData::Text(String::new()));
 
     // Start the clipboard bridge once the nested compositor's socket is
     // discovered. It's a data-control client of that nest, so it can't start
@@ -402,7 +403,7 @@ async fn main() -> Result<()> {
             };
             // Bridge the tokio mpsc (device→remote) into a calloop channel the
             // bridge thread's event loop can wait on, then run the thread.
-            let (cl_tx, cl_rx) = calloop::channel::channel::<String>();
+            let (cl_tx, cl_rx) = calloop::channel::channel::<clipboard::ClipboardData>();
             clipboard::spawn(display, cl_rx, clipboard_out_tx);
             while let Some(text) = clipboard_in_rx.recv().await {
                 if cl_tx.send(text).is_err() {

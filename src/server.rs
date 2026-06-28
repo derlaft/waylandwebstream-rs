@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use crate::adaptive_bitrate::BitrateEvent;
 use crate::audio::AudioPacket;
+use crate::clipboard::{ClipboardData, MAX_CLIPBOARD_BYTES};
 use crate::encoder::{EncodedPacket, EncoderControl};
 use crate::input::keyboard::KeyboardEvent;
 use crate::input::mouse::MouseEvent;
@@ -263,11 +264,12 @@ pub struct SignalingState {
     /// clipboard bridge to set as the nested compositor's selection. A bounded
     /// mpsc; the bridge thread drains it. Sends are dropped if the bridge never
     /// started (no nested compositor / no data-control).
-    clipboard_in_tx: mpsc::Sender<String>,
-    /// The nested compositor's current clipboard text (remote -> device). Each
-    /// `/client` connection subscribes and pushes `ServerMessage::Clipboard`
-    /// on change; a new client also gets the current value on connect.
-    clipboard_out_rx: watch::Receiver<String>,
+    clipboard_in_tx: mpsc::Sender<ClipboardData>,
+    /// The nested compositor's current clipboard (remote -> device). Each
+    /// `/client` connection subscribes and pushes the value on change (text as
+    /// `ServerMessage::Clipboard` JSON, images as a `MSG_CLIPBOARD_IMAGE`
+    /// binary frame); a new client also gets the current value on connect.
+    clipboard_out_rx: watch::Receiver<ClipboardData>,
 }
 
 impl SignalingState {
@@ -287,8 +289,8 @@ impl SignalingState {
         session: SessionManager,
         audio_tx: Option<broadcast::Sender<AudioPacket>>,
         cursor_rx: watch::Receiver<CursorUpdate>,
-        clipboard_in_tx: mpsc::Sender<String>,
-        clipboard_out_rx: watch::Receiver<String>,
+        clipboard_in_tx: mpsc::Sender<ClipboardData>,
+        clipboard_out_rx: watch::Receiver<ClipboardData>,
     ) -> Self {
         let (video_tx, _) = broadcast::channel(3);
         // Backdated so the very first `RequestKeyframe` after startup is
@@ -710,14 +712,10 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
     }
     {
         // Send the current remote clipboard up front so a freshly connected
-        // client can paste it immediately. Empty means "nothing copied yet" --
-        // skip it so we don't clobber the device clipboard with a blank.
-        let text = clipboard_out_rx.borrow().clone();
-        if !text.is_empty()
-            && send_unified_control(&mut sender, &ServerMessage::Clipboard { text })
-                .await
-                .is_err()
-        {
+        // client can paste it immediately. (send_clipboard skips the empty-text
+        // "nothing copied yet" sentinel so we don't clobber the device.)
+        let data = clipboard_out_rx.borrow().clone();
+        if send_clipboard(&mut sender, &data).await.is_err() {
             return;
         }
     }
@@ -812,17 +810,22 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
             }
             changed = clipboard_out_rx.changed() => {
                 if changed.is_err() { continue; }
-                let text = clipboard_out_rx.borrow().clone();
-                if send_unified_control(&mut sender, &ServerMessage::Clipboard { text })
-                    .await
-                    .is_err()
-                {
+                let data = clipboard_out_rx.borrow().clone();
+                if send_clipboard(&mut sender, &data).await.is_err() {
                     break;
                 }
             }
             incoming = receiver.next() => {
                 let Some(Ok(msg)) = incoming else { break; };
                 let Message::Binary(data) = msg else { continue; };
+                // Clipboard images arrive as their own binary frame (raw bytes,
+                // not JSON); everything else is a MSG_CLIENT_MSG JSON signal.
+                if let Some(image) = parse_client_clipboard_image(&data) {
+                    if let Err(e) = state.clipboard_in_tx.try_send(image) {
+                        debug!("Clipboard image (device->remote) dropped: {e}");
+                    }
+                    continue;
+                }
                 let Ok(signal) = parse_client_message(&data) else { continue; };
                 dispatch_signaling_message(signal, &state).await;
             }
@@ -932,6 +935,46 @@ async fn send_unified_control(
     sender.send(Message::Binary(encode_unified_control(msg))).await
 }
 
+/// Sends a remote->device clipboard value: text rides the JSON control channel,
+/// images ride a `MSG_CLIPBOARD_IMAGE` binary frame. Empty text is the
+/// "nothing copied yet" sentinel and is skipped.
+async fn send_clipboard(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    data: &ClipboardData,
+) -> Result<(), axum::Error> {
+    match data {
+        ClipboardData::Text(text) => {
+            if text.is_empty() {
+                return Ok(());
+            }
+            send_unified_control(sender, &ServerMessage::Clipboard { text: text.clone() }).await
+        }
+        ClipboardData::Image { mime, bytes } => {
+            let payload = proto::encode_clipboard_image_payload(mime, bytes);
+            let frame = proto::encode_msg(proto::MSG_CLIPBOARD_IMAGE, 0, &payload);
+            sender.send(Message::Binary(frame)).await
+        }
+    }
+}
+
+/// Parses a client->server `MSG_CLIENT_CLIPBOARD_IMAGE` binary frame into a
+/// clipboard image. Returns `None` for any other message type or a malformed /
+/// oversized frame (so the caller falls back to JSON signal parsing).
+fn parse_client_clipboard_image(data: &[u8]) -> Option<ClipboardData> {
+    let header: [u8; 8] = data.get(..proto::HEADER_LEN)?.try_into().ok()?;
+    let (msg_type, _flags, payload_len) = proto::decode_header(&header);
+    if msg_type != proto::MSG_CLIENT_CLIPBOARD_IMAGE {
+        return None;
+    }
+    let payload = data.get(proto::HEADER_LEN..proto::HEADER_LEN + payload_len as usize)?;
+    if payload.len() > MAX_CLIPBOARD_BYTES {
+        warn!("Clipboard image (device->remote) too large ({} bytes), dropping", payload.len());
+        return None;
+    }
+    let (mime, bytes) = proto::parse_clipboard_image_payload(payload)?;
+    Some(ClipboardData::Image { mime, bytes })
+}
+
 /// Parses a `MSG_CLIENT_MSG` frame coming from the `/client` endpoint.
 /// Anything that isn't a `MSG_CLIENT_MSG` (or has a malformed
 /// header/payload) is treated as a non-error no-op so a single bad frame
@@ -1004,7 +1047,7 @@ async fn dispatch_signaling_message(signal: SignalingMessage, state: &SignalingS
             // nested compositor's selection. try_send so a missing/slow bridge
             // (no nested compositor, or no data-control) never stalls the
             // socket loop -- a dropped clipboard update is harmless.
-            if let Err(e) = state.clipboard_in_tx.try_send(text) {
+            if let Err(e) = state.clipboard_in_tx.try_send(ClipboardData::Text(text)) {
                 debug!("Clipboard (device->remote) dropped: {e}");
             }
         }
@@ -1214,7 +1257,7 @@ mod tests {
             audio_tx,
             cursor_rx,
             mpsc::channel(4).0,
-            watch::channel(String::new()).1,
+            watch::channel(ClipboardData::Text(String::new())).1,
         )
     }
 
@@ -1242,7 +1285,7 @@ mod tests {
             None,
             cursor_rx,
             mpsc::channel(4).0,
-            watch::channel(String::new()).1,
+            watch::channel(ClipboardData::Text(String::new())).1,
         );
         let video_tx = state.get_video_sender();
         let server = SignalingServer::new(state);
@@ -1481,7 +1524,7 @@ mod tests {
             None,
             cursor_rx,
             mpsc::channel(4).0,
-            watch::channel(String::new()).1,
+            watch::channel(ClipboardData::Text(String::new())).1,
         );
         let video_tx = state.get_video_sender();
         let server = SignalingServer::new(state);
@@ -1737,7 +1780,7 @@ mod tests {
             None,
             cursor_rx,
             mpsc::channel(4).0,
-            watch::channel(String::new()).1,
+            watch::channel(ClipboardData::Text(String::new())).1,
         );
 
         dispatch_signaling_message(SignalingMessage::Resize { width: 800, height: 600 }, &state)
@@ -1770,7 +1813,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_clipboard_forwards_to_bridge() {
-        let (clipboard_in_tx, mut clipboard_in_rx) = mpsc::channel::<String>(4);
+        let (clipboard_in_tx, mut clipboard_in_rx) = mpsc::channel::<ClipboardData>(4);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (_, bitrate_rx) = watch::channel(2_000_000usize);
         let (_, codec_rx) = watch::channel(String::new());
@@ -1793,7 +1836,7 @@ mod tests {
             None,
             cursor_rx,
             clipboard_in_tx,
-            watch::channel(String::new()).1,
+            watch::channel(ClipboardData::Text(String::new())).1,
         );
 
         dispatch_signaling_message(
@@ -1803,7 +1846,10 @@ mod tests {
         .await;
 
         let received = clipboard_in_rx.try_recv().expect("clipboard_in_rx should have a value");
-        assert_eq!(received, "to remote");
+        match received {
+            ClipboardData::Text(text) => assert_eq!(text, "to remote"),
+            ClipboardData::Image { .. } => panic!("expected text"),
+        }
     }
 
     /// The /client endpoint routes a binary-framed Resize message (as the
@@ -1838,7 +1884,7 @@ mod tests {
             None,
             cursor_rx,
             mpsc::channel(4).0,
-            watch::channel(String::new()).1,
+            watch::channel(ClipboardData::Text(String::new())).1,
         );
         let server = SignalingServer::new(state);
 
