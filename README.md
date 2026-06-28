@@ -2,19 +2,21 @@
 
 A single-binary service that runs a headless Wayland compositor and streams it
 to a browser over a binary WebSocket, decoded client-side with WebCodecs, with
-low-latency video and remote touch/input control.
+low-latency video, audio, and remote touch/keyboard/clipboard control.
 
 ## Overview
 
 WaylandWebStream creates a full headless Wayland environment (via
 [Smithay](https://github.com/Smithay/smithay)), encodes the compositor
 framebuffer to H.264 in real time (via
-[FFmpeg/rust-ffmpeg](https://github.com/zmwangx/rust-ffmpeg)), and delivers the
-video stream to a browser client over a binary WebSocket (`/stream`), where the
-browser's `VideoDecoder` (WebCodecs) decodes each frame straight into a
-`<canvas>`. The user controls the remote desktop through touch/pointer events
-sent back over a second WebSocket (`/ws`) and injected directly into the
-compositor's input pipeline.
+[FFmpeg/rust-ffmpeg](https://github.com/zmwangx/rust-ffmpeg)), captures audio
+to Opus, and delivers both to a browser client over a binary WebSocket, where
+the browser's `VideoDecoder` (WebCodecs) decodes each frame straight into a
+`<canvas>`. The user controls the remote desktop through touch, pointer,
+keyboard, and clipboard events sent back over the same connection and injected
+directly into the compositor's input pipeline. A unified `/client` WebSocket
+multiplexes video, audio, and control in one connection (the legacy `/stream`,
+`/audio`, and `/ws` endpoints remain).
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -53,53 +55,69 @@ compositor's input pipeline.
 
 - **Single binary** -- compositor, encoder, HTTP/WebSocket server, and web
   client all in one executable
-- **Headless Wayland compositor** -- Smithay-based, no GPU or display required
+- **Headless Wayland compositor** -- Smithay-based, no GPU or display required;
+  optional GL/VA-API hardware path
 - **Low-latency H.264 streaming** -- software encoding via FFmpeg (x264),
-  tuned for real-time with `zerolatency` preset
+  tuned for real-time with `zerolatency` preset, with adaptive bitrate
+- **Audio streaming** -- PipeWire capture encoded to Opus and streamed
+  alongside the video (disabled gracefully when PipeWire is unavailable)
 - **Client-reported latency feedback** -- the browser reports encode/network/
-  decode timing back over `/ws` so the server can be tuned against real
-  glass-to-glass latency
+  decode timing back so the server can be tuned against real glass-to-glass
+  latency
 - **Touch-first input** -- multi-touch, pointer, and physical-keyboard events
   relayed from the browser and injected directly into the compositor (no
   uinput kernel round-trip)
-- **WebSocket + WebCodecs transport** -- one binary WebSocket per frame, no
-  SDP/ICE negotiation; the browser's native `VideoDecoder` does the decoding
-- **Built-in HTTP/WebSocket server** -- serves the web client, the binary
-  video stream, and the input/control channel from a single built-in server;
-  no separate signaling server or external infrastructure needed
+- **On-screen keyboard** -- a togglable, draggable button summons the device's
+  native soft keyboard on touch devices; typed text is translated to key
+  events (US layout)
+- **Clipboard sync** -- bidirectional text and PNG-image clipboard between the
+  device and the remote, bridged through a data-control client of the nested
+  compositor (see [Sessions](#sessions))
+- **Unified transport** -- a single `/client` binary WebSocket multiplexes
+  video, audio, and control; no SDP/ICE negotiation, the browser's native
+  `VideoDecoder` does the decoding
+- **Built-in HTTP/WebSocket server** -- serves the web client and all
+  streams/channels from a single built-in server; no separate signaling
+  server or external infrastructure needed
 - **Dynamic resolution** -- viewport size is negotiated per-client and can be
   changed mid-session; the compositor output, encoder, and stream adapt on
-  the fly without reconnecting
-- **Audio streaming** -- planned for a later phase (PipeWire capture)
+  the fly without reconnecting, plus a native-resolution (HiDPI) toggle
 
 ## Architecture
 
 | Component | Library | Role |
 |---|---|---|
-| Compositor | [smithay](https://github.com/Smithay/smithay) | Headless Wayland compositor with software rendering; dynamic output resizing |
-| Video encoding | [ffmpeg-next](https://github.com/zmwangx/rust-ffmpeg) | H.264 encoding from raw framebuffer pixels |
-| Streaming | built-in (axum WebSocket) | Binary H.264 frame delivery over `/stream`, decoded client-side with WebCodecs |
-| Control channel | built-in (hyper/axum) | HTTP + WebSocket (`/ws`) for input, resize, and latency messages |
+| Compositor | [smithay](https://github.com/Smithay/smithay) | Headless Wayland compositor with software or GL rendering; dynamic output resizing |
+| Video encoding | [ffmpeg-next](https://github.com/zmwangx/rust-ffmpeg) | H.264 encoding from framebuffer pixels (x264 software, or VA-API hardware) |
+| Audio | [pipewire](https://pipewire.org) + [opus](https://opus-codec.org) | PipeWire loopback capture, Opus-encoded, streamed over the unified `/client` (and legacy `/audio`) |
+| Streaming | built-in (axum WebSocket) | Binary H.264 frames over the unified `/client` (and legacy `/stream`), decoded client-side with WebCodecs |
+| Control channel | built-in (hyper/axum) | Input, resize, latency, and clipboard messages over the unified `/client` (and legacy `/ws`) |
 | Input | direct Smithay injection | Touch/keyboard/mouse events injected into SeatState; keyboard forwards physical key identity (`KeyboardEvent.code`), so the browser's OS keyboard layout should match the server's XKB layout for correct characters |
-| Web client | [Svelte](https://svelte.dev) + [Vite](https://vite.dev), embedded via `rust-embed` | `<canvas>` + WebCodecs decode, touch/pointer capture, collapsible stats panel; compiled to a static bundle and baked into the binary |
+| Clipboard | [wayland-client](https://github.com/Smithay/wayland-rs) (ext/wlr-data-control) | Bidirectional text + image sync via a data-control client of the nested compositor (no daemon) |
+| Web client | [Svelte](https://svelte.dev) + [Vite](https://vite.dev), embedded via `rust-embed` | `<canvas>` + WebCodecs decode, touch/pointer/keyboard capture, on-screen keyboard, clipboard sync, collapsible stats panel; compiled to a static bundle and baked into the binary |
 
 ## Requirements
 
 ### Build dependencies
 
-- Rust 1.75+ (2024 edition)
+- Rust 1.75+ (2021 edition)
 - Node.js/npm -- `build.rs` runs `npm ci && npm run build` in `web/` to
   produce the Svelte client bundle that gets embedded into the binary
   (falls back to a stale `web/dist/` with a warning if `npm` is missing)
 - FFmpeg development libraries (libavcodec, libavformat, libavutil, libswscale)
-- Wayland development libraries (libwayland-server)
+- Wayland development libraries (libwayland client + server)
+- PipeWire (libpipewire-0.3) and Opus (libopus) development libraries -- for
+  audio capture/encoding
 - pkg-config
 
 ### Runtime
 
 - Linux (Wayland is Linux-only)
 - FFmpeg shared libraries
-- No GPU required (software rendering + software encoding)
+- No GPU required (software rendering + software encoding); a GPU enables the
+  optional GL/VA-API path
+- PipeWire at runtime for audio (optional -- audio is disabled gracefully if
+  it isn't reachable)
 - A reachable TCP port for the HTTP/WebSocket server (plain WebSocket over
   TCP -- no UDP or NAT traversal needed)
 
@@ -160,6 +178,21 @@ server run and killed on shutdown.
 
 If no command is given, no child process is spawned -- a Wayland client can
 still be launched manually against `--display-name` as before.
+
+#### Nested compositors / full desktops
+
+The session command can be a single app (above) or a nested compositor that
+hosts a whole desktop -- e.g. `-- labwc`, `-- sway`, or `-- cage -- firefox`
+(set `WLR_BACKENDS=wayland` so the nested compositor renders into our headless
+display instead of grabbing DRM).
+
+Running a nested compositor is also what enables **clipboard sync**: the bridge
+attaches as a `data-control` client of the nested compositor, so the nest must
+expose `ext-data-control-v1` or `wlr-data-control` -- labwc, sway, hyprland,
+KWin/Plasma 6, and GNOME >= 49 do; cage does not. Clipboard sync is togglable
+from the side panel (on by default). Reading the device clipboard to push it to
+the remote uses the browser Clipboard API, which is gated by the browser's
+clipboard permission.
 
 ## Deployment Notes
 
