@@ -61,7 +61,7 @@ use smithay::{
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Cursor update extracted from a Wayland client's `wl_pointer.set_cursor` call.
 /// Pixels in the `Surface` variant are already RGBA (Canvas-ready); the
@@ -564,6 +564,11 @@ impl WaylandWebStreamState {
         let Some(touch) = self.seat.get_touch() else { return };
         let location = Point::<f64, Logical>::from((x, y));
         let target = self.surface_at(location);
+        tracing::debug!(
+            "touch_down ({x:.1},{y:.1}): windows={}, surface={}",
+            self.space.elements().count(),
+            target.is_some()
+        );
         let time = self.clock.now().as_millis();
         // The location handed to `TouchHandle::down` is delivered to the
         // client as-is, minus the focus origin we pass alongside it. We've
@@ -748,11 +753,11 @@ impl WaylandWebStreamState {
         let renderer = self.dmabuf_renderer.clone();
         match Self::read_cursor_pixels(&wl_surface, hotspot, renderer.as_ref()) {
             Some(pending) => {
-                info!("try_extract_cursor: extracted {:?}", pending.kind_name());
+                debug!("try_extract_cursor: extracted {:?}", pending.kind_name());
                 self.cursor_pending = Some(pending);
             }
             None => {
-                info!("try_extract_cursor: no buffer yet, will retry on commit");
+                debug!("try_extract_cursor: no buffer yet, will retry on commit");
             }
         }
     }
@@ -768,7 +773,7 @@ impl WaylandWebStreamState {
 
         let had_renderer_state = with_renderer_surface_state(wl_surface, |rstate| {
             let Some(buffer) = rstate.buffer() else {
-                info!("read_cursor_pixels: RendererSurfaceState exists but buffer is None");
+                debug!("read_cursor_pixels: RendererSurfaceState exists but buffer is None");
                 return;
             };
 
@@ -818,7 +823,7 @@ impl WaylandWebStreamState {
         });
 
         if had_renderer_state.is_none() {
-            info!("read_cursor_pixels: no RendererSurfaceState yet");
+            debug!("read_cursor_pixels: no RendererSurfaceState yet");
         }
 
         result
@@ -844,7 +849,7 @@ impl WaylandWebStreamState {
         let is_argb = fourcc == Fourcc::Argb8888;
         let is_xrgb = fourcc == Fourcc::Xrgb8888;
         if !is_argb && !is_xrgb {
-            info!("read_cursor_pixels_dmabuf: unsupported format {fourcc:?}");
+            debug!("read_cursor_pixels_dmabuf: unsupported format {fourcc:?}");
             return None;
         }
 
@@ -878,21 +883,21 @@ impl WaylandWebStreamState {
                         });
                     }
                 }
-                info!("read_cursor_pixels_dmabuf: linear mmap failed, trying GL readback");
+                debug!("read_cursor_pixels_dmabuf: linear mmap failed, trying GL readback");
             }
         }
 
         // GL readback path: import the dmabuf as an EGL image → GL texture → readback.
         // Works for tiled modifiers that can't be stride-mmap'd.
         let Some(renderer) = renderer else {
-            info!("read_cursor_pixels_dmabuf: no GL renderer available for tiled dmabuf");
+            debug!("read_cursor_pixels_dmabuf: no GL renderer available for tiled dmabuf");
             return None;
         };
 
         let mut rend = match renderer.try_borrow_mut() {
             Ok(r) => r,
             Err(_) => {
-                info!("read_cursor_pixels_dmabuf: renderer already borrowed");
+                debug!("read_cursor_pixels_dmabuf: renderer already borrowed");
                 return None;
             }
         };
@@ -900,7 +905,7 @@ impl WaylandWebStreamState {
         let texture = match rend.import_dmabuf(dmabuf, None) {
             Ok(t) => t,
             Err(e) => {
-                info!("read_cursor_pixels_dmabuf: import_dmabuf failed: {e:?}");
+                debug!("read_cursor_pixels_dmabuf: import_dmabuf failed: {e:?}");
                 return None;
             }
         };
@@ -909,7 +914,7 @@ impl WaylandWebStreamState {
         // (external GL textures from OES_EGL_image_external cannot).
         match rend.can_read_texture(&texture) {
             Ok(false) | Err(_) => {
-                info!("read_cursor_pixels_dmabuf: texture not readable (likely external OES texture)");
+                debug!("read_cursor_pixels_dmabuf: texture not readable (likely external OES texture)");
                 return None;
             }
             Ok(true) => {}
@@ -920,7 +925,7 @@ impl WaylandWebStreamState {
         let mapping = match rend.copy_texture(&texture, region, Fourcc::Abgr8888) {
             Ok(m) => m,
             Err(e) => {
-                info!("read_cursor_pixels_dmabuf: copy_texture failed: {e:?}");
+                debug!("read_cursor_pixels_dmabuf: copy_texture failed: {e:?}");
                 return None;
             }
         };
@@ -928,7 +933,7 @@ impl WaylandWebStreamState {
         let raw = match rend.map_texture(&mapping) {
             Ok(b) => b,
             Err(e) => {
-                info!("read_cursor_pixels_dmabuf: map_texture failed: {e:?}");
+                debug!("read_cursor_pixels_dmabuf: map_texture failed: {e:?}");
                 return None;
             }
         };
@@ -990,7 +995,7 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
     }
     
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        info!("New toplevel surface created");
+        debug!("New toplevel surface created");
 
         // Stage the fullscreen size/state, but don't send the configure yet:
         // `commit()` sends it on the client's first commit instead. Some
@@ -1010,11 +1015,11 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
         self.add_damage(full_damage);
         self.update_keyboard_focus();
 
-        info!("Window mapped to space. Total windows: {}", self.space.elements().count());
+        debug!("Window mapped to space. Total windows: {}", self.space.elements().count());
     }
     
     fn new_popup(&mut self, _surface: smithay::wayland::shell::xdg::PopupSurface, _positioner: smithay::wayland::shell::xdg::PositionerState) {
-        info!("New popup surface created");
+        debug!("New popup surface created");
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -1031,7 +1036,7 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
             self.update_keyboard_focus();
         }
 
-        info!("Window unmapped from space. Total windows: {}", self.space.elements().count());
+        debug!("Window unmapped from space. Total windows: {}", self.space.elements().count());
     }
     
     fn grab(&mut self, _surface: smithay::wayland::shell::xdg::PopupSurface, _seat: wl_seat::WlSeat, _serial: smithay::utils::Serial) {
@@ -1067,7 +1072,7 @@ impl smithay::wayland::compositor::CompositorHandler for WaylandWebStreamState {
             .map(|(s, _)| s == surface)
             .unwrap_or(false);
         if is_cursor_surface {
-            info!("commit: retrying cursor extraction for cursor surface");
+            debug!("commit: retrying cursor extraction for cursor surface");
             self.try_extract_cursor();
         }
 
@@ -1159,7 +1164,7 @@ impl DmabufHandler for WaylandWebStreamState {
     }
 
     fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
-        info!(
+        debug!(
             "dmabuf_imported called: format={:?} num_planes={} size={:?}",
             dmabuf.format(),
             dmabuf.num_planes(),
@@ -1170,7 +1175,7 @@ impl DmabufHandler for WaylandWebStreamState {
             .as_ref()
             .map(|renderer| renderer.borrow_mut().import_dmabuf(&dmabuf, None).is_ok())
             .unwrap_or(false);
-        info!("dmabuf_imported result: imported={imported}");
+        debug!("dmabuf_imported result: imported={imported}");
 
         if imported {
             if let Err(e) = notifier.successful::<Self>() {
@@ -1197,7 +1202,7 @@ impl smithay::input::SeatHandler for WaylandWebStreamState {
     }
     
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-        info!("cursor_image: {:?}", image);
+        debug!("cursor_image: {:?}", image);
         match image {
             CursorImageStatus::Hidden => {
                 self.cursor_surface = None;
@@ -1215,7 +1220,7 @@ impl smithay::input::SeatHandler for WaylandWebStreamState {
                         .map(|d| d.lock().unwrap().hotspot)
                         .unwrap_or_default()
                 });
-                info!("cursor_image: Surface hotspot={:?}", hotspot);
+                debug!("cursor_image: Surface hotspot={:?}", hotspot);
                 self.cursor_surface = Some((wl_surface, hotspot));
                 self.try_extract_cursor();
             }

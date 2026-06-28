@@ -8,7 +8,7 @@ use smithay::reexports::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{info, warn, debug, Level};
+use tracing::{info, warn, debug};
 use tracing_subscriber::FmtSubscriber;
 
 mod adaptive_bitrate;
@@ -54,9 +54,13 @@ fn cursor_pending_to_update(pending: CursorPending) -> CursorUpdate {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
+    // Initialize logging. Honors RUST_LOG (e.g. `RUST_LOG=info,waylandwebstream=debug`
+    // for input/clipboard tracing), defaulting to `info`.
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
