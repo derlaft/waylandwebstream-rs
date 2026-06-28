@@ -369,7 +369,13 @@ impl SignalingServer {
             .await
             .context("Failed to bind signaling server")?;
 
+        // Disable Nagle on every accepted connection: this is a latency-
+        // sensitive, per-frame push stream, so small writes (control frames,
+        // ping echoes, the tiny delta frames a near-idle screen produces)
+        // shouldn't sit waiting on a delayed ACK -- the classic Nagle/delayed-
+        // ACK interaction that can add tens of ms.
         axum::serve(listener, self.router)
+            .tcp_nodelay(true)
             .with_graceful_shutdown(shutdown)
             .await
             .context("Signaling server error")
