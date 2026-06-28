@@ -4,9 +4,11 @@
   import { ClientChannel } from '../lib/client';
   import { attachInput } from '../lib/input';
   import type { ClientMessage, CursorUpdate } from '../lib/protocol';
+  import { onScreenKeyboardEnabled } from '../lib/softKeyboard';
   import { setCursorDebug, streamStats } from '../lib/stats';
   import { createVideoPipeline, type VideoPipeline } from '../lib/videoClient';
   import { Viewport } from '../lib/viewport';
+  import OnScreenKeyboard from './OnScreenKeyboard.svelte';
 
   let canvas: HTMLCanvasElement;
   let cursorOverlay: HTMLImageElement;
@@ -209,6 +211,12 @@
     src="data:,"
     style="display: none; transform: translate(0, 0);"
   />
+  {#if $onScreenKeyboardEnabled}
+    <!-- Floating, draggable button that summons the device's native soft
+         keyboard; its input is translated to remote keys (softKeyboard.ts).
+         onActivate reconnects since typing never touches the canvas. -->
+    <OnScreenKeyboard {sendControl} onActivate={() => client?.reconnect()} />
+  {/if}
   {#if $streamStats.connectionState === 'closed'}
     <!-- pointer-events:none so the click/tap that dismisses this overlay
          reaches the canvas underneath, which triggers reconnect(). -->
