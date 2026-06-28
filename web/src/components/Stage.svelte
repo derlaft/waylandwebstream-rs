@@ -2,6 +2,7 @@
   import { onDestroy, onMount } from 'svelte';
   import { AudioStream } from '../lib/audio';
   import { ClientChannel } from '../lib/client';
+  import { ClipboardBridge } from '../lib/clipboard';
   import { attachInput } from '../lib/input';
   import type { ClientMessage, CursorUpdate } from '../lib/protocol';
   import { onScreenKeyboardEnabled } from '../lib/softKeyboard';
@@ -21,6 +22,7 @@
   let cursorMsgCount = 0;
 
   let client: ClientChannel | null = null;
+  let clipboard: ClipboardBridge | null = null;
   let pipeline: VideoPipeline | null = null;
   let audio: AudioStream | null = null;
   let viewport: Viewport | null = null;
@@ -93,6 +95,8 @@
     removeCursorListeners = null;
     detachInput?.();
     detachInput = null;
+    clipboard?.destroy();
+    clipboard = null;
     viewport?.stop();
     viewport = null;
     pipeline?.close();
@@ -107,6 +111,10 @@
     audio = new AudioStream();
     audio.start();
 
+    // Clipboard sync between the device and the remote desktop. Reads/writes
+    // the device clipboard on user gestures (see lib/clipboard.ts).
+    clipboard = new ClipboardBridge(sendControl);
+
     // Construct the channel now (so the initial resize/ready buffer in its
     // send queue) but connect it only once the pipeline is ready -- see below.
     // Its callbacks reach `pipeline` lazily, and no video frames arrive until
@@ -114,6 +122,7 @@
     client = new ClientChannel({
       onCodec: (codec) => pipeline?.setCodec(codec),
       onCursor: applyCursor,
+      onClipboard: (text) => clipboard?.onRemoteClipboard(text),
       onVideoFrame: (frame) => pipeline?.handleVideoFrame(frame),
       onAudioFrame: (frame) => audio?.handleAudioFrame(frame),
       onClosed: () => {
@@ -176,7 +185,12 @@
     // attached for the lifetime of the component. Registered before
     // attachInput's listeners so the socket is already re-opening when the
     // same event is forwarded as input (it buffers until OPEN).
-    const onReconnectIntent = () => client?.reconnect();
+    const onReconnectIntent = () => {
+      client?.reconnect();
+      // A real user gesture: the moment we're allowed to read the device
+      // clipboard and push it to the remote (see lib/clipboard.ts).
+      void clipboard?.onUserGesture();
+    };
     canvas.addEventListener('pointerdown', onReconnectIntent);
     canvas.addEventListener('touchstart', onReconnectIntent);
     canvas.addEventListener('keydown', onReconnectIntent);

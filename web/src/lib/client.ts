@@ -36,6 +36,9 @@ export interface ClientChannelOptions {
   /// Called whenever the compositor changes the cursor (shape, hotspot, or
   /// visibility). The caller applies it to the canvas's CSS cursor property.
   onCursor?: (cursor: CursorUpdate) => void;
+  /// Called when the remote (nested compositor) clipboard changes. The caller
+  /// writes the text to the device clipboard (see lib/clipboard.ts).
+  onClipboard?: (text: string) => void;
   /// Called for every decoded `MSG_VIDEO_FRAME` payload (frame_id,
   /// is_keyframe, ping echo, and the raw H.264 data). The caller feeds the
   /// H.264 to a VideoDecoder.
@@ -59,6 +62,7 @@ export class ClientChannel {
   private sendQueue: ArrayBuffer[] = [];
   private readonly onCodec?: (codec: string) => void;
   private readonly onCursor?: (cursor: CursorUpdate) => void;
+  private readonly onClipboard?: (text: string) => void;
   private readonly onVideoFrame?: (frame: VideoFramePayload) => void;
   private readonly onAudioFrame?: (frame: AudioFramePayload) => void;
   private readonly onClosed?: () => void;
@@ -78,6 +82,7 @@ export class ClientChannel {
   constructor(opts: ClientChannelOptions = {}) {
     this.onCodec = opts.onCodec;
     this.onCursor = opts.onCursor;
+    this.onClipboard = opts.onClipboard;
     this.onVideoFrame = opts.onVideoFrame;
     this.onAudioFrame = opts.onAudioFrame;
     this.onClosed = opts.onClosed;
@@ -228,6 +233,8 @@ export class ClientChannel {
       this.onCodec?.(msg.codec);
     } else if (msg.type === 'cursor') {
       this.onCursor?.(msg.cursor);
+    } else if (msg.type === 'clipboard') {
+      this.onClipboard?.(msg.text);
     }
   }
 }

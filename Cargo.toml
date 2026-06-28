@@ -46,6 +46,18 @@ futures-util = "0.3"
 rust-embed = { version = "8.11.0", features = ["mime-guess"] }
 base64 = "0.22"
 
+# Clipboard bridge: a data-control client of the nested compositor (the DE we
+# host) so the browser can sync the clipboard without a separate daemon. See
+# src/clipboard.rs. ext-data-control covers KDE6 / GNOME>=49 / modern wlroots /
+# labwc / COSMIC.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+os_pipe = { version = "1.1", features = ["io_safety"] }
+rustix = { version = "1", features = ["fs"] }
+
 [dev-dependencies]
 tempfile = "3"
 users = "0.11"

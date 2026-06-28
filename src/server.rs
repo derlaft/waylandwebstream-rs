@@ -126,6 +126,11 @@ pub enum SignalingMessage {
     /// only its own clock.
     #[serde(rename = "ping")]
     Ping { client_ts: f64 },
+    /// The browser's clipboard text, to be set as the nested compositor's
+    /// selection (device -> remote). Read from the device clipboard on a user
+    /// gesture; see the clipboard bridge in src/clipboard.rs.
+    #[serde(rename = "clipboard")]
+    Clipboard { text: String },
 }
 
 /// Cursor state pushed from the compositor to `/ws` clients. The browser
@@ -171,6 +176,11 @@ pub enum ServerMessage {
     /// every cursor change.
     #[serde(rename = "cursor")]
     Cursor { cursor: CursorUpdate },
+    /// The nested compositor's current clipboard text (remote -> device). The
+    /// browser writes it to the device clipboard. Pushed whenever the remote
+    /// selection changes; see the clipboard bridge in src/clipboard.rs.
+    #[serde(rename = "clipboard")]
+    Clipboard { text: String },
 }
 
 /// Shared state for the server
@@ -249,6 +259,15 @@ pub struct SignalingState {
     /// Broadcasts the latest claimed client generation so older `/client`
     /// connections notice they've been superseded and close themselves.
     client_gen_tx: watch::Sender<u64>,
+    /// The browser's clipboard text (device -> remote), forwarded to the
+    /// clipboard bridge to set as the nested compositor's selection. A bounded
+    /// mpsc; the bridge thread drains it. Sends are dropped if the bridge never
+    /// started (no nested compositor / no data-control).
+    clipboard_in_tx: mpsc::Sender<String>,
+    /// The nested compositor's current clipboard text (remote -> device). Each
+    /// `/client` connection subscribes and pushes `ServerMessage::Clipboard`
+    /// on change; a new client also gets the current value on connect.
+    clipboard_out_rx: watch::Receiver<String>,
 }
 
 impl SignalingState {
@@ -268,6 +287,8 @@ impl SignalingState {
         session: SessionManager,
         audio_tx: Option<broadcast::Sender<AudioPacket>>,
         cursor_rx: watch::Receiver<CursorUpdate>,
+        clipboard_in_tx: mpsc::Sender<String>,
+        clipboard_out_rx: watch::Receiver<String>,
     ) -> Self {
         let (video_tx, _) = broadcast::channel(3);
         // Backdated so the very first `RequestKeyframe` after startup is
@@ -298,6 +319,8 @@ impl SignalingState {
             cursor_rx,
             client_gen: Arc::new(AtomicU64::new(0)),
             client_gen_tx,
+            clipboard_in_tx,
+            clipboard_out_rx,
         }
     }
 
@@ -649,6 +672,7 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
     let mut bitrate_rx = state.bitrate_rx.clone();
     let mut codec_rx = state.codec_rx.clone();
     let mut cursor_rx = state.cursor_rx.clone();
+    let mut clipboard_out_rx = state.clipboard_out_rx.clone();
     let mut shutdown_rx = state.shutdown_rx.clone();
 
     // Push the current bitrate/codec/cursor up front for the same reasons as
@@ -680,6 +704,19 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
         if send_unified_control(&mut sender, &ServerMessage::Cursor { cursor })
             .await
             .is_err()
+        {
+            return;
+        }
+    }
+    {
+        // Send the current remote clipboard up front so a freshly connected
+        // client can paste it immediately. Empty means "nothing copied yet" --
+        // skip it so we don't clobber the device clipboard with a blank.
+        let text = clipboard_out_rx.borrow().clone();
+        if !text.is_empty()
+            && send_unified_control(&mut sender, &ServerMessage::Clipboard { text })
+                .await
+                .is_err()
         {
             return;
         }
@@ -767,6 +804,16 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
                 if changed.is_err() { continue; }
                 let cursor = cursor_rx.borrow().clone();
                 if send_unified_control(&mut sender, &ServerMessage::Cursor { cursor })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            changed = clipboard_out_rx.changed() => {
+                if changed.is_err() { continue; }
+                let text = clipboard_out_rx.borrow().clone();
+                if send_unified_control(&mut sender, &ServerMessage::Clipboard { text })
                     .await
                     .is_err()
                 {
@@ -950,6 +997,15 @@ async fn dispatch_signaling_message(signal: SignalingMessage, state: &SignalingS
         SignalingMessage::Key { event } => {
             if let Err(e) = state.key_tx.send(event).await {
                 warn!("Failed to send key event: {}", e);
+            }
+        }
+        SignalingMessage::Clipboard { text } => {
+            // device -> remote: hand to the clipboard bridge to set as the
+            // nested compositor's selection. try_send so a missing/slow bridge
+            // (no nested compositor, or no data-control) never stalls the
+            // socket loop -- a dropped clipboard update is harmless.
+            if let Err(e) = state.clipboard_in_tx.try_send(text) {
+                debug!("Clipboard (device->remote) dropped: {e}");
             }
         }
         SignalingMessage::RequestKeyframe => {
@@ -1157,6 +1213,8 @@ mod tests {
             SessionManager::new(Vec::new(), String::new(), shutdown_tx),
             audio_tx,
             cursor_rx,
+            mpsc::channel(4).0,
+            watch::channel(String::new()).1,
         )
     }
 
@@ -1183,6 +1241,8 @@ mod tests {
             SessionManager::new(Vec::new(), String::new(), shutdown_tx),
             None,
             cursor_rx,
+            mpsc::channel(4).0,
+            watch::channel(String::new()).1,
         );
         let video_tx = state.get_video_sender();
         let server = SignalingServer::new(state);
@@ -1420,6 +1480,8 @@ mod tests {
             SessionManager::new(Vec::new(), String::new(), shutdown_tx),
             None,
             cursor_rx,
+            mpsc::channel(4).0,
+            watch::channel(String::new()).1,
         );
         let video_tx = state.get_video_sender();
         let server = SignalingServer::new(state);
@@ -1674,6 +1736,8 @@ mod tests {
             SessionManager::new(Vec::new(), String::new(), shutdown_tx),
             None,
             cursor_rx,
+            mpsc::channel(4).0,
+            watch::channel(String::new()).1,
         );
 
         dispatch_signaling_message(SignalingMessage::Resize { width: 800, height: 600 }, &state)
@@ -1681,6 +1745,65 @@ mod tests {
 
         let received = resize_rx.try_recv().expect("resize_rx should have a value");
         assert_eq!(received, (800, 600));
+    }
+
+    #[test]
+    fn clipboard_messages_round_trip_json() {
+        // Client -> server: must carry `"type":"clipboard"` and survive a round
+        // trip, including non-ASCII (the whole point over typing emulation).
+        let msg = SignalingMessage::Clipboard { text: "héllo 📋".into() };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"clipboard\""), "got {json}");
+        match serde_json::from_str::<SignalingMessage>(&json).unwrap() {
+            SignalingMessage::Clipboard { text } => assert_eq!(text, "héllo 📋"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        // Server -> client.
+        let smsg = ServerMessage::Clipboard { text: "back".into() };
+        let sjson = serde_json::to_string(&smsg).unwrap();
+        assert!(sjson.contains("\"type\":\"clipboard\""), "got {sjson}");
+        match serde_json::from_str::<ServerMessage>(&sjson).unwrap() {
+            ServerMessage::Clipboard { text } => assert_eq!(text, "back"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_clipboard_forwards_to_bridge() {
+        let (clipboard_in_tx, mut clipboard_in_rx) = mpsc::channel::<String>(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_, bitrate_rx) = watch::channel(2_000_000usize);
+        let (_, codec_rx) = watch::channel(String::new());
+        let (_, cursor_rx) = watch::channel(CursorUpdate::Default);
+        let force_render = Arc::new(AtomicBool::new(false));
+        let state = SignalingState::new(
+            mpsc::channel(4).0,
+            mpsc::channel(4).0,
+            mpsc::channel(4).0,
+            mpsc::channel(4).0,
+            None,
+            None,
+            mpsc::channel(4).0,
+            force_render,
+            mpsc::channel(4).0,
+            bitrate_rx,
+            codec_rx,
+            shutdown_rx,
+            SessionManager::new(Vec::new(), String::new(), shutdown_tx),
+            None,
+            cursor_rx,
+            clipboard_in_tx,
+            watch::channel(String::new()).1,
+        );
+
+        dispatch_signaling_message(
+            SignalingMessage::Clipboard { text: "to remote".into() },
+            &state,
+        )
+        .await;
+
+        let received = clipboard_in_rx.try_recv().expect("clipboard_in_rx should have a value");
+        assert_eq!(received, "to remote");
     }
 
     /// The /client endpoint routes a binary-framed Resize message (as the
@@ -1714,6 +1837,8 @@ mod tests {
             SessionManager::new(Vec::new(), String::new(), shutdown_tx),
             None,
             cursor_rx,
+            mpsc::channel(4).0,
+            watch::channel(String::new()).1,
         );
         let server = SignalingServer::new(state);
 

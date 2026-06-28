@@ -55,6 +55,9 @@ export type ClientMessage =
   | ({ type: 'key' } & KeyMessage)
   | { type: 'request_keyframe' }
   | { type: 'ping'; client_ts: number }
+  // The device clipboard text, to set as the remote (nested compositor)
+  // selection. Sent on a user gesture after reading navigator.clipboard.
+  | { type: 'clipboard'; text: string }
   | {
       type: 'latency';
       encoding_ms?: number;
@@ -94,7 +97,10 @@ export type CursorUpdate =
 export type ServerMessage =
   | { type: 'bitrate'; bps: number }
   | { type: 'codec'; codec: string }
-  | { type: 'cursor'; cursor: CursorUpdate };
+  | { type: 'cursor'; cursor: CursorUpdate }
+  // The remote (nested compositor) clipboard text; the browser writes it to
+  // the device clipboard. Pushed on connect and whenever the remote changes.
+  | { type: 'clipboard'; text: string };
 
 // ─── Unified binary protocol framing ─────────────────────────────────────────
 //

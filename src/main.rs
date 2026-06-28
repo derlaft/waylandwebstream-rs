@@ -13,6 +13,7 @@ use tracing_subscriber::FmtSubscriber;
 
 mod adaptive_bitrate;
 mod audio;
+mod clipboard;
 mod compositor;
 mod config;
 mod encoder;
@@ -376,6 +377,41 @@ async fn main() -> Result<()> {
     // clients always see the latest cursor, not a backlog of stale ones.
     let (cursor_tx, cursor_rx) = tokio::sync::watch::channel(CursorUpdate::Default);
 
+    // Clipboard bridge channels (see src/clipboard.rs):
+    //  - in:  browser device clipboard → nested compositor selection (mpsc;
+    //    the bridge drains it, dropping if the bridge never started).
+    //  - out: nested compositor selection → browsers (watch; latest value,
+    //    new clients see the current clipboard on connect).
+    let (clipboard_in_tx, mut clipboard_in_rx) = mpsc::channel::<String>(16);
+    let (clipboard_out_tx, clipboard_out_rx) = tokio::sync::watch::channel(String::new());
+
+    // Start the clipboard bridge once the nested compositor's socket is
+    // discovered. It's a data-control client of that nest, so it can't start
+    // until the nest exists. A no-op if no nested compositor ever appears.
+    {
+        let mut nested_rx = session.nested_display();
+        tokio::spawn(async move {
+            // Wait for the discovered display (skip the initial `None`).
+            let display = loop {
+                if let Some(d) = nested_rx.borrow_and_update().clone() {
+                    break d;
+                }
+                if nested_rx.changed().await.is_err() {
+                    return; // session gone before any nest appeared
+                }
+            };
+            // Bridge the tokio mpsc (device→remote) into a calloop channel the
+            // bridge thread's event loop can wait on, then run the thread.
+            let (cl_tx, cl_rx) = calloop::channel::channel::<String>();
+            clipboard::spawn(display, cl_rx, clipboard_out_tx);
+            while let Some(text) = clipboard_in_rx.recv().await {
+                if cl_tx.send(text).is_err() {
+                    break; // bridge thread ended
+                }
+            }
+        });
+    }
+
     // Create signaling state and server
     let encoder_control_for_loop = encoder_control.clone();
     let signaling_state = SignalingState::new(
@@ -394,6 +430,8 @@ async fn main() -> Result<()> {
         session.clone(),
         audio_tx,
         cursor_rx,
+        clipboard_in_tx,
+        clipboard_out_rx,
     );
     let video_tx = signaling_state.get_video_sender();
     let signaling_server = SignalingServer::new(signaling_state);

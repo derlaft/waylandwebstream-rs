@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import ClipboardToggleButton from './ClipboardToggleButton.svelte';
   import FullscreenButton from './FullscreenButton.svelte';
   import KeyboardToggleButton from './KeyboardToggleButton.svelte';
   import NativeResolutionButton from './NativeResolutionButton.svelte';
@@ -73,6 +74,7 @@
     <FullscreenButton {fullscreenTarget} />
     <NativeResolutionButton />
     <KeyboardToggleButton />
+    <ClipboardToggleButton />
     <StatsPanel />
   </div>
 </div>
