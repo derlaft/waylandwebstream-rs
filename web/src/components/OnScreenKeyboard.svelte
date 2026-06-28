@@ -96,6 +96,16 @@
     }
   }
 
+  // pointercancel means the browser took the gesture over (e.g. it became a
+  // scroll) -- abort without treating it as a tap, which would otherwise pop
+  // the keyboard up mid-scroll.
+  function onPointerCancel(e: PointerEvent): void {
+    if (!dragging) return;
+    dragging = false;
+    fabEl?.releasePointerCapture(e.pointerId);
+    if (moved) fabPosition.set(pos);
+  }
+
   let detach: (() => void) | null = null;
 
   onMount(() => {
@@ -169,7 +179,7 @@
   onpointerdown={onPointerDown}
   onpointermove={onPointerMove}
   onpointerup={onPointerUp}
-  onpointercancel={onPointerUp}
+  onpointercancel={onPointerCancel}
 >
   ⌨
 </div>
