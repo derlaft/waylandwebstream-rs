@@ -68,6 +68,9 @@ beforeEach(() => {
     value: { writeText, write, readText, read },
     configurable: true,
   });
+  // Default: no permissions API -> proactive read is skipped (the gesture/paste
+  // paths drive the other tests). Proactive tests set this explicitly.
+  Object.defineProperty(navigator, 'permissions', { value: undefined, configurable: true });
 });
 
 afterEach(() => {
@@ -143,6 +146,35 @@ describe('ClipboardBridge device -> remote (touch read)', () => {
     window.dispatchEvent(new Event('focus')); // re-arm
     await bridge.onUserGesture(true);
     expect(sent).toContainEqual({ type: 'clipboard', text: 'second' });
+  });
+});
+
+describe('ClipboardBridge proactive sync on focus', () => {
+  it('reads on focus when clipboard-read is granted (so remote right-click Paste works)', async () => {
+    Object.defineProperty(navigator, 'permissions', {
+      value: { query: vi.fn().mockResolvedValue({ state: 'granted' }) },
+      configurable: true,
+    });
+    const { sent } = setup();
+    readText.mockResolvedValue('proactive');
+    window.dispatchEvent(new Event('focus'));
+    await flush();
+    expect(sent).toContainEqual({ type: 'clipboard', text: 'proactive' });
+  });
+
+  it('does not read on focus when not granted (no Paste prompt)', async () => {
+    Object.defineProperty(navigator, 'permissions', {
+      value: { query: vi.fn().mockResolvedValue({ state: 'prompt' }) },
+      configurable: true,
+    });
+    const { sent } = setup();
+    readText.mockResolvedValue('x');
+    read.mockResolvedValue([textReadItem('x')]);
+    window.dispatchEvent(new Event('focus'));
+    await flush();
+    expect(read).not.toHaveBeenCalled();
+    expect(readText).not.toHaveBeenCalled();
+    expect(sent).toEqual([]);
   });
 });
 

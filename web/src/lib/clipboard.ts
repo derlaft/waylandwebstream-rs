@@ -7,14 +7,16 @@
 //    the tab is focused; Firefox/Safari require a user gesture, so a remote
 //    change is written immediately if possible, else stashed and flushed on the
 //    next gesture (onUserGesture).
-//  - device -> remote needs a clipboard read, which is permission-gated. Two
-//    triggers, both deliberate (never a plain mouse click -- that pops the
-//    Firefox/Safari "Paste" affordance and hijacks clicks):
-//      * desktop: the browser `paste` event (Ctrl+V), whose clipboardData is
-//        readable with NO prompt.
-//      * mobile: the first *touch* on the stream after the tab regains focus
-//        (read() shows at most a one-time permission prompt on Chrome, not a
-//        recurring menu). Touch-gated so desktop mouse clicks never read.
+//  - device -> remote needs a clipboard read, which is permission-gated. Never
+//    on a plain mouse click -- that pops the Firefox/Safari "Paste" affordance
+//    and hijacks clicks. Triggers:
+//      * the browser `paste` event (Ctrl+V), whose clipboardData reads with NO
+//        prompt (desktop).
+//      * the first *touch* on the stream after the tab regains focus (read()
+//        shows at most a one-time permission prompt on Chrome) -- mobile.
+//      * on tab focus/visibility, a proactive read WHEN clipboard-read is
+//        already granted (Chrome), so the remote clipboard stays current and
+//        right-click → Paste inside the remote works, not just Ctrl+V.
 import { writable } from 'svelte/store';
 import type { ClientMessage } from './protocol';
 
@@ -79,9 +81,13 @@ export class ClipboardBridge {
   private readonly unsub: () => void;
   private readonly onFocus = () => {
     this.armed = true;
+    void this.maybeProactiveRead();
   };
   private readonly onVisibility = () => {
-    if (document.visibilityState === 'visible') this.armed = true;
+    if (document.visibilityState === 'visible') {
+      this.armed = true;
+      void this.maybeProactiveRead();
+    }
   };
   /// device -> remote: the user pasted (Ctrl+V). clipboardData is readable
   /// here without any permission prompt.
@@ -172,8 +178,24 @@ export class ClipboardBridge {
     }
   }
 
+  /// Keeps the remote clipboard in sync without a gesture, so ANY paste method
+  /// in the remote (Ctrl+V, right-click → Paste, middle-click) sees the device
+  /// clipboard -- not just a browser Ctrl+V. Reads only when `clipboard-read`
+  /// is already granted (Chrome): elsewhere a gesture-less read pops the
+  /// "Paste" affordance, so we skip and rely on the paste event / touch read.
+  private async maybeProactiveRead(): Promise<void> {
+    if (!this.enabled) return;
+    try {
+      const perm = await navigator.permissions.query({ name: 'clipboard-read' as PermissionName });
+      if (perm.state !== 'granted') return;
+    } catch {
+      return; // permissions API has no clipboard-read here (Firefox/Safari)
+    }
+    await this.readDevice();
+  }
+
   /// device -> remote: read the device clipboard (image preferred, else text)
-  /// and forward it. Only called from a touch gesture (see onUserGesture).
+  /// and forward it. Called from a touch gesture and from maybeProactiveRead.
   private async readDevice(): Promise<void> {
     try {
       const items = await navigator.clipboard.read();
