@@ -251,9 +251,7 @@ describe('ClientChannel', () => {
       expect(onVideoFrame).toHaveBeenCalledTimes(1);
       const frame = onVideoFrame.mock.calls[0][0];
       expect(frame.isKeyframe).toBe(true);
-      expect(frame.frameId).toBe(7);
       expect(frame.pingEchoClientTs).toBeCloseTo(100.5);
-      expect(frame.captureToEncodeMs).toBeCloseTo(8.25);
       expect(Array.from(frame.data)).toEqual([0xDE, 0xAD, 0xBE, 0xEF]);
       channel.close();
     });

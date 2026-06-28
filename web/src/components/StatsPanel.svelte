@@ -17,20 +17,6 @@
   </details>
 {/if}
 
-{#if $streamStats.cursorDebug !== null}
-  {@const c = $streamStats.cursorDebug}
-  <details open class="info-debug">
-    <summary>Cursor debug</summary>
-    <dl class="stats">
-      <dt>Messages</dt><dd>{c.count}</dd>
-      <dt>Last kind</dt><dd>{c.kind}</dd>
-      <dt>Overlay display</dt><dd>{c.overlayDisplay || '(empty)'}</dd>
-      <dt>Overlay size</dt><dd>{c.imgW}×{c.imgH}</dd>
-      <dt>Transform</dt><dd class="mono">{c.overlayTransform || '(empty)'}</dd>
-    </dl>
-  </details>
-{/if}
-
 <dl class="stats">
   <dt>Connection</dt>
   <dd>{$streamStats.connectionState}</dd>
@@ -99,11 +85,5 @@
     color: #aaa;
     cursor: pointer;
     margin-bottom: 6px;
-  }
-
-  .mono {
-    font-family: monospace;
-    font-size: 11px;
-    word-break: break-all;
   }
 </style>

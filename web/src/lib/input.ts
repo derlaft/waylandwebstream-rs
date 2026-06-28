@@ -1,12 +1,17 @@
-// Touch/pointer/wheel input, normalized against the canvas's *live*
-// bounding rect on every event (never a cached rect) so input stays
-// aligned through resizes, rotation, and the side panel opening.
+// Touch/pointer/wheel input, normalized against the canvas's bounding rect so
+// input stays aligned through resizes, rotation, and scroll. The rect is read
+// from a ResizeObserver-backed cache (see lib/rectCache.ts) rather than live on
+// every event: pointermove/wheel fire 60-120x/sec and each live read forces a
+// synchronous layout on the same canvas the decoder paints to. The cache is
+// refreshed exactly when the box changes, so coordinates stay just as accurate.
 import type { ClientMessage, PointerPoint, TouchPoint } from './protocol';
+import { observeRect } from './rectCache';
 
 export function attachInput(
   canvas: HTMLCanvasElement,
   sendControl: (msg: ClientMessage) => void,
 ): () => void {
+  const rectCache = observeRect(canvas);
   // Converts a TouchList to normalized [0,1] coordinates.
   //
   // `clampOutOfBounds = false` (touchstart only): drops contacts whose
@@ -20,7 +25,7 @@ export function attachInput(
   // combine with real ones to look like multi-touch to the remote app --
   // that is what causes spurious context menus on the next single tap.
   function normalizeTouches(touchList: TouchList, clampOutOfBounds: boolean): TouchPoint[] {
-    const rect = canvas.getBoundingClientRect();
+    const rect = rectCache.get();
     const vv = window.visualViewport;
     const w = vv && vv.width > 0 ? vv.width : rect.width;
     const h = vv && vv.height > 0 ? vv.height : rect.height;
@@ -77,7 +82,7 @@ export function attachInput(
   canvas.addEventListener('touchcancel', onTouchCancel, { passive: false });
 
   function normalizedPointer(e: PointerEvent): PointerPoint {
-    const rect = canvas.getBoundingClientRect();
+    const rect = rectCache.get();
     const x = (e.clientX - rect.left) / rect.width;
     const y = (e.clientY - rect.top) / rect.height;
     return {
@@ -146,7 +151,7 @@ export function attachInput(
 
   const onWheel = (e: WheelEvent): void => {
     e.preventDefault();
-    const rect = canvas.getBoundingClientRect();
+    const rect = rectCache.get();
     const x = Math.min(Math.max((e.clientX - rect.left) / rect.width, 0), 1);
     const y = Math.min(Math.max((e.clientY - rect.top) / rect.height, 0), 1);
     const { deltaX, deltaY } = normalizedWheelDelta(e, rect.height);
@@ -217,5 +222,6 @@ export function attachInput(
     canvas.removeEventListener('blur', releaseAllKeys);
     window.removeEventListener('blur', releaseAllKeys);
     document.removeEventListener('visibilitychange', onVisibilityChange);
+    rectCache.dispose();
   };
 }

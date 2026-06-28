@@ -1,16 +1,8 @@
 // Svelte store for connection/decode diagnostics, fed by stream.ts and
-// control.ts, and rendered by StatsPanel.svelte.
+// client.ts, and rendered by StatsPanel.svelte.
 import { writable } from 'svelte/store';
 
 export type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'closed' | 'error';
-
-export interface CursorDebug {
-  kind: string;         // last received cursor kind
-  count: number;        // total cursor messages received
-  overlayDisplay: string; // current cursorOverlay.style.display
-  overlayTransform: string; // current cursorOverlay.style.transform
-  imgW: number; imgH: number; // overlay dimensions
-}
 
 /// How the video is being decoded and painted, for the debug panel. Lets you
 /// confirm at a glance which path a given browser/device actually took --
@@ -28,7 +20,6 @@ export interface VideoPipelineInfo {
 
 export interface StreamStats {
   connectionState: ConnectionState;
-  cursorDebug: CursorDebug | null;
   videoPipeline: VideoPipelineInfo | null;
   /// Glass-to-glass: ping round-trip (network + whole server pipeline,
   /// measured via the embedded-timestamp ping/echo in stream.ts) plus this
@@ -41,7 +32,7 @@ export interface StreamStats {
   burstCount: number;
   maxDecodeQueue: number;
   maxFrameBytes: number;
-  /// Current encoder target bitrate reported by the server over `/ws`. 0
+  /// Current encoder target bitrate reported by the server over `/client`. 0
   /// means "not yet known" or "not applicable" (constant-quality/CRF mode).
   bitrateBps: number;
   /// Average time from feeding a chunk to `decoder.decode()` until its frame
@@ -56,7 +47,6 @@ export interface StreamStats {
 
 const initialStats: StreamStats = {
   connectionState: 'connecting',
-  cursorDebug: null,
   videoPipeline: null,
   endToEndLatencyMs: 0,
   resolution: null,
@@ -88,10 +78,6 @@ export function setVideoPipelineInfo(info: VideoPipelineInfo): void {
 
 export function reportEndToEndLatency(ms: number): void {
   streamStats.update((s) => ({ ...s, endToEndLatencyMs: ms }));
-}
-
-export function setCursorDebug(d: CursorDebug): void {
-  streamStats.update((s) => ({ ...s, cursorDebug: d }));
 }
 
 export function setBitrate(bps: number): void {

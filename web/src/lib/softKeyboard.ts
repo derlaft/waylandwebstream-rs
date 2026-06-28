@@ -14,32 +14,10 @@
 // (see src/input/keyboard.rs). Characters with no US-layout key (emoji,
 // non-Latin) can't be expressed this way and are dropped -- a future
 // zwp_virtual_keyboard_v1 path could carry full Unicode.
-import { writable } from 'svelte/store';
 import type { ClientMessage } from './protocol';
+import { persisted } from './persisted';
 
 // ─── Persisted settings ──────────────────────────────────────────────────────
-
-/// A `writable` that mirrors itself into localStorage so the on-screen
-/// keyboard preference and the floating button's position survive a reload.
-/// Falls back to `initial` if storage is unavailable or holds garbage.
-function persisted<T>(key: string, initial: T) {
-  let start = initial;
-  try {
-    const raw = localStorage.getItem(key);
-    if (raw !== null) start = JSON.parse(raw) as T;
-  } catch {
-    /* storage blocked or value corrupt -- use the default */
-  }
-  const store = writable<T>(start);
-  store.subscribe((value) => {
-    try {
-      localStorage.setItem(key, JSON.stringify(value));
-    } catch {
-      /* ignore: a failed persist shouldn't break input */
-    }
-  });
-  return store;
-}
 
 /// Whether the floating on-screen-keyboard button is shown. Off by default;
 /// toggled from the side panel (KeyboardToggleButton).

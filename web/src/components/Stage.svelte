@@ -5,8 +5,9 @@
   import { ClipboardBridge } from '../lib/clipboard';
   import { attachInput } from '../lib/input';
   import type { ClientMessage, CursorUpdate } from '../lib/protocol';
+  import { observeRect } from '../lib/rectCache';
   import { onScreenKeyboardEnabled } from '../lib/softKeyboard';
-  import { setCursorDebug, streamStats } from '../lib/stats';
+  import { streamStats } from '../lib/stats';
   import { createVideoPipeline, type VideoPipeline } from '../lib/videoClient';
   import { Viewport } from '../lib/viewport';
   import OnScreenKeyboard from './OnScreenKeyboard.svelte';
@@ -19,7 +20,6 @@
   let cursorHotX = 0;
   let cursorHotY = 0;
   let cursorSurfaceActive = false;
-  let cursorMsgCount = 0;
 
   let client: ClientChannel | null = null;
   let clipboard: ClipboardBridge | null = null;
@@ -43,7 +43,6 @@
   // via a CSS transform updated in the pointermove handler, so the OS cursor
   // itself is always hidden (cursor:none on both canvas and .stage).
   function applyCursor(update: CursorUpdate): void {
-    cursorMsgCount++;
     if (update.kind === 'surface') {
       canvas.style.cursor = 'none';
       const raw = atob(update.rgba);
@@ -79,14 +78,6 @@
         canvas.style.cursor = 'none';
       }
     }
-    setCursorDebug({
-      kind: update.kind,
-      count: cursorMsgCount,
-      overlayDisplay: cursorOverlay.style.display,
-      overlayTransform: cursorOverlay.style.transform,
-      imgW: cursorOverlay.offsetWidth,
-      imgH: cursorOverlay.offsetHeight,
-    });
   }
 
   function teardown(): void {
@@ -166,9 +157,12 @@
     // input.ts's pointerdown handler).
     canvas.focus();
 
+    // Cached canvas rect for the per-move cursor-overlay positioning below;
+    // see lib/rectCache.ts for why this isn't read live on every pointermove.
+    const cursorRect = observeRect(canvas);
     const onMove = (e: PointerEvent) => {
       if (e.pointerType === 'touch') return;
-      const rect = canvas.getBoundingClientRect();
+      const rect = cursorRect.get();
       const x = e.clientX - rect.left;
       const y = e.clientY - rect.top;
       cursorOverlay.style.transform = `translate(${x - cursorHotX}px, ${y - cursorHotY}px)`;
@@ -207,6 +201,7 @@
       canvas.removeEventListener('pointerdown', onReconnectIntent);
       canvas.removeEventListener('touchstart', onReconnectIntent);
       canvas.removeEventListener('keydown', onReconnectIntent);
+      cursorRect.dispose();
     };
 
     window.addEventListener('beforeunload', teardown);

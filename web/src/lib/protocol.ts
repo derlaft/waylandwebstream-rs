@@ -60,9 +60,7 @@ export type ClientMessage =
   | { type: 'clipboard'; text: string }
   | {
       type: 'latency';
-      encoding_ms?: number;
       network_ms?: number;
-      jitter_buffer_ms?: number;
       decoding_ms?: number;
       total_ms: number;
       // Count of /client frame arrivals within ~3ms of the previous one
@@ -195,15 +193,16 @@ export function parseClipboardImage(payload: ArrayBuffer): { mime: string; bytes
 
 /// Decoded payload of a `MSG_VIDEO_FRAME` from the `/client` endpoint.
 /// Layout (after the 8-byte proto header, big-endian unless noted):
-///   bytes 0-3   : frame_id (u32 BE)
+///   bytes 0-3   : frame_id (u32 BE)            -- on the wire, not surfaced
 ///   bytes 4-11  : ping_echo_client_ts (f64 BE; 0.0 when flags & FLAG_HAS_PING == 0)
-///   bytes 12-19 : capture_to_encode_ms (f64 BE)
+///   bytes 12-19 : capture_to_encode_ms (f64 BE) -- on the wire, not surfaced
 ///   bytes 20..  : raw Annex-B H.264 NAL data
+///
+/// frame_id and capture_to_encode_ms are still sent by the server but the
+/// client doesn't read them today, so they're skipped rather than decoded.
 export interface VideoFramePayload {
   isKeyframe: boolean;
-  frameId: number;
   pingEchoClientTs: number | null;
-  captureToEncodeMs: number;
   /** Annex-B H.264 data starting from offset 20 of the framed payload. */
   data: Uint8Array;
 }
@@ -215,14 +214,10 @@ export function parseVideoFramePayload(payload: ArrayBuffer, flags: number): Vid
   const view = new DataView(payload);
   const isKeyframe = (flags & FLAG_KEYFRAME) !== 0;
   const hasPing = (flags & FLAG_HAS_PING) !== 0;
-  const frameId = view.getUint32(0, false);
   const pingRaw = view.getFloat64(4, false);
-  const captureToEncodeMs = view.getFloat64(12, false);
   return {
     isKeyframe,
-    frameId,
     pingEchoClientTs: hasPing ? pingRaw : null,
-    captureToEncodeMs,
     data: new Uint8Array(payload, 20, payload.byteLength - 20),
   };
 }

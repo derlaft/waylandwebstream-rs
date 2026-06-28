@@ -17,28 +17,8 @@
 //      * on tab focus/visibility, a proactive read WHEN clipboard-read is
 //        already granted (Chrome), so the remote clipboard stays current and
 //        right-click → Paste inside the remote works, not just Ctrl+V.
-import { writable } from 'svelte/store';
 import type { ClientMessage } from './protocol';
-
-/// A `writable` mirrored into localStorage so the preference survives reloads.
-function persisted<T>(key: string, initial: T) {
-  let start = initial;
-  try {
-    const raw = localStorage.getItem(key);
-    if (raw !== null) start = JSON.parse(raw) as T;
-  } catch {
-    /* storage blocked or corrupt -- use the default */
-  }
-  const store = writable<T>(start);
-  store.subscribe((value) => {
-    try {
-      localStorage.setItem(key, JSON.stringify(value));
-    } catch {
-      /* ignore */
-    }
-  });
-  return store;
-}
+import { persisted } from './persisted';
 
 /// Whether clipboard sync is active. On by default.
 export const clipboardSyncEnabled = persisted('clipboard.enabled', true);

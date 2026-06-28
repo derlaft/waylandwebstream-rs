@@ -9,12 +9,6 @@
 import { writable } from 'svelte/store';
 import type { ClientMessage } from './protocol';
 
-/// Default `1`; a future `2` halves render resolution further for
-/// low-power links (the deferred 2x client-side scale button). Exposed as
-/// a store so that button can flip it later without any other module
-/// changing.
-export const scaleFactor = writable(1);
-
 /// When `true`, render resolution is multiplied by devicePixelRatio so the
 /// stream is rendered at the display's native device-pixel resolution
 /// instead of CSS px -- crisp on HiDPI screens at the cost of encoding
@@ -52,11 +46,11 @@ function getViewportCssSize(): { width: number; height: number } {
   return { width: window.innerWidth, height: window.innerHeight };
 }
 
-export function computeRenderResolution(scale: number, pixelRatio = 1): RenderResolution {
+export function computeRenderResolution(pixelRatio = 1): RenderResolution {
   const { width, height } = getViewportCssSize();
   return {
-    width: Math.min(floorToAlignment((width * pixelRatio) / scale), MAX_RENDER_WIDTH),
-    height: Math.min(floorToAlignment((height * pixelRatio) / scale), MAX_RENDER_HEIGHT),
+    width: Math.min(floorToAlignment(width * pixelRatio), MAX_RENDER_WIDTH),
+    height: Math.min(floorToAlignment(height * pixelRatio), MAX_RENDER_HEIGHT),
   };
 }
 
@@ -69,11 +63,9 @@ export class Viewport {
   private readonly canvas: HTMLCanvasElement;
   private readonly sendControl: (msg: ClientMessage) => void;
 
-  private currentScale = 1;
   private useNative = false;
   private lastSent: RenderResolution | null = null;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
-  private unsubscribeScale: (() => void) | null = null;
   private unsubscribeNative: (() => void) | null = null;
 
   constructor(opts: ViewportOptions) {
@@ -82,10 +74,6 @@ export class Viewport {
   }
 
   start(): void {
-    this.unsubscribeScale = scaleFactor.subscribe((scale) => {
-      this.currentScale = scale;
-      this.update();
-    });
     this.unsubscribeNative = nativeResolution.subscribe((native) => {
       this.useNative = native;
       this.update();
@@ -105,8 +93,6 @@ export class Viewport {
   }
 
   stop(): void {
-    this.unsubscribeScale?.();
-    this.unsubscribeScale = null;
     this.unsubscribeNative?.();
     this.unsubscribeNative = null;
 
@@ -137,14 +123,14 @@ export class Viewport {
     // the window moves between monitors of different DPI, both of which also
     // fire window 'resize', so this path re-runs and re-sends as needed.
     const pixelRatio = this.useNative ? window.devicePixelRatio || 1 : 1;
-    const render = computeRenderResolution(this.currentScale, pixelRatio);
+    const render = computeRenderResolution(pixelRatio);
     const viewport = getViewportCssSize();
 
     // Canvas CSS size always fills the full viewport edge-to-edge, even
     // though the render resolution sent to the server is a few px smaller
-    // (the /16 flooring, plus whatever scaleFactor subtracts) -- the
-    // browser stretches the canvas's bitmap to whatever CSS box it's
-    // given for free, so there's no visual cost. Sizing the CSS box to
+    // (the /16 flooring) -- the browser stretches the canvas's bitmap to
+    // whatever CSS box it's given for free, so there's no visual cost.
+    // Sizing the CSS box to
     // `render` instead, as before, left a sub-16px dead strip at the
     // right/bottom edge of the viewport that was part of `.stage` but
     // outside the canvas -- and so outside every touch/pointer listener,

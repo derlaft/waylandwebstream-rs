@@ -104,9 +104,10 @@ describe('parseVideoFramePayload', () => {
     const parsed = parseVideoFramePayload(payload, flags);
 
     expect(parsed.isKeyframe).toBe(true);
-    expect(parsed.frameId).toBe(0x0102_0304);
     expect(parsed.pingEchoClientTs).toBeCloseTo(12345.6789);
-    expect(parsed.captureToEncodeMs).toBeCloseTo(8.5);
+    // frame_id (offset 0) and capture_to_encode_ms (offset 12) are still on the
+    // wire (written by buildVideoPayload above) but the client skips them, so the
+    // data starting at offset 20 is what proves the parser used the right offset.
     expect(Array.from(parsed.data)).toEqual([0x67, 0x42, 0x00, 0x1F, 0xAA, 0xBB, 0xCC]);
   });
 
@@ -124,7 +125,6 @@ describe('parseVideoFramePayload', () => {
     const parsed = parseVideoFramePayload(payload, flags);
 
     expect(parsed.isKeyframe).toBe(false);
-    expect(parsed.frameId).toBe(7);
     expect(parsed.pingEchoClientTs).toBeNull();
     expect(Array.from(parsed.data)).toEqual([0x41, 0x9A]);
   });

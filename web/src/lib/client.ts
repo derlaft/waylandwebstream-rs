@@ -1,5 +1,5 @@
-// Owns the `/client` unified WebSocket. Combines the legacy /ws + /stream +
-// /audio endpoints into one connection using the 8-byte proto framing
+// Owns the `/client` unified WebSocket -- the single connection carrying
+// video, audio, and control in both directions using the 8-byte proto framing
 // (see src/proto.rs and lib/protocol.ts):
 //
 //   - sends ClientMessage as MSG_CLIENT_MSG frames (JSON payload)
