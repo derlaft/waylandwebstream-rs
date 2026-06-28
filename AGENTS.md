@@ -13,18 +13,32 @@ commits, comments), it is gone, not optional.
 
 A single binary that runs a headless Smithay Wayland compositor, encodes its
 framebuffer to H.264 with FFmpeg/x264, and ships each frame over a **binary
-WebSocket** (`/stream`) to a browser that decodes it with **WebCodecs** into a
-`<canvas>`. Input/resize/latency ride a second JSON WebSocket (`/ws`). The
-Svelte client is built by `build.rs` and embedded with `rust-embed`. There is
-no WebRTC, no RTP, no signaling negotiation, no external services.
+WebSocket** to a browser that decodes it with **WebCodecs** into a `<canvas>`.
+Audio is captured from PipeWire and Opus-encoded. The Svelte client is built by
+`build.rs` and embedded with `rust-embed`. There is no WebRTC, no RTP, no
+signaling negotiation, no external services.
+
+The modern web client uses a **single unified `/client` WebSocket** that
+multiplexes video, audio, and control (input/resize/latency/**clipboard**) in
+one connection, framed by `src/proto.rs` (8-byte header + payload; `MSG_*`
+type bytes). The legacy split endpoints (`/stream` video, `/audio` audio, `/ws`
+JSON control) still exist and share the same handlers, but new work should
+target `/client`.
 
 ## Architecture & data flow
 
 ```
 Wayland client → compositor render() → mpsc → encoder thread (x264)
-  → broadcast → /stream WS → browser VideoDecoder → canvas
-browser input → /ws WS → mpsc → compositor seat injection
+  → broadcast → /client (or /stream) WS → browser VideoDecoder → canvas
+PipeWire → audio thread (Opus) → broadcast → /client (or /audio) WS → browser
+browser input/clipboard → /client (or /ws) WS → mpsc → compositor seat injection
+nested-compositor selection ↔ data-control client (src/clipboard.rs) ↔ browser
 ```
+
+An **optional GL/EGL compositor + VA-API encoder** path also exists
+(`--compositor gl` / `--encoder vaapi`, with linux-dmabuf import); the
+SHM-copy + x264 path described below is the default and what runs on the
+GPU-less dev box.
 
 - **Two execution domains.** The compositor + render loop is **synchronous**
   and owns `CompositorState` on one thread (Smithay/calloop is not `Send`).
@@ -35,6 +49,9 @@ browser input → /ws WS → mpsc → compositor seat injection
   **`src/server.rs`** is the HTTP/WS front door (`SignalingMessage` /
   `ServerMessage` are the wire protocol). **`src/compositor/state.rs`** is the
   whole compositor. **`src/encoder/mod.rs`** is the encoder thread.
+  **`src/audio.rs`** is the PipeWire→Opus thread, **`src/session.rs`** spawns
+  the `-- <cmd>` app and discovers a nested compositor's socket, and
+  **`src/clipboard.rs`** is the data-control clipboard bridge.
 
 ## Hard-won gotchas (read before touching these areas)
 
@@ -108,6 +125,17 @@ browser input → /ws WS → mpsc → compositor seat injection
   `encode_video_frame`): `[type:u8][frame_id:u32 BE][has_ping:u8][ping_ts:f64
   BE][Annex-B H.264]`, header = 14 bytes. SPS/PPS are inline on every keyframe
   (`repeat_headers=1`, `annex_b=1`), so the decoder needs no `description`.
+- **The unified `/client` endpoint uses `src/proto.rs` framing**, *not* the
+  `/stream` layout: 8-byte header `[msg_type:u8][flags:u8][reserved:u16][len:u32
+  LE]` + payload. `MSG_VIDEO_FRAME`/`MSG_AUDIO_FRAME`/`MSG_CONTROL` go
+  server→client, `MSG_CLIENT_MSG` (JSON `SignalingMessage`) and
+  `MSG_CLIPBOARD_IMAGE`/`MSG_CLIENT_CLIPBOARD_IMAGE` (binary clipboard images)
+  both ways. The TS side mirrors it in `web/src/lib/protocol.ts` — keep the two
+  in lockstep byte-for-byte. `ServerMessage::Cursor`/`Bitrate`/`Codec`/
+  `Clipboard` ride `MSG_CONTROL` as JSON.
+- **Audio**: PipeWire loopback → Opus (96 kbps, 20 ms) on a dedicated thread
+  (`src/audio.rs`), broadcast like video. `audio_tx` is `None` when PipeWire
+  fails to start — the endpoint just never produces frames, never an error.
 - **The video broadcast channel is intentionally tiny (cap 3).** A slow client
   should `Lagged`-skip to a recent frame and resync on the next keyframe, never
   build a backlog of stale P-frames. Don't enlarge it to "fix" lag.
@@ -143,8 +171,14 @@ browser input → /ws WS → mpsc → compositor seat injection
 - **The client clamps resize to a hardcoded 3840×2160** because the server
   doesn't advertise (or enforce) `max_resolution` over the wire. Both halves
   are sub-16-aligned (`/16`) for H.264.
-- Reconnect (auto, with backoff) is in `backoff.ts` + the socket handlers;
-  `onclose` schedules it (never `onerror`, which always precedes close).
+- **Reconnect is manual, not automatic** (changed from the old backoff
+  auto-reconnect; `backoff.ts` is gone). The server allows **one client at a
+  time** and kicks the previous connection when a new one arrives, so an
+  auto-reconnecting client would fight a second tab forever. `ClientChannel`
+  stays `closed` on a dropped/kicked socket and only `reconnect()`s on the next
+  canvas interaction (Stage wires pointerdown/touchstart/keydown); `close()`
+  (intentional teardown) never reconnects. `onClosed` only fires on an
+  unexpected close, so the overlay can prompt the user.
 - **`decodeQueueSize > N` fires on harmless bursts.** A tab being refocused
   releases a flood of buffered frames all at once; a network clump delivers
   several P-frames within a millisecond. Both spike `decodeQueueSize` briefly
@@ -170,6 +204,97 @@ browser input → /ws WS → mpsc → compositor seat injection
   hides the real bottleneck. Track blit time in a separate sample array and
   surface it in both the UI and the server's latency report.
 
+### Clipboard bridge (`src/clipboard.rs` + `web/src/lib/clipboard.ts`)
+
+Took many commits across both sides; the subtleties:
+
+- **Why a separate data-control client at all.** Sessions usually run a *nested*
+  compositor (see below), so our compositor's only Wayland client is that nest
+  — the apps' clipboard lives in the nest and never reaches our own
+  `wl_data_device`. The bridge instead connects, as a **`data-control` client**,
+  to the *nested* compositor's socket (focus-independent clipboard access, what
+  clipboard managers use). No daemon: it's an in-process thread.
+- **ext vs wlr.** Prefer `ext-data-control-v1`, fall back to legacy
+  `zwlr-data-control`. labwc 0.8/wlroots 0.18 only has wlr; KDE 6 / GNOME ≥ 49 /
+  recent wlroots have ext. **cage exposes neither → no clipboard under cage.**
+- **Socket discovery (`src/session.rs`)** must test **connectability, not just
+  filename**: the nest reuses the conventional `wayland-0`, and a stale
+  `wayland-0` *file* from a prior run would defeat a name-only diff — but it
+  isn't connectable. Match `wayland-<digits>` only (ours is `wayland-wws-*`,
+  per-app proxies are `wayland-proxy-*`), exclude what was already live before
+  spawn.
+- **Event-driven, no polling.** The device's `selection` event drives
+  remote→device. It runs on a calloop loop (`calloop-wayland-source`) with a
+  channel for device→remote, so it stays single-threaded.
+- **The `owning` flag prevents a loop *and* a self-deadlock.** After we
+  `set_selection` (device→remote) the compositor echoes a `selection` event for
+  our own source; reading it would loop, and worse, deadlock — we'd be both the
+  pipe's writer (source `send`) and its blocking reader. So skip reads while we
+  own the selection; clear ownership on the source's `cancelled` event (someone
+  else took the selection) → the next `selection` is a real remote change.
+- Dedup by **raw bytes** (not MIME label); 8 MiB cap both directions.
+- **Browser permission traps (the part that caused regressions):**
+  - Never read the device clipboard on a **mouse/keyboard** gesture — Firefox/
+    Safari pop a "Paste" affordance that hijacks the click. device→remote
+    triggers are: the **`paste` event** (Ctrl+V; `clipboardData`, no prompt), a
+    **touch** gesture (mobile, armed once per focus), and a proactive read on
+    focus **only when `clipboard-read` is already granted** (Chrome; gated via
+    `navigator.permissions` so Firefox/Safari don't pop menus). The proactive
+    read is what makes the remote's own right-click→Paste see the device
+    clipboard, not just browser Ctrl+V.
+  - **Read before flushing a deferred write.** A `writeText`/`write` consumes
+    the gesture's transient activation, so a read *after* it throws
+    `NotAllowedError` — this silently broke mobile paste until reordered.
+- **Drag-and-drop and text-input-v3 "auto-show keyboard" are NOT bridgeable**
+  through the nested model (data-control is clipboard-only; DnD/text-input need
+  focus/grabs the nest won't forward). They'd require running apps as direct
+  clients of our compositor.
+
+### On-screen keyboard (`web/src/lib/softKeyboard.ts` + `OnScreenKeyboard.svelte`)
+
+- **Mobile soft keyboards don't emit usable `KeyboardEvent.code`** (Android
+  GBoard → `keyCode 229`/"Unidentified"). So a hidden `<textarea>` captures
+  input and we **diff its `value`** on `input` to derive keystrokes. Do *not*
+  transcribe `beforeinput` snapshots — IME composition fires *cumulative*
+  snapshots and would duplicate ("hello"→h, he, hel…). Diff output is mapped to
+  US-layout `code`+shift and reuses the normal key pipeline (works in every app
+  incl. XWayland; no Unicode beyond the US layout).
+- **The floating button must be non-focusable** (`<div role="button">`, plus
+  `preventDefault` on pointerdown). A focusable control grabs focus on tap and
+  blurs the hidden field, closing the keyboard the instant it opens.
+- **The hidden field must NOT be `aria-hidden`** — Chrome blocks and *removes*
+  focus from an aria-hidden element, so the keyboard opens then closes.
+- **`pointercancel` ≠ tap.** The browser fires it when it claims the gesture as
+  a scroll; treating it like `pointerup` made scrolling over the button pop the
+  keyboard.
+
+### Sessions & nested compositors (`src/session.rs`)
+
+- The `-- <cmd>` session can be a single app *or* a nested compositor hosting a
+  whole desktop (`-- labwc`, `-- sway`, `-- cage -- firefox`), set
+  `WLR_BACKENDS=wayland` so it nests into our headless display. The nest is a
+  **single opaque surface** to us — we always inject input into that one
+  surface; what it does internally is downstream.
+- **A misbehaving in-app dialog (e.g. Firefox's file chooser) can freeze input
+  inside the nest and it is NOT our bug.** Verified: our compositor still
+  delivers every touch (`windows=1, surface=true`) during the freeze; the
+  in-app GTK modal grabs input. The fix is environmental — install
+  `xdg-desktop-portal` + a backend so the chooser is a separate portal window
+  rather than a grabbing modal.
+
+### Mobile touch (`src/input/touch.rs`, 6 commits to get right)
+
+- **1:1 coordinate mapping.** `surface_at` passes compositor coords straight
+  through as surface-local (both SW and GL renderers clip 1:1, never scale). An
+  old bbox-derived scale factor delivered touches up to ~3.3× off on the first
+  mobile page load.
+- **No phantom touches across sessions.** On `/client` disconnect the server
+  sends `TouchEvent::Cancel` so the next session doesn't inherit active
+  contacts; `touchcancel` clears **all** active touches (the browser's
+  changedTouches list can be incomplete when contacts went off-screen).
+- The client normalizes touch coords against **`visualViewport`** (accounts for
+  mobile browser chrome / soft keyboard), not `innerWidth/Height`.
+
 ## Build & test
 
 - `cargo build` runs `build.rs` → `npm ci && npm run build` in `web/`, embeds
@@ -183,9 +308,15 @@ browser input → /ws WS → mpsc → compositor seat injection
 
 ## Conventions
 
-- Keep the **wire protocol** (`SignalingMessage`/`ServerMessage` in
-  `src/server.rs`, mirrored in `web/src/lib/protocol.ts`) in lockstep across
-  both sides; it's the contract between binary and bundle.
+- Keep the **wire protocol** in lockstep across both sides; it's the contract
+  between binary and bundle: `SignalingMessage`/`ServerMessage` in
+  `src/server.rs` + the binary framing/`MSG_*` constants and clipboard-image
+  payload in `src/proto.rs`, all mirrored in `web/src/lib/protocol.ts`.
+- **Logging honors `RUST_LOG`** via `EnvFilter` (`src/main.rs`; it was once
+  hardcoded to `INFO`, which silently ignored `RUST_LOG` — don't reintroduce
+  that). `info` is lifecycle-only; per-event/diagnostic logs (window map/unmap,
+  cursor, touch/pointer, clipboard) are `debug`. Trace input/clipboard with
+  `RUST_LOG=info,waylandwebstream=debug`.
 - Prefer adding CLI knobs in `src/config.rs` (clap) over hardcoding.
 - This project links FFmpeg/x264 and is **AGPL-3.0**; the resulting binary may
   carry GPL terms depending on the FFmpeg build.
