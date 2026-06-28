@@ -611,7 +611,7 @@ pub(crate) fn select_h264_level(width: u32, height: u32, framerate: u32) -> u8 {
 /// Formats a level_idc as the dotted string x264's `level` option expects,
 /// e.g. 31 -> "3.1", 40 -> "4".
 pub(crate) fn h264_level_option(level_idc: u8) -> String {
-    if level_idc % 10 == 0 {
+    if level_idc.is_multiple_of(10) {
         (level_idc / 10).to_string()
     } else {
         format!("{}.{}", level_idc / 10, level_idc % 10)
@@ -728,6 +728,7 @@ pub(crate) fn create_input_frame(width: u32, height: u32) -> ffmpeg::frame::Vide
 }
 
 /// Encode a single frame
+#[allow(clippy::too_many_arguments)] // per-frame encode params; grouping them hurts readability
 fn encode_frame(
     encoder: &mut ffmpeg::encoder::Video,
     scaler: &mut ffmpeg::software::scaling::Context,
@@ -754,6 +755,11 @@ fn encode_frame(
             expected_len
         );
     }
+    // SAFETY: `input_frame` is a valid AVFrame owned by the ffmpeg wrapper, so
+    // its pointer is non-null and we hold it exclusively (`&mut`). The bounds
+    // check above guarantees `raw_frame.data` holds at least one full BGRA
+    // image, and it outlives this call, so pointing the frame's plane at it
+    // with stride `width * 4` is in-bounds for the subsequent swscale read.
     unsafe {
         let ptr = input_frame.as_mut_ptr();
         (*ptr).data[0] = raw_frame.data.as_ptr() as *mut u8;

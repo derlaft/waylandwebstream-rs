@@ -273,6 +273,7 @@ pub struct SignalingState {
 }
 
 impl SignalingState {
+    #[allow(clippy::too_many_arguments)] // wires up many independent channels; a params struct would just move the noise
     pub fn new(
         resize_tx: mpsc::Sender<(u32, u32)>,
         touch_tx: mpsc::Sender<TouchEvent>,
@@ -1264,13 +1265,21 @@ mod tests {
 
         pub struct CountingAllocator;
 
+        // SAFETY: this allocator only counts allocations and otherwise forwards
+        // verbatim to the std `System` allocator, so it upholds every GlobalAlloc
+        // invariant exactly as `System` does.
         unsafe impl GlobalAlloc for CountingAllocator {
             unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
                 ALLOC_COUNT.with(|c| c.set(c.get() + 1));
-                System.alloc(layout)
+                // SAFETY: `layout` is forwarded unchanged from our caller, which
+                // already upholds GlobalAlloc::alloc's requirements.
+                unsafe { System.alloc(layout) }
             }
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-                System.dealloc(ptr, layout)
+                // SAFETY: `ptr`/`layout` come straight from our caller and satisfy
+                // GlobalAlloc::dealloc's contract (allocated by this allocator,
+                // which delegates to `System`).
+                unsafe { System.dealloc(ptr, layout) }
             }
         }
 

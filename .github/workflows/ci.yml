@@ -1,0 +1,59 @@
+# Continuous integration: format, lint, and test the workspace.
+#
+# NOTE: scaffolding only -- the repo owner wires this into GitHub Actions when
+# ready. It is written for ubuntu-latest and installs the native libraries that
+# smithay (wayland/gbm/egl/gl/pixman), ffmpeg-next (libav*), pipewire, and opus
+# link against, plus libclang for the *-sys bindgen steps and Node for the
+# build.rs web bundle.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Debug builds only -- the project's standing rule is to avoid --release
+  # (it triggers heavy rebuilds); see CLAUDE.local.md / AGENTS.md.
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang libclang-dev \
+            libwayland-dev libxkbcommon-dev \
+            libgbm-dev libegl1-mesa-dev libgles2-mesa-dev libdrm-dev \
+            libpixman-1-dev libudev-dev libinput-dev libseat-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
+            libavdevice-dev libswscale-dev libswresample-dev \
+            libpipewire-0.3-dev libopus-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build web bundle (consumed by build.rs / rust-embed)
+        working-directory: web
+        run: npm ci && npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace

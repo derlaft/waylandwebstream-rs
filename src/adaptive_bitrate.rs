@@ -49,7 +49,7 @@
 
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::encoder::EncoderControl;
 
@@ -290,10 +290,17 @@ impl AdaptiveBitrateController {
 
     async fn apply(&self, new_rate: usize) {
         info!("Adaptive bitrate: -> {} bps", new_rate);
-        let _ = self
+        // Control-plane send: a closed channel means the encoder thread is gone,
+        // so surface it rather than silently dropping the rate change.
+        if self
             .encoder_control_tx
             .send(EncoderControl::ChangeBitrate(new_rate))
-            .await;
+            .await
+            .is_err()
+        {
+            warn!("Adaptive bitrate: encoder control channel closed; rate change dropped");
+        }
+        // bitrate_tx is a telemetry watch; a missing receiver is benign.
         let _ = self.bitrate_tx.send(new_rate);
     }
 }

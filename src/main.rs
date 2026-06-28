@@ -1,3 +1,8 @@
+// See src/lib.rs for the rationale; the binary is a separate crate root and
+// needs its own copy of these lint attributes to cover its module tree.
+#![warn(unsafe_op_in_unsafe_fn)]
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 use anyhow::{Context, Result};
 use base64::prelude::*;
 use clap::Parser;
@@ -97,6 +102,8 @@ async fn main() -> Result<()> {
             _ = ctrl_c => info!("Received Ctrl+C, shutting down gracefully..."),
             _ = terminate => info!("Received SIGTERM, shutting down gracefully..."),
         }
+        // An Err here means every receiver is already gone (main loop exited
+        // first) -- the process is shutting down regardless, so it's benign.
         let _ = shutdown_tx.send(true);
     });
 
@@ -545,6 +552,9 @@ async fn main() -> Result<()> {
                 last_stage_log = std::time::Instant::now();
             }
 
+            // Fire-and-forget broadcast: with no client connected there are no
+            // subscribers, and a dropped frame is recovered by the next one --
+            // intentionally not logged per frame.
             let _ = video_tx.send(packet);
         }
     });
@@ -647,6 +657,8 @@ async fn main() -> Result<()> {
 
         // Forward any cursor update the compositor extracted this tick.
         if let Some(pending) = state.take_cursor_pending() {
+            // Fire-and-forget broadcast (see video_tx above): no subscribers
+            // when no client is connected; the next update supersedes a drop.
             let _ = cursor_tx.send(cursor_pending_to_update(pending));
         }
 
@@ -680,8 +692,12 @@ async fn main() -> Result<()> {
                 if keyframe_pending {
                     // new_client: server.rs already sent ForceKeyframe when
                     // the client connected, so this is a no-op there but
-                    // harmless to send twice.
-                    let _ = encoder_control_for_loop.try_send(EncoderControl::ForceKeyframe);
+                    // harmless to send twice. A full/closed control queue means
+                    // the keyframe request is lost (client stays corrupt until
+                    // the next one), so this control-plane send is worth a warn.
+                    if let Err(e) = encoder_control_for_loop.try_send(EncoderControl::ForceKeyframe) {
+                        warn!("Failed to request keyframe from encoder: {e}");
+                    }
                     keyframe_pending = false;
                 }
                 if let Some(captured_frame) = compositor_backend.render(&mut state, spare_buffers.pop()) {
@@ -697,7 +713,7 @@ async fn main() -> Result<()> {
                             // frame this tick.
                             dropped_frames += 1;
                             ticks_since_render += 1;
-                            if dropped_frames == 1 || dropped_frames % 30 == 0 {
+                            if dropped_frames == 1 || dropped_frames.is_multiple_of(30) {
                                 warn!(
                                     "Encoder queue full, dropped {} frame(s) so far",
                                     dropped_frames

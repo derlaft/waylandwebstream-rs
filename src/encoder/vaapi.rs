@@ -71,6 +71,9 @@ impl Drop for VaapiPipeline {
         // their own Drop impls -- only `Gpu`'s `frames_ref` is a raw ref this
         // type owns directly.
         if let VaapiPipeline::Gpu { frames_ref, .. } = self {
+            // SAFETY: `frames_ref` is the owned ref this variant holds (from
+            // `av_hwframe_ctx_alloc`); it's still live here, freed exactly once
+            // on drop, and null is tolerated by av_buffer_unref.
             unsafe { ffi::av_buffer_unref(frames_ref) };
         }
     }
@@ -111,6 +114,7 @@ impl VaapiEncoder {
     /// doesn't assume that -- see the comment in `build_pipeline` on why
     /// frames aren't reused (filter pool owns surface lifetime here, unlike
     /// `X264Encoder`'s `yuv_frame`).
+    #[allow(clippy::too_many_arguments)] // threads the filtergraph + per-frame encode state
     fn encode_cpu_frame(
         graph: &mut ffmpeg::filter::Graph,
         encoder: &mut ffmpeg::encoder::Video,
@@ -131,6 +135,11 @@ impl VaapiEncoder {
                 expected_len
             );
         }
+        // SAFETY: `as_mut_ptr` returns the live, non-null AVFrame this owned
+        // `bgra_frame` wraps; `raw_frame.data` was just length-checked above to
+        // be at least `expected_len`, so pointing data[0] at it with the
+        // matching stride stays in-bounds, and it outlives the synchronous
+        // `av_buffersrc_add_frame` copy below.
         unsafe {
             let ptr = bgra_frame.as_mut_ptr();
             (*ptr).data[0] = raw_frame.data.as_ptr() as *mut u8;
@@ -258,6 +267,8 @@ impl Drop for VaapiEncoder {
         // `pipeline` frees itself (including the refs it holds) via its own
         // Drop impl when this struct is dropped -- only the device ref this
         // struct created directly needs unreffing here.
+        // SAFETY: `device_ref` is the owned ref `create_device` produced; it's
+        // still live, freed exactly once here on drop, no aliasing.
         unsafe {
             ffi::av_buffer_unref(&mut self.device_ref);
         }
@@ -328,6 +339,7 @@ fn drain_filtergraph(
 /// feeds the result through `graph`'s `scale_vaapi=format=nv12` GPU colour
 /// conversion, and drains the encoder. No CPU pixel copy happens anywhere in
 /// this path.
+#[allow(clippy::too_many_arguments)] // threads the filtergraph + per-frame encode state
 fn encode_gpu_frame(
     frames_ref: *mut ffi::AVBufferRef,
     graph: &mut ffmpeg::filter::Graph,
@@ -341,15 +353,23 @@ fn encode_gpu_frame(
 ) -> Result<Vec<EncodedPacket>> {
     let src = drm_prime_frame_from_dmabuf(dmabuf, width, height)?;
 
+    // SAFETY: av_frame_alloc has no preconditions and returns null on OOM,
+    // which is checked immediately below.
     let mut mapped = unsafe { ffi::av_frame_alloc() };
     if mapped.is_null() {
         anyhow::bail!("av_frame_alloc failed for the mapped VAAPI frame");
     }
+    // SAFETY: `mapped` was just null-checked, so these field writes are
+    // in-bounds and exclusive; `frames_ref` is a live ref this encoder owns,
+    // and the fresh av_buffer_ref of it is owned by `mapped` from here on.
     unsafe {
         (*mapped).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
         (*mapped).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
     }
 
+    // SAFETY: `mapped` is the just-allocated VAAPI dst frame; `src` is the
+    // live DRM_PRIME frame `drm_prime_frame_from_dmabuf` returned, valid for
+    // this borrow; both stay alive across the call.
     let map_ret = unsafe {
         ffi::av_hwframe_map(
             mapped,
@@ -358,12 +378,16 @@ fn encode_gpu_frame(
         )
     };
     if map_ret < 0 {
+        // SAFETY: `mapped` is the owned frame allocated above; av_hwframe_map
+        // failed, so freeing it here (exactly once) is the right cleanup.
         unsafe { ffi::av_frame_free(&mut mapped) };
         anyhow::bail!("av_hwframe_map(DRM_PRIME -> VAAPI) failed: {}", ffmpeg::Error::from(map_ret));
     }
     // Safe wrapper takes ownership of `mapped` (frees it via Drop) -- same
     // type the Cpu path's `hw_frame` uses, so it can go through the
     // identical `Source::add`/buffersink drain code below.
+    // SAFETY: `mapped` is a valid, mapped, non-null AVFrame that nothing else
+    // owns; the wrapper takes sole ownership of it.
     let mapped_frame = unsafe { ffmpeg::frame::Video::wrap(mapped) };
 
     let mut in_ctx = graph
@@ -394,6 +418,9 @@ struct DrmFrameOwner {
 }
 
 unsafe extern "C" fn free_drm_frame_owner(opaque: *mut std::ffi::c_void, _data: *mut u8) {
+    // SAFETY: ffmpeg runs this callback exactly once, with the original
+    // `Box<DrmFrameOwner>` pointer passed to av_buffer_create, so reclaiming
+    // and dropping that box here frees it exactly once.
     drop(unsafe { Box::from_raw(opaque as *mut DrmFrameOwner) });
 }
 
@@ -425,6 +452,8 @@ fn drm_prime_frame_from_dmabuf(dmabuf: &Dmabuf, width: u32, height: u32) -> Resu
     .map(|m| m.len() as usize)
     .unwrap_or(0);
 
+    // Every `std::mem::zeroed()` below fills an unused trailing slot of a C
+    // AVDRM* descriptor; see the per-block SAFETY notes.
     let mut owner = Box::new(DrmFrameOwner {
         descriptor: Box::new(ffi::AVDRMFrameDescriptor {
             nb_objects: 1,
@@ -434,8 +463,14 @@ fn drm_prime_frame_from_dmabuf(dmabuf: &Dmabuf, width: u32, height: u32) -> Resu
                     size: object_size,
                     format_modifier: u64::from(format.modifier),
                 },
+                // SAFETY: AVDRMObjectDescriptor is C POD; all-zeroes is a valid
+                // initial state, and nb_objects=1 so ffmpeg never reads this slot.
                 unsafe { std::mem::zeroed() },
+                // SAFETY: AVDRMObjectDescriptor is C POD; all-zeroes is a valid
+                // initial state, and nb_objects=1 so ffmpeg never reads this slot.
                 unsafe { std::mem::zeroed() },
+                // SAFETY: AVDRMObjectDescriptor is C POD; all-zeroes is a valid
+                // initial state, and nb_objects=1 so ffmpeg never reads this slot.
                 unsafe { std::mem::zeroed() },
             ],
             nb_layers: 1,
@@ -449,13 +484,28 @@ fn drm_prime_frame_from_dmabuf(dmabuf: &Dmabuf, width: u32, height: u32) -> Resu
                             offset: offset as isize,
                             pitch: stride as isize,
                         },
+                        // SAFETY: AVDRMPlaneDescriptor is C POD; all-zeroes is a
+                        // valid initial state, and nb_planes=1 so ffmpeg never
+                        // reads this slot.
                         unsafe { std::mem::zeroed() },
+                        // SAFETY: AVDRMPlaneDescriptor is C POD; all-zeroes is a
+                        // valid initial state, and nb_planes=1 so ffmpeg never
+                        // reads this slot.
                         unsafe { std::mem::zeroed() },
+                        // SAFETY: AVDRMPlaneDescriptor is C POD; all-zeroes is a
+                        // valid initial state, and nb_planes=1 so ffmpeg never
+                        // reads this slot.
                         unsafe { std::mem::zeroed() },
                     ],
                 },
+                // SAFETY: AVDRMLayerDescriptor is C POD; all-zeroes is a valid
+                // initial state, and nb_layers=1 so ffmpeg never reads this slot.
                 unsafe { std::mem::zeroed() },
+                // SAFETY: AVDRMLayerDescriptor is C POD; all-zeroes is a valid
+                // initial state, and nb_layers=1 so ffmpeg never reads this slot.
                 unsafe { std::mem::zeroed() },
+                // SAFETY: AVDRMLayerDescriptor is C POD; all-zeroes is a valid
+                // initial state, and nb_layers=1 so ffmpeg never reads this slot.
                 unsafe { std::mem::zeroed() },
             ],
         }),
@@ -463,34 +513,50 @@ fn drm_prime_frame_from_dmabuf(dmabuf: &Dmabuf, width: u32, height: u32) -> Resu
     });
     let descriptor_ptr: *mut ffi::AVDRMFrameDescriptor = &mut *owner.descriptor;
 
+    // SAFETY: av_frame_alloc has no preconditions and returns null on OOM,
+    // which is checked immediately below.
     let raw = unsafe { ffi::av_frame_alloc() };
     if raw.is_null() {
         anyhow::bail!("av_frame_alloc failed for the DRM_PRIME source frame");
     }
+    // SAFETY: `raw` was just null-checked so the field writes are in-bounds and
+    // exclusive; `descriptor_ptr` points into `owner`'s heap-boxed descriptor,
+    // and av_buffer_create takes ownership of the `Box::into_raw(owner)` pointer
+    // it'll later hand to free_drm_frame_owner.
     unsafe {
         (*raw).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
         (*raw).width = width as i32;
         (*raw).height = height as i32;
         (*raw).data[0] = descriptor_ptr as *mut u8;
+        // Hold the owner box pointer separately: `data[0]` points at the inner
+        // descriptor allocation, but ffmpeg's opaque (and our failure reclaim)
+        // must be the *outer* DrmFrameOwner box, so we can't recover it from
+        // `data[0]` later.
+        let owner_raw = Box::into_raw(owner);
         (*raw).buf[0] = ffi::av_buffer_create(
             descriptor_ptr as *mut u8,
             std::mem::size_of::<ffi::AVDRMFrameDescriptor>(),
             Some(free_drm_frame_owner),
-            Box::into_raw(owner) as *mut std::ffi::c_void,
+            owner_raw as *mut std::ffi::c_void,
             0,
         );
         if (*raw).buf[0].is_null() {
             // av_buffer_create failed (allocation failure) before taking
             // ownership of `owner` -- reclaim and drop it ourselves so it
             // doesn't leak, since its callback will now never run.
-            let owner_ptr = (*raw).data[0] as *mut DrmFrameOwner;
-            drop(Box::from_raw(owner_ptr));
+            // SAFETY: `owner_raw` came from Box::into_raw just above and was not
+            // consumed (av_buffer_create returned null), so from_raw reclaims
+            // unique ownership exactly once. `raw` is a valid owned frame, freed
+            // once here.
+            drop(Box::from_raw(owner_raw));
             let mut raw = raw;
             ffi::av_frame_free(&mut raw);
             anyhow::bail!("av_buffer_create failed for the DRM_PRIME frame descriptor");
         }
     }
 
+    // SAFETY: `raw` is a fully-populated, non-null DRM_PRIME AVFrame with a
+    // valid buf[0]; the wrapper takes sole ownership and frees it via Drop.
     Ok(unsafe { ffmpeg::frame::Video::wrap(raw) })
 }
 
@@ -501,6 +567,9 @@ fn drm_prime_frame_from_dmabuf(dmabuf: &Dmabuf, width: u32, height: u32) -> Resu
 fn create_device(path: &str) -> Result<*mut ffi::AVBufferRef> {
     let device_path = std::ffi::CString::new(path).with_context(|| format!("invalid VAAPI device path {path:?}"))?;
     let mut device_ref: *mut ffi::AVBufferRef = std::ptr::null_mut();
+    // SAFETY: `&mut device_ref` and the null-terminated `device_path` C string
+    // are valid for the call; av_hwdevice_ctx_create writes the owned device
+    // ref into `device_ref` on success (ret >= 0), checked below.
     let ret = unsafe {
         ffi::av_hwdevice_ctx_create(
             &mut device_ref,
@@ -560,17 +629,35 @@ fn build_pipeline(config: &EncoderConfig, device_ref: *mut ffi::AVBufferRef) -> 
     hwupload_ctx.link(0, &mut scale_ctx, 0);
     scale_ctx.link(0, &mut out_ctx, 0);
 
-    graph.validate().context("failed to configure vaapi filtergraph")?;
+    finalize_vaapi_graph(graph, config, "")
+}
 
-    let out_ctx = graph
-        .get("out")
-        .context("vaapi filtergraph missing its \"out\" buffersink after validation")?;
+/// Shared tail of `build_pipeline`/`build_gpu_pipeline`: validate the linked
+/// graph, recover scale_vaapi's output hw_frames_ctx, and build the encoder
+/// from it. `label` distinguishes the two graphs in error messages (`""` for
+/// the CPU-upload graph, `"gpu "` for the zero-copy one). Split out so the
+/// delicate "borrowed, never-unref" frames_ctx handling lives in one place.
+fn finalize_vaapi_graph(
+    mut graph: ffmpeg::filter::Graph,
+    config: &EncoderConfig,
+    label: &str,
+) -> Result<(ffmpeg::filter::Graph, ffmpeg::encoder::Video)> {
+    graph
+        .validate()
+        .with_context(|| format!("failed to configure vaapi {label}filtergraph"))?;
+
+    let out_ctx = graph.get("out").with_context(|| {
+        format!("vaapi {label}filtergraph missing its \"out\" buffersink after validation")
+    })?;
     // scale_vaapi derives its own output hw_frames_ctx from hw_device_ctx
     // during graph.validate() above; this is the *only* public way to get
     // it back out (AVFilterLink::hw_frames_ctx isn't part of the public ABI
     // in this ffmpeg version -- it moved to a private internal struct).
     // Borrowed, not owned -- see the comment in create_vaapi_encoder on why
     // this must never be unreffed directly.
+    // SAFETY: `out_ctx.as_ptr()` is the live, validated buffersink filter
+    // context; the call only reads its link's hw_frames_ctx and returns a
+    // borrowed (not owned) pointer, null-checked below.
     let frames_ref = unsafe { ffi::av_buffersink_get_hw_frames_ctx(out_ctx.as_ptr()) };
     if frames_ref.is_null() {
         anyhow::bail!("scale_vaapi did not produce a hardware frames context");
@@ -596,10 +683,15 @@ fn build_gpu_pipeline(
     // conforms to -- not a pool. `av_hwframe_map` creates one real VA
     // surface per dmabuf import (see `encode_gpu_frame`); every mapped
     // frame just references this same frames context as its declared type.
+    // SAFETY: `device_ref` is a live owned device ref; av_hwframe_ctx_alloc
+    // returns a new owned ref or null (checked below).
     let input_frames_ref = unsafe { ffi::av_hwframe_ctx_alloc(device_ref) };
     if input_frames_ref.is_null() {
         anyhow::bail!("av_hwframe_ctx_alloc failed for the GPU input frames context");
     }
+    // SAFETY: `input_frames_ref` was just null-checked; its `data` points at a
+    // freshly-allocated, not-yet-initialized AVHWFramesContext, so these field
+    // writes (before av_hwframe_ctx_init) are in-bounds and exclusive.
     unsafe {
         let ctx = (*input_frames_ref).data as *mut ffi::AVHWFramesContext;
         (*ctx).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
@@ -610,9 +702,12 @@ fn build_gpu_pipeline(
         (*ctx).width = config.width as i32;
         (*ctx).height = config.height as i32;
     }
+    // SAFETY: `input_frames_ref` is the live, now-configured frames ctx ref.
     let init_ret = unsafe { ffi::av_hwframe_ctx_init(input_frames_ref) };
     if init_ret < 0 {
         let mut input_frames_ref = input_frames_ref;
+        // SAFETY: `input_frames_ref` is the owned ref allocated above; init
+        // failed, so free it exactly once here before bailing.
         unsafe { ffi::av_buffer_unref(&mut input_frames_ref) };
         anyhow::bail!("av_hwframe_ctx_init failed: {}", ffmpeg::Error::from(init_ret));
     }
@@ -637,15 +732,23 @@ fn build_gpu_pipeline(
     // options string) and takes its own `av_buffer_ref` of what we pass, so
     // `input_frames_ref` itself is only borrowed here.
     let cname = std::ffi::CString::new("in_gpu").unwrap();
+    // SAFETY: `graph.as_mut_ptr()` and `buffer_filter.as_ptr()` are live, and
+    // `cname` is a valid null-terminated C string outliving the call; returns
+    // a filter context owned by the graph, or null (checked below).
     let in_ctx_ptr = unsafe { ffi::avfilter_graph_alloc_filter(graph.as_mut_ptr(), buffer_filter.as_ptr(), cname.as_ptr()) };
     if in_ctx_ptr.is_null() {
         anyhow::bail!("avfilter_graph_alloc_filter(\"in_gpu\") failed");
     }
 
+    // SAFETY: av_buffersrc_parameters_alloc has no preconditions; returns an
+    // owned, av_malloc'd struct or null (checked below).
     let params = unsafe { ffi::av_buffersrc_parameters_alloc() };
     if params.is_null() {
         anyhow::bail!("av_buffersrc_parameters_alloc failed");
     }
+    // SAFETY: `params` was just null-checked, so the field writes are in-bounds
+    // and exclusive; `input_frames_ref` is a live ref that av_buffersrc_parameters_set
+    // below takes its own av_buffer_ref of (so it stays borrowed here).
     unsafe {
         (*params).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
         (*params).width = config.width as i32;
@@ -653,16 +756,24 @@ fn build_gpu_pipeline(
         (*params).time_base = ffi::AVRational { num: 1, den: config.framerate as i32 };
         (*params).hw_frames_ctx = input_frames_ref;
     }
+    // SAFETY: `in_ctx_ptr` is the live, not-yet-initialized buffer filter
+    // context; `params` is the valid struct populated just above.
     let params_ret = unsafe { ffi::av_buffersrc_parameters_set(in_ctx_ptr, params) };
+    // SAFETY: `params` was allocated by av_buffersrc_parameters_alloc and is no
+    // longer needed after the set call copied what it needs; freed once here.
     unsafe { ffi::av_free(params as *mut std::ffi::c_void) };
     if params_ret < 0 {
         anyhow::bail!("av_buffersrc_parameters_set failed: {}", ffmpeg::Error::from(params_ret));
     }
 
+    // SAFETY: `in_ctx_ptr` is the live filter context, configured via params
+    // above; initializing it with no options dict is valid here.
     let init_ret = unsafe { ffi::avfilter_init_dict(in_ctx_ptr, std::ptr::null_mut()) };
     if init_ret < 0 {
         anyhow::bail!("avfilter_init_dict(\"in_gpu\") failed: {}", ffmpeg::Error::from(init_ret));
     }
+    // SAFETY: `in_ctx_ptr` is a live, now-initialized filter context owned by
+    // `graph`; wrapping borrows it for the graph's lifetime.
     let mut in_ctx = unsafe { ffmpeg::filter::Context::wrap(in_ctx_ptr) };
 
     let mut out_ctx = graph
@@ -676,21 +787,7 @@ fn build_gpu_pipeline(
     in_ctx.link(0, &mut scale_ctx, 0);
     scale_ctx.link(0, &mut out_ctx, 0);
 
-    graph.validate().context("failed to configure vaapi gpu filtergraph")?;
-
-    let out_ctx = graph
-        .get("out")
-        .context("vaapi gpu filtergraph missing its \"out\" buffersink after validation")?;
-    // Same care as build_pipeline: borrowed, not owned -- take a fresh ref
-    // for the encoder, never unref this one directly (see the comment in
-    // create_vaapi_encoder).
-    let frames_ref = unsafe { ffi::av_buffersink_get_hw_frames_ctx(out_ctx.as_ptr()) };
-    if frames_ref.is_null() {
-        anyhow::bail!("scale_vaapi did not produce a hardware frames context");
-    }
-
-    let encoder = create_vaapi_encoder(config, frames_ref)?;
-
+    let (graph, encoder) = finalize_vaapi_graph(graph, config, "gpu ")?;
     Ok((input_frames_ref, graph, encoder))
 }
 
@@ -708,23 +805,38 @@ fn alloc_hw_filter(
     option: Option<(&str, &str)>,
 ) -> Result<ffmpeg::filter::Context> {
     let cname = std::ffi::CString::new(name).unwrap();
+    // SAFETY: `graph.as_mut_ptr()` and `filter.as_ptr()` are live, and `cname`
+    // is a valid null-terminated C string outliving the call; returns a filter
+    // context owned by the graph, or null (checked below).
     let ctx_ptr = unsafe { ffi::avfilter_graph_alloc_filter(graph.as_mut_ptr(), filter.as_ptr(), cname.as_ptr()) };
     if ctx_ptr.is_null() {
         anyhow::bail!("avfilter_graph_alloc_filter({name:?}) failed");
     }
+    // SAFETY: `ctx_ptr` was just null-checked (live, not-yet-initialized filter
+    // context); `device_ref` is a live owned ref, and the fresh av_buffer_ref
+    // of it becomes owned by the filter context.
     unsafe {
         (*ctx_ptr).hw_device_ctx = ffi::av_buffer_ref(device_ref);
     }
 
     let ret = match option {
+        // SAFETY: `ctx_ptr` is the live filter context; initializing with no
+        // options dict is valid.
         None => unsafe { ffi::avfilter_init_dict(ctx_ptr, std::ptr::null_mut()) },
         Some((key, value)) => {
             let mut dict = ffmpeg::Dictionary::new();
             dict.set(key, value);
+            // SAFETY: hands the dict's owned raw AVDictionary pointer out so it
+            // can be passed by `&mut` to avfilter_init_dict below; ownership is
+            // reclaimed via Dictionary::own afterwards.
             let mut raw = unsafe { dict.disown() };
+            // SAFETY: `ctx_ptr` is the live filter context; `&mut raw` is a
+            // valid AVDictionary pointer that the call may consume/modify.
             let ret = unsafe { ffi::avfilter_init_dict(ctx_ptr, &mut raw) };
             // Frees any options avfilter_init_dict left unconsumed, mirroring
             // create_encoder/open_with's Dictionary::own/disown round trip.
+            // SAFETY: `raw` is the (possibly reduced) AVDictionary the init
+            // call left behind; re-owning it frees any unconsumed options once.
             unsafe { ffmpeg::Dictionary::own(raw) };
             ret
         }
@@ -733,6 +845,8 @@ fn alloc_hw_filter(
         anyhow::bail!("avfilter_init_dict({name:?}) failed: {}", ffmpeg::Error::from(ret));
     }
 
+    // SAFETY: `ctx_ptr` is a live, now-initialized filter context owned by
+    // `graph`; wrapping borrows it for the graph's lifetime.
     Ok(unsafe { ffmpeg::filter::Context::wrap(ctx_ptr) })
 }
 
@@ -763,6 +877,9 @@ fn create_vaapi_encoder(config: &EncoderConfig, frames_ref: *mut ffi::AVBufferRe
     // fresh av_buffer_ref of it for the encoder (whose avcodec_free_context
     // will correctly unref *that* copy on drop) and never touch frames_ref
     // itself -- it stays borrowed, owned by the graph/link.
+    // SAFETY: `encoder.as_mut_ptr()` is the live, not-yet-opened encoder
+    // context; `frames_ref` is the live (borrowed) frames ctx, and the fresh
+    // av_buffer_ref of it becomes owned by the encoder (unreffed on its drop).
     unsafe {
         (*encoder.as_mut_ptr()).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
     }
@@ -823,11 +940,18 @@ mod tests {
             Err(_) => return false,
         };
 
+        // SAFETY: `device_ref` is a live owned device ref; returns a new owned
+        // frames ctx ref or null (checked below).
         let frames_ref = unsafe { ffi::av_hwframe_ctx_alloc(device_ref) };
         if frames_ref.is_null() {
+            // SAFETY: `device_ref` is the owned ref from create_device; free it
+            // once before returning.
             unsafe { ffi::av_buffer_unref(&mut device_ref) };
             return false;
         }
+        // SAFETY: `frames_ref` was just null-checked; its `data` points at a
+        // freshly-allocated, not-yet-initialized AVHWFramesContext, so these
+        // writes (before init) are in-bounds and exclusive.
         unsafe {
             let ctx = (*frames_ref).data as *mut ffi::AVHWFramesContext;
             (*ctx).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
@@ -835,10 +959,13 @@ mod tests {
             (*ctx).width = TEST_SIZE as i32;
             (*ctx).height = TEST_SIZE as i32;
         }
+        // SAFETY: `frames_ref` is the live, now-configured frames ctx ref.
         let init_ret = unsafe { ffi::av_hwframe_ctx_init(frames_ref) };
         if init_ret < 0 {
             let mut frames_ref = frames_ref;
+            // SAFETY: `frames_ref` is the owned ref allocated above; free once.
             unsafe { ffi::av_buffer_unref(&mut frames_ref) };
+            // SAFETY: `device_ref` is the owned ref from create_device; free once.
             unsafe { ffi::av_buffer_unref(&mut device_ref) };
             return false;
         }
@@ -856,7 +983,10 @@ mod tests {
         let result = create_vaapi_encoder(&probe_config, frames_ref).is_ok();
 
         let mut frames_ref = frames_ref;
+        // SAFETY: `frames_ref` is an owned ref; the encoder (if created) took
+        // its own ref of it, so freeing this one once here is correct.
         unsafe { ffi::av_buffer_unref(&mut frames_ref) };
+        // SAFETY: `device_ref` is the owned ref from create_device; free once.
         unsafe { ffi::av_buffer_unref(&mut device_ref) };
         result
     }
@@ -1138,6 +1268,8 @@ mod tests {
             .map(|m| m.len() as usize)
             .unwrap_or(0);
 
+        // Every `std::mem::zeroed()` below fills an unused trailing slot of a C
+        // AVDRM* descriptor; see the per-block SAFETY notes.
         let descriptor = Box::into_raw(Box::new(ffi::AVDRMFrameDescriptor {
             nb_objects: 1,
             objects: [
@@ -1146,8 +1278,14 @@ mod tests {
                     size: object_size,
                     format_modifier: u64::from(format.modifier),
                 },
+                // SAFETY: AVDRMObjectDescriptor is C POD; all-zeroes is valid and
+                // nb_objects=1 means ffmpeg never reads this slot.
                 unsafe { std::mem::zeroed() },
+                // SAFETY: AVDRMObjectDescriptor is C POD; all-zeroes is valid and
+                // nb_objects=1 means ffmpeg never reads this slot.
                 unsafe { std::mem::zeroed() },
+                // SAFETY: AVDRMObjectDescriptor is C POD; all-zeroes is valid and
+                // nb_objects=1 means ffmpeg never reads this slot.
                 unsafe { std::mem::zeroed() },
             ],
             nb_layers: 1,
@@ -1161,13 +1299,25 @@ mod tests {
                             offset: offset as isize,
                             pitch: stride as isize,
                         },
+                        // SAFETY: AVDRMPlaneDescriptor is C POD; all-zeroes is
+                        // valid and nb_planes=1 means ffmpeg never reads this slot.
                         unsafe { std::mem::zeroed() },
+                        // SAFETY: AVDRMPlaneDescriptor is C POD; all-zeroes is
+                        // valid and nb_planes=1 means ffmpeg never reads this slot.
                         unsafe { std::mem::zeroed() },
+                        // SAFETY: AVDRMPlaneDescriptor is C POD; all-zeroes is
+                        // valid and nb_planes=1 means ffmpeg never reads this slot.
                         unsafe { std::mem::zeroed() },
                     ],
                 },
+                // SAFETY: AVDRMLayerDescriptor is C POD; all-zeroes is valid and
+                // nb_layers=1 means ffmpeg never reads this slot.
                 unsafe { std::mem::zeroed() },
+                // SAFETY: AVDRMLayerDescriptor is C POD; all-zeroes is valid and
+                // nb_layers=1 means ffmpeg never reads this slot.
                 unsafe { std::mem::zeroed() },
+                // SAFETY: AVDRMLayerDescriptor is C POD; all-zeroes is valid and
+                // nb_layers=1 means ffmpeg never reads this slot.
                 unsafe { std::mem::zeroed() },
             ],
         }));
@@ -1180,7 +1330,13 @@ mod tests {
             _dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
         }
         unsafe extern "C" fn free_drm_frame_owner(opaque: *mut std::ffi::c_void, _data: *mut u8) {
+            // SAFETY: ffmpeg runs this callback exactly once with the original
+            // `Box<DrmFrameOwner>` pointer passed to av_buffer_create, so
+            // reclaiming that box here frees it exactly once.
             let owner = unsafe { Box::from_raw(opaque as *mut DrmFrameOwner) };
+            // SAFETY: `owner.descriptor` is the raw pointer from Box::into_raw
+            // (the descriptor box) stored when the owner was built; reclaim and
+            // drop it exactly once here.
             unsafe { drop(Box::from_raw(owner.descriptor)) };
         }
         let owner_ptr = Box::into_raw(Box::new(DrmFrameOwner {
@@ -1188,8 +1344,14 @@ mod tests {
             _dmabuf: dmabuf,
         })) as *mut std::ffi::c_void;
 
+        // SAFETY: av_frame_alloc has no preconditions; returns null on OOM,
+        // asserted non-null below.
         let mut src = unsafe { ffi::av_frame_alloc() };
         assert!(!src.is_null(), "av_frame_alloc returned null");
+        // SAFETY: `src` was just asserted non-null, so the field writes are
+        // in-bounds and exclusive; `descriptor` points at the leaked descriptor
+        // box, and av_buffer_create takes ownership of `owner_ptr` (the leaked
+        // DrmFrameOwner box) for free_drm_frame_owner.
         unsafe {
             (*src).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
             (*src).width = TEST_SIZE as i32;
@@ -1206,8 +1368,13 @@ mod tests {
         }
 
         // --- Build the destination VAAPI-format frame ---
+        // SAFETY: `device_ref` is a live owned device ref; returns a new owned
+        // frames ctx ref or null, asserted below.
         let mut vaapi_frames_ref = unsafe { ffi::av_hwframe_ctx_alloc(device_ref) };
         assert!(!vaapi_frames_ref.is_null(), "av_hwframe_ctx_alloc returned null");
+        // SAFETY: `vaapi_frames_ref` was just asserted non-null; its `data`
+        // points at a fresh, not-yet-initialized AVHWFramesContext, so these
+        // pre-init writes are in-bounds and exclusive.
         unsafe {
             let ctx = (*vaapi_frames_ref).data as *mut ffi::AVHWFramesContext;
             (*ctx).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
@@ -1218,6 +1385,7 @@ mod tests {
             (*ctx).width = TEST_SIZE as i32;
             (*ctx).height = TEST_SIZE as i32;
         }
+        // SAFETY: `vaapi_frames_ref` is the live, now-configured frames ctx ref.
         let init_ret = unsafe { ffi::av_hwframe_ctx_init(vaapi_frames_ref) };
         assert!(
             init_ret >= 0,
@@ -1225,13 +1393,19 @@ mod tests {
             ffmpeg::Error::from(init_ret)
         );
 
+        // SAFETY: av_frame_alloc has no preconditions; returns null on OOM,
+        // asserted non-null below.
         let mut dst = unsafe { ffi::av_frame_alloc() };
         assert!(!dst.is_null(), "av_frame_alloc returned null");
+        // SAFETY: `dst` was just asserted non-null; `vaapi_frames_ref` is a live
+        // ref, and the fresh av_buffer_ref of it becomes owned by `dst`.
         unsafe {
             (*dst).hw_frames_ctx = ffi::av_buffer_ref(vaapi_frames_ref);
             (*dst).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
         }
 
+        // SAFETY: `dst` is the just-built VAAPI dst frame and `src` the live
+        // DRM_PRIME source frame; both stay alive across the call.
         let map_ret = unsafe {
             ffi::av_hwframe_map(
                 dst,
@@ -1240,6 +1414,9 @@ mod tests {
             )
         };
 
+        // SAFETY: `dst`/`src` are the owned frames allocated above and
+        // `vaapi_frames_ref`/`device_ref` the owned refs; each is freed exactly
+        // once here, no aliasing.
         unsafe {
             ffi::av_frame_free(&mut dst);
             ffi::av_frame_free(&mut src);

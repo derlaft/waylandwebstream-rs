@@ -62,6 +62,15 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use tracing::{debug, info, trace, warn};
 
+/// Name reported for the single headless `wl_output` we expose.
+const OUTPUT_NAME: &str = "HEADLESS-1";
+
+/// Keyboard auto-repeat: delay before the first repeat, in milliseconds.
+const KEYBOARD_REPEAT_DELAY_MS: i32 = 200;
+
+/// Keyboard auto-repeat: repeats per second once repeating begins.
+const KEYBOARD_REPEAT_RATE_HZ: i32 = 25;
+
 /// Cursor update extracted from a Wayland client's `wl_pointer.set_cursor` call.
 /// Pixels in the `Surface` variant are already RGBA (Canvas-ready); the
 /// BGRA↔RGBA swap happens inside `read_cursor_pixels`.
@@ -155,6 +164,72 @@ pub struct WaylandWebStreamState {
     cursor_pending: Option<CursorPending>,
 }
 
+/// Copies a window's BGRA buffer into the output framebuffer `dst` at
+/// `(pos_x, pos_y)`, 1:1, clipping to the output bounds. `src` holds `src_h`
+/// rows of `src_stride` bytes; only the first `src_w * 4` bytes of each row are
+/// copied. Rows/bytes that would fall outside either buffer are skipped.
+#[allow(clippy::too_many_arguments)] // a pixel blit is clearest with explicit dims
+fn blit_bgra(
+    dst: &mut [u8],
+    dst_width: u32,
+    dst_height: u32,
+    pos_x: u32,
+    pos_y: u32,
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    src_stride: u32,
+) {
+    let target_width = dst_width.saturating_sub(pos_x);
+    let target_height = dst_height.saturating_sub(pos_y);
+    if src_w == 0 || src_h == 0 || target_width == 0 || target_height == 0 {
+        return;
+    }
+    let copy_w = src_w.min(target_width);
+    let copy_h = src_h.min(target_height);
+    let row_bytes = (copy_w * 4) as usize;
+    for dest_y in 0..copy_h {
+        let src_idx = (dest_y * src_stride) as usize;
+        let dest_idx = (((pos_y + dest_y) * dst_width + pos_x) * 4) as usize;
+        if src_idx + row_bytes <= src.len() && dest_idx + row_bytes <= dst.len() {
+            dst[dest_idx..dest_idx + row_bytes].copy_from_slice(&src[src_idx..src_idx + row_bytes]);
+        }
+    }
+}
+
+/// Fills the output region covered by a single-pixel buffer with its solid
+/// colour. `rgba` is the source colour; the output is BGRA-packed.
+fn fill_solid(dst: &mut [u8], dst_width: u32, dst_height: u32, pos_x: u32, pos_y: u32, rgba: [u8; 4]) {
+    let [r, g, b, a] = rgba;
+    let target_width = dst_width.saturating_sub(pos_x);
+    let target_height = dst_height.saturating_sub(pos_y);
+    for dest_y in 0..target_height {
+        for dest_x in 0..target_width {
+            let dest_idx = (((pos_y + dest_y) * dst_width + (pos_x + dest_x)) * 4) as usize;
+            if let Some(px) = dst.get_mut(dest_idx..dest_idx + 4) {
+                px.copy_from_slice(&[b, g, r, a]);
+            }
+        }
+    }
+}
+
+/// Renders the classic X11 "root weave" stipple (a 4x4 basket-weave bitmap in
+/// black and white) into `dst`, used when no window is mapped.
+fn render_root_weave(dst: &mut [u8], width: u32, height: u32) {
+    const ROOT_WEAVE_BITS: [u8; 4] = [0b0110, 0b1001, 0b1001, 0b0110];
+    for y in 0..height {
+        let row = ROOT_WEAVE_BITS[(y % 4) as usize];
+        for x in 0..width {
+            let bit = (row >> (x % 4)) & 1;
+            let color = if bit == 1 { 255 } else { 0 };
+            let idx = ((y * width + x) * 4) as usize;
+            if let Some(px) = dst.get_mut(idx..idx + 4) {
+                px.copy_from_slice(&[color, color, color, 255]);
+            }
+        }
+    }
+}
+
 impl WaylandWebStreamState {
     pub fn new(
         _event_loop: &mut EventLoop<Self>,
@@ -204,7 +279,7 @@ impl WaylandWebStreamState {
         };
 
         let output = Output::new(
-            "HEADLESS-1".to_string(),
+            OUTPUT_NAME.to_string(),
             physical_properties,
         );
 
@@ -214,7 +289,8 @@ impl WaylandWebStreamState {
 
         // Create seat (input device manager)
         let mut seat = seat_state.new_wl_seat(&dh, "seat-0");
-        seat.add_keyboard(Default::default(), 200, 25).unwrap();
+        seat.add_keyboard(Default::default(), KEYBOARD_REPEAT_DELAY_MS, KEYBOARD_REPEAT_RATE_HZ)
+            .unwrap();
         seat.add_pointer();
         seat.add_touch();
 
@@ -410,7 +486,7 @@ impl WaylandWebStreamState {
         // Log every 30 frames (once per second at 30fps)
         self.frame_counter = self.frame_counter.wrapping_add(1);
         let frame_counter = self.frame_counter;
-        if frame_counter % 30 == 0 {
+        if frame_counter.is_multiple_of(30) {
             trace!("Rendering {} windows", window_count);
         }
 
@@ -429,68 +505,58 @@ impl WaylandWebStreamState {
                         // Buffer derefs to WlBuffer, so we can use it directly with with_buffer_contents
                         // Access SHM buffer contents
                         let shm_result = smithay::wayland::shm::with_buffer_contents(
-                            &*buffer,
+                            buffer,
                         |ptr, len, buffer_data| {
                             let buffer_width = buffer_data.width as u32;
                             let buffer_height = buffer_data.height as u32;
                             let buffer_stride = buffer_data.stride as u32;
                             let buffer_offset = buffer_data.offset as isize;
                             
-                            if frame_counter % 120 == 0 {
+                            if frame_counter.is_multiple_of(120) {
                                 trace!("Rendering buffer: {}x{}", buffer_width, buffer_height);
                             }
 
                             // Access pixel data safely
                             let expected_len = (buffer_stride * buffer_height) as usize;
                             if buffer_offset as usize + expected_len <= len {
+                                // SAFETY: the bounds check above guarantees
+                                // `[offset, offset+expected_len)` lies within the
+                                // mapped SHM pool of `len` bytes, so `ptr+offset`
+                                // is valid for `expected_len` reads for the life
+                                // of this borrow (the pool stays mapped).
                                 let pixel_data = unsafe {
                                     std::slice::from_raw_parts(ptr.offset(buffer_offset), expected_len)
                                 };
-                                
-                                // Copy the buffer into the output at 1:1 scale, clipping to
-                                // whichever is smaller in each dimension. The GL compositor
-                                // (GlCompositor) renders windows at 1:1 in the space too, so
-                                // keeping SW consistent means surface_at can use the same
-                                // 1:1 coordinate formula for both paths without
-                                // introducing a scale factor that only one renderer applies.
-                                // The render_buffer is zero-initialised above, so any output
-                                // pixels not covered by the buffer remain black.
-                                let target_width = self.width.saturating_sub(window_pos_x);
-                                let target_height = self.height.saturating_sub(window_pos_y);
 
-                                if buffer_width > 0 && buffer_height > 0 && target_width > 0 && target_height > 0 {
-                                    let copy_w = buffer_width.min(target_width);
-                                    let copy_h = buffer_height.min(target_height);
-                                    let row_bytes = (copy_w * 4) as usize;
-                                    for dest_y in 0..copy_h {
-                                        let src_idx = (dest_y * buffer_stride) as usize;
-                                        let dest_idx = (((window_pos_y + dest_y) * self.width + window_pos_x) * 4) as usize;
-                                        if src_idx + row_bytes <= pixel_data.len() && dest_idx + row_bytes <= render_buffer.len() {
-                                            render_buffer[dest_idx..dest_idx + row_bytes]
-                                                .copy_from_slice(&pixel_data[src_idx..src_idx + row_bytes]);
-                                        }
-                                    }
-                                }
+                                // Copy the buffer into the output at 1:1 scale (see
+                                // `blit_bgra`). Both SW and GL renderers blit at 1:1 so
+                                // `surface_at` can share one coordinate formula; the
+                                // zero-initialised render_buffer leaves uncovered pixels black.
+                                blit_bgra(
+                                    &mut render_buffer,
+                                    self.width,
+                                    self.height,
+                                    window_pos_x,
+                                    window_pos_y,
+                                    pixel_data,
+                                    buffer_width,
+                                    buffer_height,
+                                    buffer_stride,
+                                );
                             }
                         }
                     );
 
                         if matches!(shm_result, Err(smithay::wayland::shm::BufferAccessError::NotManaged)) {
-                            if let Ok(spb) = smithay::wayland::single_pixel_buffer::get_single_pixel_buffer(&*buffer) {
-                                let [r, g, b, a] = spb.rgba8888();
-                                let target_width = self.width.saturating_sub(window_pos_x);
-                                let target_height = self.height.saturating_sub(window_pos_y);
-                                for dest_y in 0..target_height {
-                                    for dest_x in 0..target_width {
-                                        let dest_idx = (((window_pos_y + dest_y) * self.width + (window_pos_x + dest_x)) * 4) as usize;
-                                        if dest_idx + 3 < render_buffer.len() {
-                                            render_buffer[dest_idx]     = b;
-                                            render_buffer[dest_idx + 1] = g;
-                                            render_buffer[dest_idx + 2] = r;
-                                            render_buffer[dest_idx + 3] = a;
-                                        }
-                                    }
-                                }
+                            if let Ok(spb) = smithay::wayland::single_pixel_buffer::get_single_pixel_buffer(buffer) {
+                                fill_solid(
+                                    &mut render_buffer,
+                                    self.width,
+                                    self.height,
+                                    window_pos_x,
+                                    window_pos_y,
+                                    spb.rgba8888(),
+                                );
                             }
                         }
                     }
@@ -502,19 +568,7 @@ impl WaylandWebStreamState {
         // basket-weave bitmap (X11's default root window pattern before any
         // window manager or client connects), rendered in black and white.
         if window_count == 0 {
-            const ROOT_WEAVE_BITS: [u8; 4] = [0b0110, 0b1001, 0b1001, 0b0110];
-            for y in 0..self.height {
-                let row = ROOT_WEAVE_BITS[(y % 4) as usize];
-                for x in 0..self.width {
-                    let bit = (row >> (x % 4)) & 1;
-                    let color = if bit == 1 { 255 } else { 0 };
-                    let idx = ((y * self.width + x) * 4) as usize;
-                    render_buffer[idx] = color;     // B
-                    render_buffer[idx + 1] = color; // G
-                    render_buffer[idx + 2] = color; // R
-                    render_buffer[idx + 3] = 255;    // A
-                }
-            }
+            render_root_weave(&mut render_buffer, self.width, self.height);
         }
         
         Some(render_buffer)
@@ -780,7 +834,7 @@ impl WaylandWebStreamState {
             };
 
             // Try SHM first.
-            let shm_result = with_buffer_contents(&**buffer, |ptr, len, data| {
+            let shm_result = with_buffer_contents(buffer, |ptr, len, data| {
                 let w = data.width as u32;
                 let h = data.height as u32;
                 let stride = data.stride as u32;
@@ -795,6 +849,9 @@ impl WaylandWebStreamState {
                 let expected = (stride * h) as usize;
                 if (offset as usize).saturating_add(expected) > len { return; }
 
+                // SAFETY: the (saturating) bounds check above guarantees
+                // `[offset, offset+expected)` lies within the mapped SHM pool of
+                // `len` bytes, so this read is in-bounds for the borrow's life.
                 let pixels = unsafe {
                     std::slice::from_raw_parts(ptr.offset(offset), expected)
                 };
@@ -818,7 +875,7 @@ impl WaylandWebStreamState {
 
             if matches!(shm_result, Err(smithay::wayland::shm::BufferAccessError::NotManaged)) {
                 // SHM failed — try dmabuf (wlroots uses dmabuf-backed cursor surfaces on GPU hardware).
-                if let Ok(dmabuf) = get_dmabuf(&**buffer) {
+                if let Ok(dmabuf) = get_dmabuf(buffer) {
                     result = Self::read_cursor_pixels_dmabuf(dmabuf, hotspot, renderer);
                 }
             }
@@ -864,6 +921,10 @@ impl WaylandWebStreamState {
                 if let Ok(mapping) = map_result {
                     let expected = (stride * h) as usize;
                     if mapping.length() >= expected {
+                        // SAFETY: the dmabuf plane is mapped READ for this scope
+                        // (sync START/END bracket it) and `mapping.length()` is
+                        // confirmed >= `expected`, so `mapping.ptr()` is valid for
+                        // `expected` bytes while `mapping` is alive.
                         let pixels = unsafe {
                             std::slice::from_raw_parts(mapping.ptr() as *const u8, expected)
                         };
@@ -1316,6 +1377,50 @@ fn cursor_icon_to_css(icon: smithay::input::pointer::CursorIcon) -> &'static str
 pub type CompositorState = WaylandWebStreamState;
 
 #[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    #[test]
+    fn blit_bgra_copies_at_offset_and_clips() {
+        // 4x4 output, blit a 2x2 source (stride 8 = 2px*4) at (1,1).
+        let mut dst = vec![0u8; 4 * 4 * 4];
+        let src = vec![0xAAu8; 2 * 2 * 4];
+        blit_bgra(&mut dst, 4, 4, 1, 1, &src, 2, 2, 8);
+        let idx = (4 + 1) * 4; // pixel (1,1) in a 4-wide buffer, 4 bytes/px
+        assert_eq!(&dst[idx..idx + 4], &[0xAA, 0xAA, 0xAA, 0xAA]);
+        assert_eq!(&dst[0..4], &[0, 0, 0, 0]); // (0,0) untouched
+    }
+
+    #[test]
+    fn blit_bgra_clips_oversized_source_without_panicking() {
+        let mut dst = vec![0u8; 2 * 2 * 4];
+        let src = vec![0x11u8; 4 * 4 * 4];
+        blit_bgra(&mut dst, 2, 2, 1, 1, &src, 4, 4, 16);
+        let idx = (2 + 1) * 4; // pixel (1,1) in a 2-wide buffer, 4 bytes/px
+        assert_eq!(&dst[idx..idx + 4], &[0x11, 0x11, 0x11, 0x11]);
+    }
+
+    #[test]
+    fn fill_solid_swaps_rgba_to_bgra() {
+        let mut dst = vec![0u8; 4];
+        fill_solid(&mut dst, 1, 1, 0, 0, [10, 20, 30, 40]); // r,g,b,a
+        assert_eq!(&dst[0..4], &[30, 20, 10, 40]); // b,g,r,a
+    }
+
+    #[test]
+    fn render_root_weave_fills_every_pixel_opaque() {
+        let (w, h) = (8u32, 8u32);
+        let mut dst = vec![0u8; (w * h * 4) as usize];
+        render_root_weave(&mut dst, w, h);
+        for px in dst.chunks_exact(4) {
+            assert_eq!(px[3], 255);
+            assert!(px[0] == px[1] && px[1] == px[2]);
+            assert!(px[0] == 0 || px[0] == 255);
+        }
+    }
+}
+
+#[cfg(test)]
 mod cursor_tests {
     use super::*;
     use smithay::backend::allocator::{
@@ -1434,6 +1539,8 @@ mod cursor_tests {
             Err(e) => { skip!("GBM init failed", e) }
         };
         let egl_gbm = GbmDevice::new(drm_for_egl).unwrap();
+        // SAFETY: `egl_gbm` is a fresh GBM device owned exclusively by this test;
+        // smithay tracks EGLDisplays by native-display identity internally.
         let display = match unsafe { EGLDisplay::new(egl_gbm) } {
             Ok(d) => d,
             Err(e) => { skip!("EGL display failed", e) }
@@ -1442,6 +1549,8 @@ mod cursor_tests {
             Ok(c) => c,
             Err(e) => { skip!("EGL context failed", e) }
         };
+        // SAFETY: `ctx` was just created above and is not current on any other
+        // thread, which is what GlesRenderer::new requires.
         let renderer = match unsafe { GlesRenderer::new(ctx) } {
             Ok(r) => r,
             Err(e) => { skip!("GlesRenderer init failed", e) }

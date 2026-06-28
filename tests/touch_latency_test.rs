@@ -27,7 +27,7 @@ impl Drop for ChildGuard {
 fn test_touch_input_flips_compositor_output() {
     println!("Building compositor and test clients...");
     let build_status = Command::new("cargo")
-        .args(&["build", "--release", "--workspace"])
+        .args(["build", "--release", "--workspace"])
         .status()
         .expect("Failed to build workspace");
     assert!(build_status.success(), "Build failed");

@@ -125,8 +125,10 @@ fn run_capture_loop(audio_tx: broadcast::Sender<AudioPacket>) -> Result<()> {
 
             let Some(raw) = data.data() else { return };
             let n_samples = n_bytes / std::mem::size_of::<f32>();
-            // SAFETY: PipeWire guarantees the buffer contains valid F32LE PCM since
-            // we negotiated that format in stream.connect().
+            // SAFETY: we negotiated F32LE in stream.connect(), so PipeWire fills
+            // this buffer with `n_samples` valid, natively-aligned f32 PCM samples
+            // (audio DMA buffers are at least sample-aligned). `raw` stays valid
+            // and unaliased for the duration of this borrow.
             let samples =
                 unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_samples) };
 
@@ -141,6 +143,9 @@ fn run_capture_loop(audio_tx: broadcast::Sender<AudioPacket>) -> Result<()> {
                 match state.encoder.encode_float(&pcm, &mut pkt) {
                     Ok(n) => {
                         pkt.truncate(n);
+                        // Fire-and-forget broadcast: no subscribers when no
+                        // client is connected, and audio is real-time so a
+                        // dropped packet is simply skipped (not retransmitted).
                         let _ = state.audio_tx.send(AudioPacket {
                             data: pkt,
                             pts_us: state.pts_us,

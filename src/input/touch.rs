@@ -3,7 +3,7 @@
 use crate::compositor::CompositorState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Touch event types from the browser
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,10 +71,12 @@ impl TouchHandler {
         self.height = height;
     }
 
-    /// Convert normalized coordinates (0.0-1.0) to compositor coordinates
+    /// Convert normalized coordinates (0.0-1.0) to compositor coordinates.
+    /// Inputs are clamped (see [`crate::input::normalize_unit`]) since they
+    /// come from an untrusted browser client.
     fn to_compositor_coords(&self, x: f64, y: f64) -> (f64, f64) {
-        let comp_x = x * self.width as f64;
-        let comp_y = y * self.height as f64;
+        let comp_x = crate::input::normalize_unit(x) * self.width as f64;
+        let comp_y = crate::input::normalize_unit(y) * self.height as f64;
         (comp_x, comp_y)
     }
 
@@ -114,7 +116,10 @@ impl TouchHandler {
                         );
                         state.touch_motion(touch.identifier, x, y);
                     } else {
-                        warn!("Touch move for unknown touch: {}", touch.identifier);
+                        // Expected for out-of-order / client-filtered contacts
+                        // (e.g. a move whose start was dropped off-screen);
+                        // debug, not warn, to avoid log spam.
+                        debug!("Touch move for unknown touch: {}", touch.identifier);
                     }
                 }
                 state.touch_frame();
@@ -129,7 +134,9 @@ impl TouchHandler {
                         );
                         state.touch_up(touch.identifier);
                     } else {
-                        warn!("Touch end for unknown touch: {}", touch.identifier);
+                        // See the touchmove branch: an unknown id here is an
+                        // expected consequence of client-side filtering.
+                        debug!("Touch end for unknown touch: {}", touch.identifier);
                     }
                 }
                 state.touch_frame();

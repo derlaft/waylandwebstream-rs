@@ -26,7 +26,7 @@ impl Drop for ChildGuard {
 fn test_keyboard_releases_held_keys_on_focus_loss() {
     println!("Building compositor and test clients...");
     let build_status = Command::new("cargo")
-        .args(&["build", "--release", "--workspace"])
+        .args(["build", "--release", "--workspace"])
         .status()
         .expect("Failed to build workspace");
     assert!(build_status.success(), "Build failed");

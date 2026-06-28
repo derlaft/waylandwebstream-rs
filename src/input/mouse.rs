@@ -93,9 +93,14 @@ impl MouseHandler {
         self.height = height;
     }
 
-    /// Convert normalized coordinates (0.0-1.0) to compositor coordinates
+    /// Convert normalized coordinates (0.0-1.0) to compositor coordinates.
+    /// Inputs are clamped (see [`crate::input::normalize_unit`]) since they
+    /// come from an untrusted browser client.
     fn to_compositor_coords(&self, x: f64, y: f64) -> (f64, f64) {
-        (x * self.width as f64, y * self.height as f64)
+        (
+            crate::input::normalize_unit(x) * self.width as f64,
+            crate::input::normalize_unit(y) * self.height as f64,
+        )
     }
 
     /// Process a pointer event from the browser, injecting it into the

@@ -15,7 +15,7 @@ fn test_compositor_pipeline() {
     // Build the compositor first
     println!("Building compositor...");
     let build_status = Command::new("cargo")
-        .args(&["build", "--release", "--workspace"])
+        .args(["build", "--release", "--workspace"])
         .status()
         .expect("Failed to build compositor");
     
@@ -55,9 +55,10 @@ fn test_compositor_pipeline() {
         println!("Validating screenshot...");
         validate_screenshot(&screenshot_path);
         
-        // Cleanup client
+        // Cleanup client (kill, then reap so it doesn't linger as a zombie)
         let _ = client.kill();
-        
+        let _ = client.wait();
+
         println!("Test passed!");
     }));
     
