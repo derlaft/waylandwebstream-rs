@@ -189,11 +189,13 @@
     // attached for the lifetime of the component. Registered before
     // attachInput's listeners so the socket is already re-opening when the
     // same event is forwarded as input (it buffers until OPEN).
-    const onReconnectIntent = () => {
+    const onReconnectIntent = (e: Event) => {
       client?.reconnect();
-      // A real user gesture: the moment we're allowed to read the device
-      // clipboard and push it to the remote (see lib/clipboard.ts).
-      void clipboard?.onUserGesture();
+      // Flush any deferred clipboard write, and on *touch* (mobile) read the
+      // device clipboard to push to the remote. Mouse/keyboard never read here
+      // -- that pops the browser's "Paste" affordance and hijacks clicks; the
+      // desktop path is the paste event (Ctrl+V). See lib/clipboard.ts.
+      void clipboard?.onUserGesture(e.type === 'touchstart');
     };
     canvas.addEventListener('pointerdown', onReconnectIntent);
     canvas.addEventListener('touchstart', onReconnectIntent);

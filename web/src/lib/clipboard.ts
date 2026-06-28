@@ -3,14 +3,18 @@
 // `/client` WebSocket as `clipboard` messages (see src/clipboard.rs).
 //
 // Browser permission realities shape the design:
-//  - writeText (remote -> device) works without a prompt on Chrome while the
-//    tab is focused, but Firefox/Safari require a user gesture. So a remote
-//    change is written immediately if possible, else stashed and flushed on
-//    the next gesture.
-//  - readText (device -> remote) ALWAYS needs a user gesture and prompts the
-//    first time. We can't poll it. So we read on the first stage interaction
-//    after the tab (re)gains focus -- i.e. "you copied something elsewhere,
-//    came back, and touched the stream" -> your clipboard syncs to the remote.
+//  - writeText/write (remote -> device) works without a prompt on Chrome while
+//    the tab is focused; Firefox/Safari require a user gesture, so a remote
+//    change is written immediately if possible, else stashed and flushed on the
+//    next gesture (onUserGesture).
+//  - device -> remote needs a clipboard read, which is permission-gated. Two
+//    triggers, both deliberate (never a plain mouse click -- that pops the
+//    Firefox/Safari "Paste" affordance and hijacks clicks):
+//      * desktop: the browser `paste` event (Ctrl+V), whose clipboardData is
+//        readable with NO prompt.
+//      * mobile: the first *touch* on the stream after the tab regains focus
+//        (read() shows at most a one-time permission prompt on Chrome, not a
+//        recurring menu). Touch-gated so desktop mouse clicks never read.
 import { writable } from 'svelte/store';
 import type { ClientMessage } from './protocol';
 
@@ -67,8 +71,9 @@ export class ClipboardBridge {
   /// A remote->device payload that couldn't be written yet (needed a gesture);
   /// flushed on the next user gesture.
   private pendingWrite: Payload | null = null;
-  /// Whether to read the device clipboard on the next gesture. Armed whenever
-  /// the tab (re)gains focus so we don't prompt/read on every single tap.
+  /// Whether to read the device clipboard on the next *touch*. Armed when the
+  /// tab (re)gains focus so we read at most once per focus session, not on
+  /// every tap.
   private armed = true;
 
   private readonly unsub: () => void;
@@ -78,6 +83,23 @@ export class ClipboardBridge {
   private readonly onVisibility = () => {
     if (document.visibilityState === 'visible') this.armed = true;
   };
+  /// device -> remote: the user pasted (Ctrl+V). clipboardData is readable
+  /// here without any permission prompt.
+  private readonly onPaste = (e: ClipboardEvent): void => {
+    if (!this.enabled || !e.clipboardData) return;
+    // Prefer an image; fall back to text.
+    for (const item of e.clipboardData.items) {
+      if (item.kind === 'file' && item.type === 'image/png') {
+        const file = item.getAsFile();
+        if (file) {
+          void file.arrayBuffer().then((buf) => this.forwardImage('image/png', new Uint8Array(buf)));
+          return;
+        }
+      }
+    }
+    const text = e.clipboardData.getData('text/plain');
+    if (text) this.forwardText(text);
+  };
 
   constructor(send: Send, sendImage: SendImage) {
     this.send = send;
@@ -85,12 +107,14 @@ export class ClipboardBridge {
     this.unsub = clipboardSyncEnabled.subscribe((v) => {
       this.enabled = v;
     });
+    window.addEventListener('paste', this.onPaste);
     window.addEventListener('focus', this.onFocus);
     document.addEventListener('visibilitychange', this.onVisibility);
   }
 
   destroy(): void {
     this.unsub();
+    window.removeEventListener('paste', this.onPaste);
     window.removeEventListener('focus', this.onFocus);
     document.removeEventListener('visibilitychange', this.onVisibility);
   }
@@ -128,52 +152,51 @@ export class ClipboardBridge {
     }
   }
 
-  /// device -> remote: call from a user-gesture handler (pointerdown/keydown).
-  /// Flushes any deferred write, then -- once per focus session -- reads the
-  /// device clipboard and forwards changes (image preferred) to the remote.
-  async onUserGesture(): Promise<void> {
+  /// Call from a gesture handler. Always flushes a deferred remote->device
+  /// write. Reads the device clipboard (device->remote) ONLY when `fromTouch`
+  /// and armed -- never on mouse/keyboard, since a clipboard read on a mouse
+  /// click pops the Firefox/Safari "Paste" affordance and hijacks the click.
+  /// Desktop uses the `paste` event (Ctrl+V) for device->remote instead.
+  async onUserGesture(fromTouch = false): Promise<void> {
     if (!this.enabled) return;
-
+    // Read FIRST: a deferred write (writeDevice) would consume this gesture's
+    // transient activation and make the subsequent clipboard read fail.
+    if (fromTouch && this.armed) {
+      this.armed = false;
+      await this.readDevice();
+    }
     if (this.pendingWrite !== null) {
       const p = this.pendingWrite;
       this.pendingWrite = null;
       await this.writeDevice(p);
     }
-
-    if (!this.armed) return;
-    this.armed = false;
-    await this.readDevice();
   }
 
+  /// device -> remote: read the device clipboard (image preferred, else text)
+  /// and forward it. Only called from a touch gesture (see onUserGesture).
   private async readDevice(): Promise<void> {
-    // Prefer clipboard.read() (covers images + text); fall back to readText()
-    // on browsers without read() (older Firefox).
     try {
       const items = await navigator.clipboard.read();
       for (const item of items) {
         if (item.types.includes('image/png')) {
-          const blob = await item.getType('image/png');
-          const bytes = new Uint8Array(await blob.arrayBuffer());
-          const key = imageKey('image/png', bytes);
-          if (key !== this.lastKey) {
-            this.lastKey = key;
-            this.sendImage('image/png', bytes);
-          }
+          const bytes = new Uint8Array(await (await item.getType('image/png')).arrayBuffer());
+          this.forwardImage('image/png', bytes);
           return;
         }
       }
       for (const item of items) {
         if (item.types.includes('text/plain')) {
-          const text = await (await item.getType('text/plain')).text();
-          this.forwardText(text);
+          this.forwardText(await (await item.getType('text/plain')).text());
           return;
         }
       }
     } catch {
+      // Fall back to readText() on browsers without read(); ignore failures
+      // (no permission / not focused / unsupported).
       try {
         this.forwardText(await navigator.clipboard.readText());
       } catch {
-        // No permission, not focused, or unsupported -- ignore silently.
+        /* ignore */
       }
     }
   }
@@ -183,6 +206,14 @@ export class ClipboardBridge {
     if (text && key !== this.lastKey) {
       this.lastKey = key;
       this.send({ type: 'clipboard', text });
+    }
+  }
+
+  private forwardImage(mime: string, bytes: Uint8Array): void {
+    const key = imageKey(mime, bytes);
+    if (key !== this.lastKey) {
+      this.lastKey = key;
+      this.sendImage(mime, bytes);
     }
   }
 }
