@@ -168,7 +168,7 @@ async fn main() -> Result<()> {
     //
     // `gpu_frames_requested` decides whether `GlCompositor` should skip its
     // CPU readback and hand dmabufs straight to `VaapiEncoder`
-    // (hardware-acceleration-plan.md Phase B.5, zero-copy) -- only sound
+    // (AGENTS.md, zero-copy) -- only sound
     // when both halves of the (gl, vaapi) pair are actually in play, so it's
     // computed from `--encoder` here and only kept as `true` below if GL
     // construction actually succeeds (a `sw` fallback can never produce a
@@ -180,8 +180,8 @@ async fn main() -> Result<()> {
         CompositorBackendArg::Gl => match GlCompositor::new(&config.vaapi_device, gpu_frames_requested) {
             Ok(c) => {
                 // Advertise `linux-dmabuf` to clients now that there's a
-                // renderer to import them into (hardware-acceleration-plan.md
-                // Phase B.4). `enable_dmabuf` stores a clone of the same
+                // renderer to import them into (see AGENTS.md). `enable_dmabuf`
+                // stores a clone of the same
                 // renderer handle `c` renders with -- not a second renderer.
                 // Failure here only means no dmabuf global gets advertised;
                 // GL rendering and SHM clients are unaffected.
@@ -214,7 +214,7 @@ async fn main() -> Result<()> {
     };
 
     // Current WebCodecs codec string (profile/level), surfaced to clients
-    // over `/ws` so a resolution-driven level change reaches the decoder --
+    // over `/client` so a resolution-driven level change reaches the decoder --
     // see `encoder::h264_codec_string`.
     let (codec_tx, codec_rx) = tokio::sync::watch::channel(encoder::h264_codec_string(width, height, config.framerate));
 
@@ -228,7 +228,7 @@ async fn main() -> Result<()> {
     // Forwards a client's `ping` (control channel) to the packet-forwarding
     // loop below, which stamps it onto the next outgoing video frame.
     let (pending_ping_tx, mut pending_ping_rx) = mpsc::channel::<f64>(8);
-    // Current encoder target bitrate, surfaced to clients over `/ws`. CRF
+    // Current encoder target bitrate, surfaced to clients over `/client`. CRF
     // (constant-quality) mode has no bitrate target, hence the 0 sentinel.
     let initial_bitrate_for_display = match rate_control {
         RateControl::Bitrate(bps) => bps,
@@ -243,7 +243,7 @@ async fn main() -> Result<()> {
     info!("\n╔══════════════════════════════════════════════════════════════╗");
     info!("║  WaylandWebStream - Latency Reporting Enabled               ║");
     info!("╠══════════════════════════════════════════════════════════════╣");
-    info!("║  ✓ H.264 video over a binary WebSocket (/stream)            ║");
+    info!("║  ✓ H.264 video over a binary WebSocket (/client)            ║");
     info!("║  ✓ Browser-side WebCodecs decode into a <canvas>             ║");
     info!("║  ✓ HTTP/WebSocket control channel                           ║");
     info!("║  ✓ Touch input handling (multi-touch support)               ║");
@@ -346,7 +346,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Set by the session manager (and the `/stream` handler) when a new
+    // Set by the session manager (and the `/client` handler) when a new
     // client connects, so the capture loop renders+sends a frame right away
     // even if the screen hasn't changed -- otherwise a newly connected
     // client would see nothing until the next damage or the next periodic
@@ -354,13 +354,13 @@ async fn main() -> Result<()> {
     let force_render = Arc::new(AtomicBool::new(false));
 
     // The session's client app, if one was given after `--`. Spawned lazily
-    // by `SignalingState`'s connection handlers on the first `/ws` or
-    // `/stream` connection rather than here, so an idle server with nobody
+    // by `SignalingState`'s connection handlers on the first `/client` or
+    // `/client` connection rather than here, so an idle server with nobody
     // watching never runs it.
     let session = SessionManager::new(config.command.clone(), config.display_name.clone(), session_shutdown_tx);
 
     // Start audio capture: PipeWire loopback virtual sink + Opus encoding.
-    // Runs on a dedicated OS thread; the broadcast sender is consumed by /audio WS clients.
+    // Runs on a dedicated OS thread; the broadcast sender is consumed by /client WS clients.
     let audio_tx = if config.no_audio {
         info!("Audio capture disabled via --no-audio");
         None
@@ -371,7 +371,7 @@ async fn main() -> Result<()> {
                 Some(tx)
             }
             Err(e) => {
-                warn!("Audio capture failed to start ({e:#}); /audio endpoint will be unavailable");
+                warn!("Audio capture failed to start ({e:#}); audio will be unavailable");
                 None
             }
         }
@@ -459,7 +459,7 @@ async fn main() -> Result<()> {
     });
 
     // Spawn the encoder packet forwarding task: every encoded packet goes to
-    // the `/stream` WebSocket broadcast for WebCodecs clients. Also where a
+    // the `/client` WebSocket broadcast for WebCodecs clients. Also where a
     // pending client ping gets stamped onto the next packet (see
     // `SignalingMessage::Ping` in src/server.rs), and where the server-only
     // legs of the latency pipeline (capture→encode, encoding, encode→send)

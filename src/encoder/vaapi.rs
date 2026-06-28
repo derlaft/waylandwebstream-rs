@@ -1,4 +1,4 @@
-//! Phase A (hardware-acceleration-plan.md) -- VAAPI hardware encode, the
+//! Phase A (AGENTS.md) -- VAAPI hardware encode, the
 //! "A-filtergraph" variant: `hwupload,scale_vaapi=format=nv12` does the
 //! BGRA->NV12 colour conversion on the GPU, so the CPU only ever touches the
 //! raw captured frame, never converts pixels itself. `h264_vaapi` then
@@ -14,7 +14,7 @@
 //! pipelines this encoder builds -- never both, see `VaapiPipeline`.
 //!
 //! ffmpeg-next's safe wrapper has no VAAPI-specific accessors (see
-//! docs/hardware-acceleration-plan.md's feasibility findings), so device
+//! AGENTS.md feasibility findings), so device
 //! setup, the filtergraph's `hw_device_ctx` wiring, and pulling the
 //! filter-derived `hw_frames_ctx` back out all go through `ffmpeg_next::ffi`
 //! directly.
@@ -306,7 +306,7 @@ fn drain_filtergraph(
                 // it only exists on some other hwaccel encoders), so
                 // tagging the frame is the only mechanism available.
                 // Verified by the keyframe regression test ported to
-                // this backend (hardware-acceleration-plan.md A.4).
+                // this backend (AGENTS.md).
                 hw_frame.set_kind(if force_keyframe {
                     ffmpeg::picture::Type::I
                 } else {
@@ -1085,7 +1085,7 @@ mod tests {
         println!("resized, re-encoded, and dropped cleanly");
     }
 
-    /// **Feasibility spike for hardware-acceleration-plan.md Phase B.5**
+    /// **Feasibility spike for AGENTS.md**
     /// (zero-copy dmabuf -> VAAPI import). Deliberately bypasses
     /// `GlCompositor`/`CapturedFrame::Gpu` entirely -- allocates a dmabuf the
     /// same way `GlCompositor`'s GBM target pool does (Argb8888,

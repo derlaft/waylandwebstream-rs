@@ -104,7 +104,7 @@ pub enum SignalingMessage {
         #[serde(default)]
         decoding_ms: Option<f64>,
         total_ms: f64,
-        /// Count of `/stream` frame arrivals within ~3ms of the previous
+        /// Count of `/client` frame arrivals within ~3ms of the previous
         /// one this window (see `VideoStream.flushDiagnostics` in
         /// web/src/lib/stream.ts) -- several frames landing almost
         /// simultaneously, which only happens if they piled up somewhere in
@@ -121,7 +121,7 @@ pub enum SignalingMessage {
         #[serde(default)]
         blit_ms: Option<f64>,
     },
-    /// Round-trip latency probe: echoed back on whichever `/stream` frame
+    /// Round-trip latency probe: echoed back on whichever `/client` frame
     /// next leaves the encoder (see `encode_video_frame`'s `ping_echo_*`
     /// handling), so the client can measure full pipeline latency using
     /// only its own clock.
@@ -134,7 +134,7 @@ pub enum SignalingMessage {
     Clipboard { text: String },
 }
 
-/// Cursor state pushed from the compositor to `/ws` clients. The browser
+/// Cursor state pushed from the compositor to `/client` clients. The browser
 /// uses this to render a client-side cursor overlay, eliminating cursor
 /// round-trip latency.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,7 +161,7 @@ pub enum CursorUpdate {
     },
 }
 
-/// Messages the server pushes to the client over `/ws`.
+/// Messages the server pushes to the client over `/client`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
@@ -201,13 +201,13 @@ pub struct SignalingState {
     /// controller. `None` when adaptive bitrate is disabled (fixed bitrate
     /// or constant-quality mode).
     bitrate_event_tx: Option<mpsc::Sender<BitrateEvent>>,
-    /// Broadcasts encoded video packets to `/stream` WebSocket clients. Small
+    /// Broadcasts encoded video packets to `/client` WebSocket clients. Small
     /// capacity is deliberate: a slow client should skip forward to a recent
     /// frame rather than build up a backlog, since H.264 P-frames in the
     /// backlog would be stale by the time they're sent anyway. The next
     /// periodic keyframe resyncs any client that fell behind and missed some.
     video_tx: broadcast::Sender<EncodedPacket>,
-    /// Lets a new `/stream` client request a fresh keyframe -- without this,
+    /// Lets a new `/client` client request a fresh keyframe -- without this,
     /// a client connecting while the screen is idle could wait until the
     /// next damage or GOP-cycle keyframe before seeing anything decodable.
     encoder_control_tx: mpsc::Sender<EncoderControl>,
@@ -222,11 +222,11 @@ pub struct SignalingState {
     pending_ping_tx: mpsc::Sender<f64>,
     /// Current encoder target bitrate, updated by the adaptive bitrate
     /// controller (or fixed forever in constant-bitrate/CRF mode). Each
-    /// `/ws` connection gets its own clone to push `ServerMessage::Bitrate`
+    /// `/client` connection gets its own clone to push `ServerMessage::Bitrate`
     /// updates to that client.
     bitrate_rx: watch::Receiver<usize>,
     /// Current WebCodecs codec string, updated by the encoder thread when a
-    /// resolution change picks a different H.264 level. Each `/ws`
+    /// resolution change picks a different H.264 level. Each `/client`
     /// connection gets its own clone to push `ServerMessage::Codec` updates.
     codec_rx: watch::Receiver<String>,
     /// Flips to `true` when the process is shutting down. Each connection
@@ -236,18 +236,18 @@ pub struct SignalingState {
     /// only ending when the client happens to disconnect on its own.
     shutdown_rx: watch::Receiver<bool>,
     /// Lazily starts the session's configured client app on the first
-    /// `/ws` or `/stream` connection. A no-op if no command was configured.
+    /// `/client` connection. A no-op if no command was configured.
     session: SessionManager,
     /// When a `RequestKeyframe` resync was last actually honored (forced a
-    /// new keyframe), shared across every `/ws` connection -- see
+    /// new keyframe), shared across every `/client` connection -- see
     /// `KEYFRAME_FORCE_COOLDOWN`. Plain `std::sync::Mutex` rather than
     /// tokio's: the critical section is a single comparison/store, never
     /// held across an `.await`.
     last_keyframe_force: Arc<Mutex<Instant>>,
-    /// Broadcasts Opus-encoded audio packets to `/audio` WebSocket clients.
+    /// Broadcasts Opus-encoded audio packets to `/client` WebSocket clients.
     /// `None` when the PipeWire audio capture failed to start at launch.
     audio_tx: Option<broadcast::Sender<AudioPacket>>,
-    /// Current cursor state from the compositor. Each `/ws` connection
+    /// Current cursor state from the compositor. Each `/client` connection
     /// subscribes to this watch channel and pushes updates as
     /// `ServerMessage::Cursor` messages. A new client also receives the
     /// current cursor immediately on connect.
@@ -327,7 +327,7 @@ impl SignalingState {
     }
 
     /// Cloneable sender for feeding encoded video packets in from the
-    /// encoder forwarding task; every `/stream` client subscribes to the
+    /// encoder forwarding task; every `/client` client subscribes to the
     /// same underlying broadcast channel.
     pub fn get_video_sender(&self) -> broadcast::Sender<EncodedPacket> {
         self.video_tx.clone()
@@ -342,9 +342,6 @@ impl SignalingServer {
     pub fn new(state: SignalingState) -> Self {
         let router = Router::new()
             .route("/", get(serve_index))
-            .route("/ws", get(handle_websocket))
-            .route("/stream", get(handle_video_stream))
-            .route("/audio", get(handle_audio_stream))
             .route("/client", get(handle_unified_client))
             .fallback(serve_asset)
             .layer(TraceLayer::new_for_http())
@@ -379,269 +376,9 @@ impl SignalingServer {
     }
 }
 
-/// Handle the control WebSocket (`/ws`): touch/pointer/resize/latency and
-/// keyframe-resync requests.
-async fn handle_websocket(
-    ws: WebSocketUpgrade,
-    State(state): State<SignalingState>,
-) -> Response {
-    ws.on_upgrade(move |socket| websocket_handler(socket, state))
-}
-
-async fn websocket_handler(socket: WebSocket, state: SignalingState) {
-    state.session.ensure_started().await;
-
-    let (mut sender, mut receiver) = socket.split();
-    let mut bitrate_rx = state.bitrate_rx.clone();
-    let mut codec_rx = state.codec_rx.clone();
-    let mut cursor_rx = state.cursor_rx.clone();
-    let mut shutdown_rx = state.shutdown_rx.clone();
-    // Save for post-disconnect cleanup (state is moved into the loop below).
-    let touch_tx_cleanup = state.touch_tx.clone();
-
-    // Push the current bitrate right away -- otherwise a client connecting
-    // between adaptive-bitrate adjustments would see nothing until the next
-    // change, which on a settled stream might be a long time off.
-    let initial_bitrate = *bitrate_rx.borrow();
-    if send_server_message(&mut sender, &ServerMessage::Bitrate { bps: initial_bitrate }).await.is_err() {
-        return;
-    }
-
-    // Same idea for the codec string: a client connecting after the
-    // encoder has already settled on a non-default level (e.g. after a
-    // resolution change before this client connected) needs that level up
-    // front, not just on the next change.
-    let initial_codec = codec_rx.borrow().clone();
-    if send_server_message(&mut sender, &ServerMessage::Codec { codec: initial_codec }).await.is_err() {
-        return;
-    }
-
-    // Push the current cursor state so the client renders the right cursor
-    // immediately (e.g. reconnecting while an app is running).
-    let initial_cursor = cursor_rx.borrow().clone();
-    if send_server_message(&mut sender, &ServerMessage::Cursor { cursor: initial_cursor }).await.is_err() {
-        return;
-    }
-
-loop {
-            tokio::select! {
-                incoming = receiver.next() => {
-                    let Some(Ok(msg)) = incoming else { break; };
-                    let Message::Text(text) = msg else { continue; };
-                    let Ok(signal) = serde_json::from_str::<SignalingMessage>(&text) else { continue; };
-                    dispatch_signaling_message(signal, &state).await;
-                }
-            changed = bitrate_rx.changed() => {
-                if changed.is_err() {
-                    // Sender side dropped; bitrate just won't update further.
-                    continue;
-                }
-                let bps = *bitrate_rx.borrow();
-                if send_server_message(&mut sender, &ServerMessage::Bitrate { bps }).await.is_err() {
-                    break;
-                }
-            }
-            changed = codec_rx.changed() => {
-                if changed.is_err() {
-                    // Sender side (encoder thread) dropped; codec just won't update further.
-                    continue;
-                }
-                let codec = codec_rx.borrow().clone();
-                if send_server_message(&mut sender, &ServerMessage::Codec { codec }).await.is_err() {
-                    break;
-                }
-            }
-            changed = cursor_rx.changed() => {
-                if changed.is_err() {
-                    continue;
-                }
-                let cursor = cursor_rx.borrow().clone();
-                if send_server_message(&mut sender, &ServerMessage::Cursor { cursor }).await.is_err() {
-                    break;
-                }
-            }
-            _ = shutdown_rx.changed() => {
-                let _ = sender.send(Message::Close(Some(CloseFrame {
-                    code: close_code::AWAY,
-                    reason: "server shutting down".into(),
-                }))).await;
-                break;
-            }
-        }
-    }
-    let _ = touch_tx_cleanup.send(TouchEvent::Cancel { touches: vec![] }).await;
-}
-
-async fn send_server_message(
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    msg: &ServerMessage,
-) -> Result<(), axum::Error> {
-    sender
-        .send(Message::Text(serde_json::to_string(msg).expect("ServerMessage always serializes")))
-        .await
-}
-
-/// Handle the binary video WebSocket (`/stream`). Each connected client gets
-/// its own subscription to the shared `video_tx` broadcast channel and a
-/// dedicated send loop; one WebSocket message per encoded frame, no RTP/SDP
-/// involved.
-async fn handle_video_stream(
-    ws: WebSocketUpgrade,
-    State(state): State<SignalingState>,
-) -> Response {
-    ws.on_upgrade(move |socket| video_stream_handler(socket, state))
-}
-
-/// Wire format for each binary frame sent to the client:
-/// ```text
-/// byte 0     : frame_type (0 = delta, 1 = key)
-/// bytes 1-4  : frame_id (u32, big-endian)
-/// byte 5     : has_ping_echo (0 or 1)
-/// bytes 6-13 : ping_echo_client_ts (f64, big-endian; valid only if byte 5 == 1)
-/// bytes 14.. : raw Annex-B H.264 for the whole frame
-/// ```
-/// The ping echo round-trips a client's `ping` (`SignalingMessage::Ping`)
-/// back on whichever frame next leaves the encoder, so the client can
-/// measure full pipeline latency (its own clock only, no sync needed) --
-/// see `VideoStream` in web/src/lib/stream.ts.
-const STREAM_FRAME_HEADER_BYTES: usize = 14;
-
-fn encode_video_frame(packet: &EncodedPacket) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(STREAM_FRAME_HEADER_BYTES + packet.data.len());
-    buf.push(packet.is_keyframe as u8);
-    buf.extend_from_slice(&packet.frame_id.to_be_bytes());
-    match packet.ping_echo_client_ts {
-        Some(ts) => {
-            buf.push(1);
-            buf.extend_from_slice(&ts.to_be_bytes());
-        }
-        None => {
-            buf.push(0);
-            buf.extend_from_slice(&0f64.to_be_bytes());
-        }
-    }
-    buf.extend_from_slice(&packet.data);
-    buf
-}
-
-async fn video_stream_handler(socket: WebSocket, state: SignalingState) {
-    info!("Video stream client connected");
-    state.session.ensure_started().await;
-
-    let (mut sender, _receiver) = socket.split();
-    let mut video_rx = state.get_video_sender().subscribe();
-    let mut shutdown_rx = state.shutdown_rx.clone();
-
-    // Request a fresh keyframe and force a render right away -- otherwise
-    // this client has no decodable frame to start from until the screen
-    // happens to change or the next GOP-cycle keyframe comes around.
-    state.force_render.store(true, Ordering::Relaxed);
-    if let Err(e) = state.encoder_control_tx.send(EncoderControl::ForceKeyframe).await {
-        warn!("Failed to request keyframe for new video stream client: {}", e);
-    }
-
-    loop {
-        tokio::select! {
-            packet = video_rx.recv() => {
-                let packet = match packet {
-                    Ok(packet) => packet,
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!("Video stream client lagging, skipped {} frame(s)", skipped);
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                };
-
-                let frame = encode_video_frame(&packet);
-                if sender.send(Message::Binary(frame)).await.is_err() {
-                    break;
-                }
-            }
-            _ = shutdown_rx.changed() => {
-                let _ = sender.send(Message::Close(Some(CloseFrame {
-                    code: close_code::AWAY,
-                    reason: "server shutting down".into(),
-                }))).await;
-                break;
-            }
-        }
-    }
-
-    info!("Video stream client disconnected");
-}
-
-/// Handle the Opus audio WebSocket (`/audio`).
-///
-/// Wire format per message (binary):
-/// ```text
-/// bytes 0-7  : pts_us (u64, big-endian) — presentation timestamp in microseconds
-/// bytes 8..  : raw Opus packet (one 20 ms frame)
-/// ```
-async fn handle_audio_stream(
-    ws: WebSocketUpgrade,
-    State(state): State<SignalingState>,
-) -> Response {
-    ws.on_upgrade(move |socket| audio_stream_handler(socket, state))
-}
-
-async fn audio_stream_handler(socket: WebSocket, state: SignalingState) {
-    let Some(ref audio_tx) = state.audio_tx else {
-        // Audio capture is not available; close immediately with a normal close code.
-        let (mut sender, _) = socket.split();
-        let _ = sender
-            .send(Message::Close(Some(CloseFrame {
-                code: close_code::NORMAL,
-                reason: "audio capture not available".into(),
-            })))
-            .await;
-        return;
-    };
-
-    info!("Audio stream client connected");
-    let (mut sender, _receiver) = socket.split();
-    let mut audio_rx = audio_tx.subscribe();
-    let mut shutdown_rx = state.shutdown_rx.clone();
-
-    loop {
-        tokio::select! {
-            packet = audio_rx.recv() => {
-                let packet = match packet {
-                    Ok(p) => p,
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Audio stream client lagging, skipped {} packet(s)", n);
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                };
-                let frame = encode_audio_frame(&packet);
-                if sender.send(Message::Binary(frame)).await.is_err() {
-                    break;
-                }
-            }
-            _ = shutdown_rx.changed() => {
-                let _ = sender.send(Message::Close(Some(CloseFrame {
-                    code: close_code::AWAY,
-                    reason: "server shutting down".into(),
-                }))).await;
-                break;
-            }
-        }
-    }
-
-    info!("Audio stream client disconnected");
-}
-
-fn encode_audio_frame(packet: &AudioPacket) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(8 + packet.data.len());
-    buf.extend_from_slice(&packet.pts_us.to_be_bytes());
-    buf.extend_from_slice(&packet.data);
-    buf
-}
-
-/// Handle the unified client WebSocket (`/client`) that combines the control
-/// channel (`/ws`), video stream (`/stream`), and audio stream (`/audio`)
-/// into one connection using the shared 8-byte `proto::HEADER_LEN` framing.
-/// See `docs/native-client-plan.md` Part 2.
+/// Handle the `/client` WebSocket -- the single endpoint that multiplexes
+/// video, audio, and control (input/resize/latency/clipboard) over the shared
+/// 8-byte `proto::HEADER_LEN` framing.
 async fn handle_unified_client(
     ws: WebSocketUpgrade,
     State(state): State<SignalingState>,
@@ -677,9 +414,9 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
     let mut clipboard_out_rx = state.clipboard_out_rx.clone();
     let mut shutdown_rx = state.shutdown_rx.clone();
 
-    // Push the current bitrate/codec/cursor up front for the same reasons as
-    // the standalone /ws handler -- a client connecting between changes
-    // (or after the encoder has settled on a non-default level) needs the
+    // Push the current bitrate/codec/cursor up front: a client connecting
+    // between changes (or after the encoder has settled on a non-default
+    // level) needs the
     // current state, not the next one. Each value is bound to a local first
     // so the `watch::Ref` borrow is released before the `.await` (it isn't
     // `Send`, and would otherwise extend across the await point).
@@ -720,9 +457,8 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
         }
     }
 
-    // Same keyframe-forcing behavior as the standalone /stream handler:
-    // otherwise a new client has no decodable frame to start from until
-    // the next damage or GOP-cycle keyframe.
+    // Force a keyframe so a new client has a decodable frame to start from,
+    // rather than waiting for the next damage or GOP-cycle keyframe.
     state.force_render.store(true, Ordering::Relaxed);
     if let Err(e) = state.encoder_control_tx.send(EncoderControl::ForceKeyframe).await {
         warn!("Failed to request keyframe for new unified client: {}", e);
@@ -872,8 +608,7 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
 /// bytes 20..  : raw Annex-B H.264 NAL data
 /// ```
 /// `is_keyframe` and `has_ping_echo` are carried in the header `flags`
-/// byte, not inline -- saving the two flag bytes the legacy `/stream`
-/// format uses.
+/// byte, not inline in the payload.
 ///
 /// Takes the packet by ownership so the H.264 buffer can be moved into the
 /// framed message with `Vec::append` (no extra allocation or copy beyond
@@ -907,9 +642,8 @@ fn encode_unified_video_frame(mut packet: EncodedPacket) -> Vec<u8> {
 /// bytes 0-7 : pts_us (u64, big-endian)
 /// bytes 8.. : raw Opus packet
 /// ```
-/// Identical to the legacy `/audio` wire format, just wrapped in the
-/// shared header. Takes ownership for the same zero-copy reason as
-/// `encode_unified_video_frame`.
+/// 8-byte big-endian pts header + the raw Opus packet. Takes ownership for the
+/// same zero-copy reason as `encode_unified_video_frame`.
 fn encode_unified_audio_frame(mut packet: AudioPacket) -> Vec<u8> {
     let payload_len = 8 + packet.data.len();
     let mut buf = Vec::with_capacity(proto::HEADER_LEN + payload_len);
@@ -1011,11 +745,9 @@ async fn recv_audio(
     }
 }
 
-/// Shared dispatch for an incoming `SignalingMessage`. Both the
-/// legacy `/ws` handler (text-framed JSON) and the unified `/client`
-/// handler (binary-framed via `parse_client_message`) route through here
-/// so the two transports can never drift apart in how they handle
-/// resize/input/keyframe-resync/latency/ping.
+/// Shared dispatch for an incoming `SignalingMessage` from the `/client`
+/// endpoint (binary-framed via `parse_client_message`): resize, input,
+/// keyframe-resync, latency, ping, and clipboard.
 async fn dispatch_signaling_message(signal: SignalingMessage, state: &SignalingState) {
     match signal {
         SignalingMessage::Ready => {
@@ -1215,16 +947,6 @@ mod tests {
         payload
     }
 
-    /// Returns the close-frame status code and UTF-8 reason string.
-    async fn read_ws_close_frame(stream: &mut TcpStream) -> (u16, String) {
-        let (opcode, payload) = read_ws_frame(stream).await;
-        assert_eq!(opcode, 8, "expected a close frame (opcode 8)");
-        assert!(payload.len() >= 2, "close frame must carry a status code");
-        let code = u16::from_be_bytes([payload[0], payload[1]]);
-        let reason = String::from_utf8(payload[2..].to_vec()).unwrap_or_default();
-        (code, reason)
-    }
-
     fn make_signaling_state(
         shutdown_rx: watch::Receiver<bool>,
         shutdown_tx: watch::Sender<bool>,
@@ -1259,129 +981,6 @@ mod tests {
             mpsc::channel(4).0,
             watch::channel(ClipboardData::Text(String::new())).1,
         )
-    }
-
-    #[tokio::test]
-    async fn stream_endpoint_delivers_frames_in_wire_format() {
-        let (encoder_control_tx, mut encoder_control_rx) = mpsc::channel(4);
-        let (pending_ping_tx, _pending_ping_rx) = mpsc::channel(4);
-        let (_, bitrate_rx) = watch::channel(2_000_000usize);
-        let (_, codec_rx) = watch::channel(String::new());
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let force_render = Arc::new(AtomicBool::new(false));
-        let (_, cursor_rx) = watch::channel(CursorUpdate::Default);
-        let state = SignalingState::new(
-            mpsc::channel(4).0,
-            mpsc::channel(4).0,
-            mpsc::channel(4).0,
-            mpsc::channel(4).0,
-            None, None,
-            encoder_control_tx,
-            force_render.clone(),
-            pending_ping_tx,
-            bitrate_rx, codec_rx,
-            shutdown_rx,
-            SessionManager::new(Vec::new(), String::new(), shutdown_tx),
-            None,
-            cursor_rx,
-            mpsc::channel(4).0,
-            watch::channel(ClipboardData::Text(String::new())).1,
-        );
-        let video_tx = state.get_video_sender();
-        let server = SignalingServer::new(state);
-
-        let addr = "127.0.0.1:27345";
-        tokio::spawn(async move {
-            server.serve("127.0.0.1", 27345, std::future::pending()).await.unwrap();
-        });
-
-        // Give the server a moment to start accepting connections, and the
-        // handler a moment to subscribe -- the broadcast channel has no
-        // replay for late subscribers.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let mut stream = ws_handshake(addr, "/stream").await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        assert!(force_render.load(Ordering::Relaxed), "connecting should force a render");
-        assert!(matches!(
-            encoder_control_rx.try_recv(),
-            Ok(EncoderControl::ForceKeyframe)
-        ), "connecting should request a fresh keyframe");
-
-        fn test_packet(data: Vec<u8>, is_keyframe: bool, frame_id: u32) -> EncodedPacket {
-            EncodedPacket {
-                data,
-                is_keyframe,
-                frame_id,
-                capture_to_encode_ms: 0.0,
-                encoding_ms: 0.0,
-                encode_complete: std::time::Instant::now(),
-                ping_echo_client_ts: None,
-            }
-        }
-
-        assert!(video_tx.send(test_packet(vec![0xAA, 0xBB, 0xCC], true, 42)).is_ok());
-        assert!(video_tx.send(test_packet(vec![0xDD], false, 43)).is_ok());
-
-        let frame1 = read_ws_binary_frame(&mut stream).await;
-        assert_eq!(frame1[0], 1, "expected keyframe flag");
-        assert_eq!(u32::from_be_bytes([frame1[1], frame1[2], frame1[3], frame1[4]]), 42);
-        assert_eq!(frame1[5], 0, "expected no ping echo on this frame");
-        assert_eq!(&frame1[STREAM_FRAME_HEADER_BYTES..], &[0xAA, 0xBB, 0xCC]);
-
-        let frame2 = read_ws_binary_frame(&mut stream).await;
-        assert_eq!(frame2[0], 0, "expected delta flag");
-        assert_eq!(u32::from_be_bytes([frame2[1], frame2[2], frame2[3], frame2[4]]), 43);
-        assert_eq!(&frame2[STREAM_FRAME_HEADER_BYTES..], &[0xDD]);
-    }
-
-    /// Wire format: [u64 pts_us BE][raw Opus bytes].
-    #[tokio::test]
-    async fn audio_endpoint_delivers_frames_in_wire_format() {
-        let (audio_tx, _) = broadcast::channel::<AudioPacket>(4);
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let state = make_signaling_state(shutdown_rx, shutdown_tx, Some(audio_tx.clone()));
-        let server = SignalingServer::new(state);
-
-        let addr = "127.0.0.1:27346";
-        tokio::spawn(async move {
-            server.serve("127.0.0.1", 27346, std::future::pending()).await.unwrap();
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let mut stream = ws_handshake(addr, "/audio").await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let opus_data = vec![0xAA, 0xBB, 0xCC, 0xDD];
-        let pts_us: u64 = 20_000;
-        assert!(audio_tx.send(AudioPacket { data: opus_data.clone(), pts_us }).is_ok());
-
-        let frame = read_ws_binary_frame(&mut stream).await;
-        assert!(frame.len() >= 8, "audio frame must have at least 8-byte header");
-        let pts_received = u64::from_be_bytes(frame[..8].try_into().unwrap());
-        assert_eq!(pts_received, pts_us, "PTS must round-trip correctly");
-        assert_eq!(&frame[8..], &opus_data, "Opus payload must follow the header");
-    }
-
-    /// When audio capture failed at startup, /audio closes immediately with
-    /// NORMAL (1000) and reason "audio capture not available".
-    #[tokio::test]
-    async fn audio_endpoint_closes_when_capture_unavailable() {
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let state = make_signaling_state(shutdown_rx, shutdown_tx, None);
-        let server = SignalingServer::new(state);
-
-        let addr = "127.0.0.1:27347";
-        tokio::spawn(async move {
-            server.serve("127.0.0.1", 27347, std::future::pending()).await.unwrap();
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let mut stream = ws_handshake(addr, "/audio").await;
-
-        let (code, reason) = read_ws_close_frame(&mut stream).await;
-        assert_eq!(code, 1000, "expected NORMAL close code");
-        assert_eq!(reason, "audio capture not available");
     }
 
     /// Parses the proto header from a binary WS payload returned by the
@@ -1496,8 +1095,7 @@ mod tests {
     }
 
     /// /client delivers an `EncodedPacket` over the unified framing,
-    /// with the is_keyframe flag set in the header (not inline like the
-    /// legacy `/stream` format).
+    /// with the is_keyframe flag set in the header (not inline in the payload).
     #[tokio::test]
     async fn client_endpoint_delivers_video_in_unified_framing() {
         let (encoder_control_tx, mut encoder_control_rx) = mpsc::channel(4);

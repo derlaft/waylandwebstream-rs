@@ -25,7 +25,7 @@ pub struct RawFrame {
 /// A frame handed from a `Compositor` to a `VideoEncoder`, in whichever
 /// memory the compositor produced it in. `SwCompositor` only ever produces
 /// `Cpu`. `GlCompositor` produces `Gpu` when paired with `--encoder vaapi`
-/// (`EncoderConfig::gpu_frames`, hardware-acceleration-plan.md Phase B.5),
+/// (`EncoderConfig::gpu_frames`, AGENTS.md),
 /// letting `VaapiEncoder` import the dmabuf straight into a VAAPI surface
 /// with no CPU round-trip; otherwise (`--encoder x264`, which can't accept a
 /// `Gpu` frame) it still produces `Cpu` via GL readback.
@@ -57,7 +57,7 @@ impl CapturedFrame {
 }
 
 /// Which codec implementation the encoder thread drives. `Vaapi` is the
-/// hardware-acceleration-plan.md Phase A backend (`vaapi::VaapiEncoder`):
+/// AGENTS.md backend (`vaapi::VaapiEncoder`):
 /// `hwupload,scale_vaapi=format=nv12` does BGRA->NV12 on the GPU, then
 /// `h264_vaapi` encodes the result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -125,7 +125,7 @@ pub struct EncoderConfig {
     /// DRM render node opened by `EncoderBackend::Vaapi`. Unused by `X264`.
     pub vaapi_device: String,
     /// Whether the render loop will hand `EncoderBackend::Vaapi` frames as
-    /// `CapturedFrame::Gpu` (hardware-acceleration-plan.md Phase B.5,
+    /// `CapturedFrame::Gpu` (AGENTS.md,
     /// zero-copy dmabuf import) rather than `CapturedFrame::Cpu`. Set when
     /// `--compositor gl` actually initialized (see `main.rs`) -- decided
     /// once at startup, never toggled at runtime, since the compositor
@@ -238,7 +238,7 @@ pub fn spawn_encoder(
 /// selection happens once at thread start (see `build_video_encoder`), based
 /// on `EncoderConfig::encoder_backend` -- the thread loop itself never
 /// touches a concrete codec type again, so a future VAAPI backend
-/// (hardware-acceleration-plan.md Phase A) drops in without reshaping this
+/// (AGENTS.md) drops in without reshaping this
 /// loop a second time.
 pub trait VideoEncoder {
     /// Encode one frame, returning zero or more ready packets. Implementors
@@ -846,7 +846,7 @@ mod tests {
     }
 
     /// Regression test for a real bug found while wiring up forced
-    /// keyframes for new `/stream` clients: `EncoderControl::ForceKeyframe`
+    /// keyframes for new `/client` clients: `EncoderControl::ForceKeyframe`
     /// used to just reset a local PTS counter, which libx264 ignores for
     /// IDR placement (it uses its own internal counter against
     /// `g`/`keyint_min`), so requested keyframes silently never happened.
@@ -854,7 +854,7 @@ mod tests {
     ///
     /// Also exercises the case that mirrors production: the keyframe
     /// request and the frame it's meant to apply to arrive back-to-back
-    /// (a `/stream` connect requests a keyframe, and the capture loop
+    /// (a `/client` connect requests a keyframe, and the capture loop
     /// renders+sends a frame for it moments later) -- this depends on the
     /// encoder thread draining the control channel again after
     /// `blocking_recv`, not just before it.

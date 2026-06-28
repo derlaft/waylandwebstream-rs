@@ -24,7 +24,7 @@ use crate::encoder::{CapturedFrame, RawFrame};
 use super::Compositor;
 use super::state::WaylandWebStreamState;
 
-/// GPU compositor (hardware-acceleration-plan.md Phase B): renders the
+/// GPU compositor (AGENTS.md): renders the
 /// `Space` with smithay's `GlesRenderer` into an offscreen GBM/dmabuf target
 /// instead of the manual SHM memcpy `WaylandWebStreamState::render` does.
 /// What happens to that target then depends on `produce_gpu_frames`: read
@@ -42,8 +42,8 @@ use super::state::WaylandWebStreamState;
 ///
 /// `renderer` is `Rc<RefCell<_>>`, not owned outright, so `WaylandWebStreamState`
 /// can hold a clone of the same handle for `linux-dmabuf` import
-/// (`DmabufHandler::dmabuf_imported`, hardware-acceleration-plan.md Phase
-/// B.4) without this struct's render path and the dmabuf-import callback
+/// (`DmabufHandler::dmabuf_imported`, see AGENTS.md) without this struct's
+/// render path and the dmabuf-import callback
 /// fighting over two different `GlesRenderer`s. Single-threaded by
 /// construction (the compositor render loop owns this on one thread), so
 /// `Rc`/`RefCell` rather than `Arc`/`Mutex`.

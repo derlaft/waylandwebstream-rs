@@ -14,9 +14,8 @@ to Opus, and delivers both to a browser client over a binary WebSocket, where
 the browser's `VideoDecoder` (WebCodecs) decodes each frame straight into a
 `<canvas>`. The user controls the remote desktop through touch, pointer,
 keyboard, and clipboard events sent back over the same connection and injected
-directly into the compositor's input pipeline. A unified `/client` WebSocket
-multiplexes video, audio, and control in one connection (the legacy `/stream`,
-`/audio`, and `/ws` endpoints remain).
+directly into the compositor's input pipeline. A single `/client` WebSocket
+multiplexes video, audio, and control in one connection.
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -30,12 +29,12 @@ multiplexes video, audio, and control in one connection (the legacy `/stream`,
 │         │ inject                  H.264 packets     │
 │         │ input                          │          │
 │  ┌──────┴───────┐                 ┌──────▼───────┐  │
-│  │   Input      │ <─── /ws ────── │  /stream      │  │
+│  │   Input      │ <── /client ─── │  /client      │  │
 │  │   Handler    │                 │  WebSocket    │  │
 │  └──────────────┘                 └──────┬───────┘  │
 │                                          │          │
 │  ┌──────────────┐                        │          │
-│  │ HTTP/WS      │ ◄──── /ws ──────────────┘          │
+│  │ HTTP/WS      │ ◄──── /client ──────────┘          │
 │  │ server (axum)│                                   │
 │  └──────────────┘                                   │
 └──────────────────────────────────────────────────────┘
@@ -89,9 +88,9 @@ multiplexes video, audio, and control in one connection (the legacy `/stream`,
 |---|---|---|
 | Compositor | [smithay](https://github.com/Smithay/smithay) | Headless Wayland compositor with software or GL rendering; dynamic output resizing |
 | Video encoding | [ffmpeg-next](https://github.com/zmwangx/rust-ffmpeg) | H.264 encoding from framebuffer pixels (x264 software, or VA-API hardware) |
-| Audio | [pipewire](https://pipewire.org) + [opus](https://opus-codec.org) | PipeWire loopback capture, Opus-encoded, streamed over the unified `/client` (and legacy `/audio`) |
-| Streaming | built-in (axum WebSocket) | Binary H.264 frames over the unified `/client` (and legacy `/stream`), decoded client-side with WebCodecs |
-| Control channel | built-in (hyper/axum) | Input, resize, latency, and clipboard messages over the unified `/client` (and legacy `/ws`) |
+| Audio | [pipewire](https://pipewire.org) + [opus](https://opus-codec.org) | PipeWire loopback capture, Opus-encoded, streamed over `/client` |
+| Streaming | built-in (axum WebSocket) | Binary H.264 frames over the unified `/client`, decoded client-side with WebCodecs |
+| Control channel | built-in (hyper/axum) | Input, resize, latency, and clipboard messages over the unified `/client` |
 | Input | direct Smithay injection | Touch/keyboard/mouse events injected into SeatState; keyboard forwards physical key identity (`KeyboardEvent.code`), so the browser's OS keyboard layout should match the server's XKB layout for correct characters |
 | Clipboard | [wayland-client](https://github.com/Smithay/wayland-rs) (ext/wlr-data-control) | Bidirectional text + image sync via a data-control client of the nested compositor (no daemon) |
 | Web client | [Svelte](https://svelte.dev) + [Vite](https://vite.dev), embedded via `rust-embed` | `<canvas>` + WebCodecs decode, touch/pointer/keyboard capture, on-screen keyboard, clipboard sync, collapsible stats panel; compiled to a static bundle and baked into the binary |
@@ -133,7 +132,7 @@ resulting `web/dist/` into the binary, so `cargo build` alone is enough.
 ### Web client dev loop
 
 For live-reloading frontend work, run the Rust server and the Vite dev
-server side by side -- Vite proxies `/ws` and `/stream` to the backend so
+server side by side -- Vite proxies `/client` to the backend so
 you get HMR against a real compositor:
 
 ```sh
@@ -172,7 +171,7 @@ compositor's headless Wayland display:
 ```
 
 The session is lazy: the command above isn't started at server launch, only
-once the first browser connection (`/ws` or `/stream`) arrives, so an idle
+once the first browser connection (`/client`) arrives, so an idle
 server with nobody watching never runs it. It's started at most once per
 server run and killed on shutdown.
 

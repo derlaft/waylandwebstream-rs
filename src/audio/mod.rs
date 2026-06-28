@@ -8,8 +8,8 @@
 //      via `pactl load-module module-null-sink`), the capture stream monitors that instead.
 //   2. Incoming F32LE PCM samples are buffered into 20 ms / 960-sample Opus frames and
 //      encoded to Opus at 96 kbps stereo.
-//   3. Encoded AudioPackets are broadcast over a tokio broadcast channel consumed by /audio
-//      WebSocket clients.
+//   3. Encoded AudioPackets are broadcast over a tokio broadcast channel consumed by the
+//      /client WebSocket.
 //
 // The PipeWire main loop runs on a dedicated OS thread.  Process exit kills it cleanly.
 

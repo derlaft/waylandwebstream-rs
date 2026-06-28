@@ -134,7 +134,7 @@ pub struct WaylandWebStreamState {
     // Counts calls to `render()`, used to throttle its debug/trace logging.
     frame_counter: u32,
 
-    // `linux-dmabuf` (hardware-acceleration-plan.md Phase B.4). Both `None`
+    // `linux-dmabuf` (AGENTS.md). Both `None`
     // until `enable_dmabuf` registers the global -- only meaningful with the
     // `gl` compositor backend, since `SwCompositor`'s SHM-only render path
     // has no renderer to import a client's dmabuf into. `dmabuf_renderer` is
@@ -1154,7 +1154,7 @@ impl BufferHandler for WaylandWebStreamState {
 // Output handler
 impl OutputHandler for WaylandWebStreamState {}
 
-// `linux-dmabuf` handler (hardware-acceleration-plan.md Phase B.4). Only
+// `linux-dmabuf` handler (AGENTS.md). Only
 // reachable once `enable_dmabuf` has run (`gl` compositor backend); the
 // global itself isn't advertised otherwise, so `dmabuf_imported` only fires
 // when `dmabuf_renderer` is actually `Some`.

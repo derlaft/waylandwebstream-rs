@@ -41,7 +41,7 @@
 //! `AdaptiveBitrateController` is the thin async wrapper that drives it from
 //! real time and an encoder control channel.
 //!
-//! Note: one encoder feeds every connected `/stream` client (see
+//! Note: one encoder feeds every connected `/client` client (see
 //! `SignalingState::video_tx` in `src/server.rs`), so a cut triggered by one
 //! struggling client lowers the rate for all of them. That's an existing
 //! property of the single shared-encoder broadcast design, not something
@@ -233,7 +233,7 @@ pub struct AdaptiveBitrateController {
     adjustment_interval: Duration,
     encoder_control_tx: mpsc::Sender<EncoderControl>,
     event_rx: mpsc::Receiver<BitrateEvent>,
-    /// Surfaces the current target bitrate to `/ws` clients (see
+    /// Surfaces the current target bitrate to `/client` clients (see
     /// `SignalingState::bitrate_rx` in src/server.rs).
     bitrate_tx: watch::Sender<usize>,
 }

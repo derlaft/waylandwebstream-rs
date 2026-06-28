@@ -14,7 +14,7 @@ use state::WaylandWebStreamState;
 ///
 /// `SwCompositor` wraps the manual memcpy compositor in
 /// `WaylandWebStreamState::render`. `GlCompositor`
-/// (hardware-acceleration-plan.md Phase B, stage 1) renders the same `Space`
+/// (AGENTS.md, stage 1) renders the same `Space`
 /// with smithay's `GlesRenderer` instead, reading the result back to the CPU
 /// -- zero-copy GPU encode (no CPU round-trip) is a later stage.
 pub trait Compositor {

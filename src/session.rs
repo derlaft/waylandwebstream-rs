@@ -1,7 +1,7 @@
 // Lazily starts the session's client app (the `-- <command> [args...]`
 // passed on the command line) inside the compositor's Wayland display.
 // "Lazy" means the process isn't spawned at server startup -- only once the
-// first browser connection (`/ws` or `/stream`) arrives, so an idle server
+// first browser connection (`/client`) arrives, so an idle server
 // with nobody watching never pays for running it.
 
 use std::collections::HashSet;

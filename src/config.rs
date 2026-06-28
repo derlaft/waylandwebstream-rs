@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 
 /// Which `Compositor` backend renders the output. `Gl`
-/// (hardware-acceleration-plan.md Phase B) isn't implemented yet -- selecting
+/// (AGENTS.md) isn't implemented yet -- selecting
 /// it falls back to `Sw` with a warning instead of failing to start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lower")]
@@ -11,7 +11,7 @@ pub enum CompositorBackendArg {
 }
 
 /// Which `VideoEncoder` backend encodes captured frames. `Vaapi`
-/// (hardware-acceleration-plan.md Phase A) does H.264 encode on the GPU via
+/// (AGENTS.md) does H.264 encode on the GPU via
 /// `hwupload,scale_vaapi=format=nv12` + `h264_vaapi`; needs `--vaapi-device`
 /// to point at a render node that actually has VAAPI H.264 encode support.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -94,13 +94,13 @@ pub struct Config {
     /// Rendering backend. `gl` (GPU compositing via smithay's GlesRenderer,
     /// reading the result back to the CPU -- no zero-copy GPU encode path
     /// yet) falls back to `sw` with a warning if GL/EGL/GBM initialization
-    /// fails. See docs/hardware-acceleration-plan.md Phase B.
+    /// fails. See AGENTS.md
     #[arg(long, value_enum, default_value = "sw")]
     pub compositor: CompositorBackendArg,
 
     /// Video encoder backend. `vaapi` does hardware H.264 encode --
     /// requires a render node with VAAPI H.264 EncSlice support (check with
-    /// `vainfo`). See docs/hardware-acceleration-plan.md Phase A.
+    /// `vainfo`). See AGENTS.md
     #[arg(long, value_enum, default_value = "x264")]
     pub encoder: EncoderBackendArg,
 
@@ -110,7 +110,7 @@ pub struct Config {
     #[arg(long, default_value = "/dev/dri/renderD128")]
     pub vaapi_device: String,
 
-    /// Disable PipeWire audio capture. The `/audio` WebSocket endpoint will
+    /// Disable PipeWire audio capture. The `/client` WebSocket endpoint will
     /// close immediately with "audio capture not available" when this is set.
     #[arg(long)]
     pub no_audio: bool,
