@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import FullscreenButton from './FullscreenButton.svelte';
+  import NativeResolutionButton from './NativeResolutionButton.svelte';
   import StatsPanel from './StatsPanel.svelte';
 
   interface Props {
@@ -69,6 +70,7 @@
   </button>
   <div class="content" id="side-panel-content" inert={!open}>
     <FullscreenButton {fullscreenTarget} />
+    <NativeResolutionButton />
     <StatsPanel />
   </div>
 </div>

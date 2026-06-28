@@ -1,9 +1,11 @@
 // Computes the server-side render resolution from the viewport, and keeps
-// the canvas's CSS size in sync, top-left aligned. Render resolution is in
-// CSS px, *not* multiplied by devicePixelRatio: capture/encode cost scales
-// with pixel count, and on a DPR=2 display matching device pixels would
-// mean encoding 4x the pixels for a sharpness gain that isn't worth the
-// CPU (a softer-than-native image on HiDPI is the accepted trade-off).
+// the canvas's CSS size in sync, top-left aligned. By default render
+// resolution is in CSS px, *not* multiplied by devicePixelRatio: capture/
+// encode cost scales with pixel count, and on a DPR=2 display matching
+// device pixels would mean encoding 4x the pixels for a sharpness gain
+// that isn't always worth the CPU (a softer-than-native image on HiDPI is
+// the default trade-off). The `nativeResolution` toggle opts back into
+// device-pixel rendering for a crisp, native-resolution image.
 import { writable } from 'svelte/store';
 import type { ClientMessage } from './protocol';
 
@@ -12,6 +14,12 @@ import type { ClientMessage } from './protocol';
 /// a store so that button can flip it later without any other module
 /// changing.
 export const scaleFactor = writable(1);
+
+/// When `true`, render resolution is multiplied by devicePixelRatio so the
+/// stream is rendered at the display's native device-pixel resolution
+/// instead of CSS px -- crisp on HiDPI screens at the cost of encoding
+/// more pixels. Default `false`. Toggled by the native-resolution button.
+export const nativeResolution = writable(false);
 
 // Mirrors the CLI default in src/config.rs (`--max-resolution`, default
 // "3840x2160"). The server doesn't expose its actually-configured value
@@ -44,11 +52,11 @@ function getViewportCssSize(): { width: number; height: number } {
   return { width: window.innerWidth, height: window.innerHeight };
 }
 
-export function computeRenderResolution(scale: number): RenderResolution {
+export function computeRenderResolution(scale: number, pixelRatio = 1): RenderResolution {
   const { width, height } = getViewportCssSize();
   return {
-    width: Math.min(floorToAlignment(width / scale), MAX_RENDER_WIDTH),
-    height: Math.min(floorToAlignment(height / scale), MAX_RENDER_HEIGHT),
+    width: Math.min(floorToAlignment((width * pixelRatio) / scale), MAX_RENDER_WIDTH),
+    height: Math.min(floorToAlignment((height * pixelRatio) / scale), MAX_RENDER_HEIGHT),
   };
 }
 
@@ -62,9 +70,11 @@ export class Viewport {
   private readonly sendControl: (msg: ClientMessage) => void;
 
   private currentScale = 1;
+  private useNative = false;
   private lastSent: RenderResolution | null = null;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private unsubscribeScale: (() => void) | null = null;
+  private unsubscribeNative: (() => void) | null = null;
 
   constructor(opts: ViewportOptions) {
     this.canvas = opts.canvas;
@@ -74,6 +84,10 @@ export class Viewport {
   start(): void {
     this.unsubscribeScale = scaleFactor.subscribe((scale) => {
       this.currentScale = scale;
+      this.update();
+    });
+    this.unsubscribeNative = nativeResolution.subscribe((native) => {
+      this.useNative = native;
       this.update();
     });
 
@@ -93,6 +107,8 @@ export class Viewport {
   stop(): void {
     this.unsubscribeScale?.();
     this.unsubscribeScale = null;
+    this.unsubscribeNative?.();
+    this.unsubscribeNative = null;
 
     window.removeEventListener('resize', this.handleWindowResize);
     window.removeEventListener('orientationchange', this.handleWindowResize);
@@ -117,7 +133,11 @@ export class Viewport {
   };
 
   private update(): void {
-    const render = computeRenderResolution(this.currentScale);
+    // devicePixelRatio is read live: it changes with browser zoom and when
+    // the window moves between monitors of different DPI, both of which also
+    // fire window 'resize', so this path re-runs and re-sends as needed.
+    const pixelRatio = this.useNative ? window.devicePixelRatio || 1 : 1;
+    const render = computeRenderResolution(this.currentScale, pixelRatio);
     const viewport = getViewportCssSize();
 
     // Canvas CSS size always fills the full viewport edge-to-edge, even
