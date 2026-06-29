@@ -149,7 +149,7 @@ async fn main() -> Result<()> {
                     compositor_state: smithay::wayland::compositor::CompositorClientState::default(),
                 };
                 if let Err(e) = display_handle.insert_client(client_stream, Arc::new(client_state)) {
-                    info!("Failed to insert client: {}", e);
+                    warn!("Failed to insert client: {}", e);
                 } else {
                     info!("New client connected");
                 }
@@ -313,42 +313,26 @@ async fn main() -> Result<()> {
         use crate::latency::LatencyReport;
         let (latency_tx, mut latency_rx) = mpsc::channel::<LatencyReport>(16);
         
-        info!("Latency reporting pipeline initialized");
+        debug!("Latency reporting pipeline initialized");
         
-        // Spawn task to log detailed latency reports
+        // Log a one-line latency summary per report. At debug so the default
+        // (info) level stays quiet -- the report arrives every ~5s and also
+        // feeds adaptive bitrate (src/server.rs), so its cadence is left alone;
+        // only the logging is demoted. Missing fields render as "-".
         tokio::spawn(async move {
-            info!("Latency reporting task started, waiting for reports...");
+            debug!("Latency reporting task started, waiting for reports...");
+            let fmt = |v: Option<f64>| v.map_or_else(|| "-".to_string(), |x| format!("{x:.1}"));
             while let Some(report) = latency_rx.recv().await {
-                info!("═══ Latency Report ═══");
-                if let Some(v) = report.input_ms {
-                    info!("  Input:          {:>6.1} ms", v);
-                }
-                if let Some(v) = report.capture_to_encode_ms {
-                    info!("  Capture→Encode: {:>6.1} ms", v);
-                }
-                if let Some(v) = report.encoding_ms {
-                    info!("  Encoding:       {:>6.1} ms", v);
-                }
-                if let Some(v) = report.encode_to_send_ms {
-                    info!("  Encode→Send:    {:>6.1} ms", v);
-                }
-                if let Some(v) = report.network_ms {
-                    info!("  Network:        {:>6.1} ms", v);
-                }
-                if let Some(v) = report.jitter_buffer_ms {
-                    info!("  Jitter buffer:  {:>6.1} ms", v);
-                }
-                if let Some(v) = report.receive_to_decode_ms {
-                    info!("  Receive→Decode: {:>6.1} ms", v);
-                }
-                if let Some(v) = report.decoding_ms {
-                    info!("  Decoding:       {:>6.1} ms", v);
-                }
-                if let Some(v) = report.decode_to_display_ms {
-                    info!("  Decode→Display: {:>6.1} ms", v);
-                }
-                info!("  ══════════════════════");
-                info!("  TOTAL:          {:>6.1} ms", report.total_ms);
+                debug!(
+                    "Latency: total {:.1}ms (input {}, encode {}, net {}, jitter {}, decode {}, blit {})",
+                    report.total_ms,
+                    fmt(report.input_ms),
+                    fmt(report.encoding_ms),
+                    fmt(report.network_ms),
+                    fmt(report.jitter_buffer_ms),
+                    fmt(report.decoding_ms),
+                    fmt(report.decode_to_display_ms),
+                );
             }
         });
         

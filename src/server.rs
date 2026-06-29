@@ -758,7 +758,7 @@ async fn recv_audio(
 async fn dispatch_signaling_message(signal: SignalingMessage, state: &SignalingState) {
     match signal {
         SignalingMessage::Ready => {
-            info!("Client is ready");
+            debug!("Client is ready");
         }
         SignalingMessage::Resize { width, height } => {
             info!("Received resize request from client: {}x{}", width, height);
@@ -791,7 +791,7 @@ async fn dispatch_signaling_message(signal: SignalingMessage, state: &SignalingS
             }
         }
         SignalingMessage::RequestKeyframe => {
-            info!("Client requested a keyframe resync (decoder fell behind)");
+            debug!("Client requested a keyframe resync (decoder fell behind)");
             // A keyframe request is a *local* decode-pacing concern, not a
             // congestion signal -- in the browser it's dominated by transient
             // main-thread stalls, not by the rate being too high (the native
@@ -843,7 +843,7 @@ async fn dispatch_signaling_message(signal: SignalingMessage, state: &SignalingS
             burst_count,
             blit_ms,
         } => {
-            info!(
+            debug!(
                 "Received latency report from client: network {:.1}ms decode {:.1}ms blit {:.1}ms total {:.1}ms",
                 network_ms.unwrap_or(0.0),
                 decoding_ms.unwrap_or(0.0),

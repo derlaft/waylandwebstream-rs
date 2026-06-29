@@ -289,7 +289,7 @@ impl AdaptiveBitrateController {
     }
 
     async fn apply(&self, new_rate: usize) {
-        info!("Adaptive bitrate: -> {} bps", new_rate);
+        debug!("Adaptive bitrate: -> {} bps", new_rate);
         // Control-plane send: a closed channel means the encoder thread is gone,
         // so surface it rather than silently dropping the rate change.
         if self

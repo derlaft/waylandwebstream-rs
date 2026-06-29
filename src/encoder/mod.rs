@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use ffmpeg_next as ffmpeg;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod vaapi;
 
@@ -420,7 +420,7 @@ fn drain_control_messages(
     while let Ok(control) = control_rx.try_recv() {
         match control {
             EncoderControl::ForceKeyframe => {
-                info!("Keyframe requested");
+                debug!("Keyframe requested");
                 *force_keyframe = true;
             }
             EncoderControl::ChangeBitrate(new_bitrate) => {
@@ -529,7 +529,7 @@ fn encoder_thread(
         // before sending it -- see `encode_frame`.
         let force_this_frame = force_keyframe;
         if force_this_frame {
-            info!("Forcing keyframe");
+            debug!("Forcing keyframe");
             force_keyframe = false;
         }
 
