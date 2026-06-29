@@ -53,6 +53,32 @@ use tracing::{debug, info, warn};
 
 use crate::encoder::EncoderControl;
 
+/// Fraction of the last-applied rate the AIMD target must climb past before a
+/// growth step is actually pushed to the encoder. Each `ChangeBitrate`
+/// rebuilds the encoder and emits an IDR (libavcodec exposes no in-place
+/// x264/VAAPI bitrate reconfig), so without this the per-tick
+/// `additive_increase` growth would rebuild -- and spike a keyframe -- roughly
+/// every second, on top of the periodic GOP keyframes, fighting the very
+/// jitter buffer the VBV cap protects. Coalescing growth into ~15% jumps makes
+/// bitrate-driven IDRs rarer than the natural keyframe-interval IDR. Decreases
+/// are never coalesced (see `should_actuate`).
+const APPLY_THRESHOLD_FRACTION: f64 = 0.15;
+
+/// Whether a freshly computed `target` rate is worth pushing to the encoder
+/// given the rate it last received (`last_applied`). A growth step must clear
+/// `APPLY_THRESHOLD_FRACTION` of the applied rate to actuate; a decrease (a
+/// congestion cut) or reaching the `max_bitrate` ceiling always actuates
+/// immediately -- relieving a bottleneck is urgent, and the ceiling flush
+/// ensures the encoder actually reaches the cap instead of stalling one
+/// coalescing band below it.
+fn should_actuate(target: usize, last_applied: usize, max_bitrate: usize) -> bool {
+    if target <= last_applied || target >= max_bitrate {
+        return true;
+    }
+    let threshold = ((last_applied as f64) * APPLY_THRESHOLD_FRACTION) as usize;
+    target - last_applied >= threshold.max(1)
+}
+
 /// Signal fed into the controller from the server's signaling handlers.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BitrateEvent {
@@ -236,6 +262,11 @@ pub struct AdaptiveBitrateController {
     /// Surfaces the current target bitrate to `/client` clients (see
     /// `SignalingState::bitrate_rx` in src/server.rs).
     bitrate_tx: watch::Sender<usize>,
+    /// The rate last actually pushed to the encoder. The algorithm's target
+    /// climbs finely every tick, but only crosses into a real `ChangeBitrate`
+    /// (and its rebuild+IDR) once it has pulled this far enough ahead -- see
+    /// `should_actuate`. Seeded with the initial bitrate the encoder started at.
+    last_applied_bitrate: usize,
 }
 
 impl AdaptiveBitrateController {
@@ -246,12 +277,14 @@ impl AdaptiveBitrateController {
         bitrate_tx: watch::Sender<usize>,
     ) -> Self {
         let adjustment_interval = config.adjustment_interval;
+        let initial_bitrate = config.initial_bitrate;
         Self {
             algo: BitrateAlgorithm::new(config),
             adjustment_interval,
             encoder_control_tx,
             event_rx,
             bitrate_tx,
+            last_applied_bitrate: initial_bitrate,
         }
     }
 
@@ -269,7 +302,7 @@ impl AdaptiveBitrateController {
                     match event {
                         Some(BitrateEvent::SendBacklog) | Some(BitrateEvent::ArrivalStall) => {
                             if let Some(new_rate) = self.algo.on_congestion(Instant::now()) {
-                                self.apply(new_rate).await;
+                                self.maybe_apply(new_rate).await;
                             }
                         }
                         Some(BitrateEvent::Latency(ms)) => self.algo.on_latency_report(ms),
@@ -278,7 +311,7 @@ impl AdaptiveBitrateController {
                 }
                 _ = interval.tick() => {
                     match self.algo.tick(Instant::now()) {
-                        Some(new_rate) => self.apply(new_rate).await,
+                        Some(new_rate) => self.maybe_apply(new_rate).await,
                         None => debug!("Adaptive bitrate: holding at {} bps", self.algo.current_bitrate()),
                     }
                 }
@@ -288,7 +321,22 @@ impl AdaptiveBitrateController {
         info!("Adaptive bitrate controller stopped");
     }
 
-    async fn apply(&self, new_rate: usize) {
+    /// Push `new_rate` to the encoder only if it's worth a rebuild+IDR (see
+    /// `should_actuate`); otherwise defer -- the algorithm keeps tracking the
+    /// finer target and a later tick will cross the band. Decreases and the
+    /// ceiling always pass through.
+    async fn maybe_apply(&mut self, new_rate: usize) {
+        if !should_actuate(new_rate, self.last_applied_bitrate, self.algo.config.max_bitrate) {
+            debug!(
+                "Adaptive bitrate: target {} bps within coalescing band of applied {} bps; deferring rebuild",
+                new_rate, self.last_applied_bitrate
+            );
+            return;
+        }
+        self.apply(new_rate).await;
+    }
+
+    async fn apply(&mut self, new_rate: usize) {
         debug!("Adaptive bitrate: -> {} bps", new_rate);
         // Control-plane send: a closed channel means the encoder thread is gone,
         // so surface it rather than silently dropping the rate change.
@@ -302,5 +350,42 @@ impl AdaptiveBitrateController {
         }
         // bitrate_tx is a telemetry watch; a missing receiver is benign.
         let _ = self.bitrate_tx.send(new_rate);
+        self.last_applied_bitrate = new_rate;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_actuate;
+
+    const MAX: usize = 12_000_000;
+
+    #[test]
+    fn decrease_always_actuates() {
+        // A congestion cut must take effect immediately, never coalesced.
+        assert!(should_actuate(1_500_000, 2_000_000, MAX));
+        // Equal is harmless: the encoder's own change_bitrate no-ops it.
+        assert!(should_actuate(2_000_000, 2_000_000, MAX));
+    }
+
+    #[test]
+    fn small_growth_is_coalesced() {
+        // +150k on a 2M applied rate is 7.5% < 15% threshold -> defer.
+        assert!(!should_actuate(2_150_000, 2_000_000, MAX));
+    }
+
+    #[test]
+    fn growth_past_threshold_actuates() {
+        // +300k on 2M is exactly 15% -> actuate.
+        assert!(should_actuate(2_300_000, 2_000_000, MAX));
+        // Just below the band stays deferred.
+        assert!(!should_actuate(2_299_000, 2_000_000, MAX));
+    }
+
+    #[test]
+    fn ceiling_flushes_even_within_band() {
+        // Target at the cap but only a hair above applied: still actuate so
+        // the encoder actually reaches max instead of stalling below it.
+        assert!(should_actuate(MAX, 11_900_000, MAX));
     }
 }

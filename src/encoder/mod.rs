@@ -373,7 +373,14 @@ impl VideoEncoder for X264Encoder {
         match create_encoder(&self.config) {
             Ok(new_encoder) => {
                 self.encoder = new_encoder;
-                self.frame_count = 0; // Reset frame count to force IDR
+                // Restart the PTS clock for the fresh encoder (as reinitialize
+                // does). The rebuild itself is what emits an IDR -- a brand-new
+                // libx264 always starts its stream with one; the counter has no
+                // bearing on IDR placement (see encoder_thread). Avoiding this
+                // IDR would mean an in-place reconfig libavcodec doesn't expose,
+                // which is why ChangeBitrate is coalesced upstream in
+                // adaptive_bitrate.rs to keep rebuilds rare.
+                self.frame_count = 0;
                 info!("Encoder reinitialized with new bitrate");
                 true
             }

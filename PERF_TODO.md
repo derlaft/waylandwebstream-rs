@@ -36,7 +36,21 @@ that fights the controller.
 **Fix:** change bitrate in place (libx264 `x264_encoder_reconfig` / don't reset
 the frame counter; VAAPI live RC update); never force an IDR on a rate change.
 
-- [ ] Done
+- [x] **Done — via coalescing, not in-place reconfig.** Finding: libavcodec
+  (ffmpeg 7.1 / ffmpeg-next 8.1) exposes **no** runtime bitrate reconfig for
+  x264 *or* h264_vaapi — the IDR is intrinsic to any encoder rebuild, so
+  "in-place, no IDR" isn't reachable through the binding. Real fix: make
+  rebuilds rare. `src/adaptive_bitrate.rs` now decouples the finely-tracked
+  AIMD target from the rate actually pushed to the encoder: a growth step only
+  actuates a `ChangeBitrate` once it clears `APPLY_THRESHOLD_FRACTION` (15%) of
+  the last-applied rate (`should_actuate` + `last_applied_bitrate` in the
+  controller); congestion cuts and the `max_bitrate` ceiling always actuate
+  immediately. Collapses the ~1 Hz CA-growth IDR train to rarer-than-GOP. Also
+  corrected the misleading `frame_count = 0 // force IDR` comments in
+  `encoder/mod.rs` + `vaapi.rs` (the rebuild emits the IDR, not the counter).
+  Verified on s8: 60 bin + 24 lib (4 new `should_actuate`) + 8 algorithm tests
+  pass; live ramp reaches max (12 Mbps) exactly, streams firefox; algorithm
+  untouched so its tests are unchanged.
 
 ## 3. Encoder: drain-to-newest in the encode loop  `[HIGH]`
 `encoder/mod.rs:448-487` encodes every queued frame in order. On a hiccup, up

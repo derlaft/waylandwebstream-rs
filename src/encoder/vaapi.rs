@@ -238,7 +238,12 @@ impl VideoEncoder for VaapiEncoder {
         match build_pipeline_for(&self.config, self.device_ref) {
             Ok(pipeline) => {
                 self.pipeline = pipeline;
-                self.frame_count = 0; // Reset frame count to force IDR
+                // Restart the PTS clock for the fresh pipeline. The rebuilt
+                // h264_vaapi session emits an IDR on its first frame regardless;
+                // the counter doesn't drive IDR placement. h264_vaapi has no
+                // in-place rate-control reconfig here either, so ChangeBitrate is
+                // coalesced upstream (adaptive_bitrate.rs) to keep rebuilds rare.
+                self.frame_count = 0;
                 info!("VAAPI encoder reinitialized with new bitrate");
                 true
             }
