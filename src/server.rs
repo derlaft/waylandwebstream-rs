@@ -270,6 +270,13 @@ pub struct SignalingState {
     /// `ServerMessage::Clipboard` JSON, images as a `MSG_CLIPBOARD_IMAGE`
     /// binary frame); a new client also gets the current value on connect.
     clipboard_out_rx: watch::Receiver<ClipboardData>,
+    /// Wakes the synchronous compositor loop the instant an input/resize event
+    /// is queued, so it's injected without waiting for the next event-loop
+    /// dispatch timeout (up to a frame interval). The input channels live on
+    /// the tokio side; calloop can't poll them, so this ping is the bridge.
+    /// `None` outside `main` (e.g. unit tests construct `SignalingState`
+    /// without an event loop), in which case waking is simply skipped.
+    input_ping: Option<calloop::ping::Ping>,
 }
 
 impl SignalingState {
@@ -324,6 +331,7 @@ impl SignalingState {
             client_gen_tx,
             clipboard_in_tx,
             clipboard_out_rx,
+            input_ping: None,
         }
     }
 
@@ -332,6 +340,22 @@ impl SignalingState {
     /// same underlying broadcast channel.
     pub fn get_video_sender(&self) -> broadcast::Sender<EncodedPacket> {
         self.video_tx.clone()
+    }
+
+    /// Installs the handle that wakes the compositor loop on input. Called once
+    /// from `main` after the event loop's ping source is registered; left unset
+    /// in tests (where there is no event loop to wake).
+    pub fn set_input_ping(&mut self, ping: calloop::ping::Ping) {
+        self.input_ping = Some(ping);
+    }
+
+    /// Nudges the compositor loop so a just-queued input/resize event is
+    /// serviced immediately rather than at the next dispatch deadline. A no-op
+    /// when no ping is installed.
+    fn wake_input_loop(&self) {
+        if let Some(ping) = &self.input_ping {
+            ping.ping();
+        }
     }
 }
 
@@ -763,23 +787,27 @@ async fn dispatch_signaling_message(signal: SignalingMessage, state: &SignalingS
         SignalingMessage::Resize { width, height } => {
             info!("Received resize request from client: {}x{}", width, height);
             let _ = state.resize_tx.send((width, height)).await;
+            state.wake_input_loop();
         }
         SignalingMessage::Touch { event } => {
             // Touch events can be frequent, so only log at debug level
             if let Err(e) = state.touch_tx.send(event).await {
                 warn!("Failed to send touch event: {}", e);
             }
+            state.wake_input_loop();
         }
         SignalingMessage::Pointer { event } => {
             // Pointer events can be frequent, so only log at debug level
             if let Err(e) = state.mouse_tx.send(event).await {
                 warn!("Failed to send pointer event: {}", e);
             }
+            state.wake_input_loop();
         }
         SignalingMessage::Key { event } => {
             if let Err(e) = state.key_tx.send(event).await {
                 warn!("Failed to send key event: {}", e);
             }
+            state.wake_input_loop();
         }
         SignalingMessage::Clipboard { text } => {
             // device -> remote: hand to the clipboard bridge to set as the

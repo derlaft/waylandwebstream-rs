@@ -466,6 +466,17 @@ impl WaylandWebStreamState {
         self.repaint_region.is_some()
     }
 
+    /// Whether there is accumulated damage, *without* consuming it. The capture
+    /// loop uses this to decide whether to render early (as soon as a frame
+    /// interval has elapsed since the last capture) instead of waiting for the
+    /// next periodic frame deadline -- damage often lands mid-interval on an
+    /// otherwise idle screen, and waiting for the grid point adds up to a full
+    /// frame of latency. The actual consume still happens in `take_dirty()`
+    /// when the frame is rendered, so the `repaint_region` stash stays correct.
+    pub fn is_dirty(&self) -> bool {
+        self.damage.is_some()
+    }
+
     /// Unions `rect` into the accumulated damage for the current frame.
     fn add_damage(&mut self, rect: Rectangle<i32, Logical>) {
         self.damage = Some(match self.damage {

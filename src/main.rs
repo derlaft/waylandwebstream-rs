@@ -157,6 +157,20 @@ async fn main() -> Result<()> {
         )
         .context("Failed to insert listening socket into event loop")?;
 
+    // A ping the async input/resize handlers fire to wake this synchronous loop
+    // the instant an event is queued (see `SignalingState::wake_input_loop`),
+    // instead of letting the event wait out the dispatch timeout below (up to a
+    // frame interval). The input channels live on the tokio side and calloop
+    // can't poll them, so this ping is the bridge. The source callback is empty:
+    // its only job is to break `dispatch()` out so the loop's input drain runs
+    // now rather than at the next frame deadline.
+    let (input_ping, input_ping_source) = calloop::ping::make_ping()
+        .context("Failed to create input wake ping")?;
+    event_loop
+        .handle()
+        .insert_source(input_ping_source, |_, _, _state| {})
+        .context("Failed to insert input wake ping into event loop")?;
+
     // Initialize encoder
     let keyframe_interval = config.keyframe_interval.unwrap_or(config.framerate * 2);
     let rate_control = match config.crf {
@@ -437,7 +451,7 @@ async fn main() -> Result<()> {
 
     // Create signaling state and server
     let encoder_control_for_loop = encoder_control.clone();
-    let signaling_state = SignalingState::new(
+    let mut signaling_state = SignalingState::new(
         resize_tx,
         touch_tx,
         mouse_tx,
@@ -456,6 +470,7 @@ async fn main() -> Result<()> {
         clipboard_in_tx,
         clipboard_out_rx,
     );
+    signaling_state.set_input_ping(input_ping);
     let video_tx = signaling_state.get_video_sender();
     let signaling_server = SignalingServer::new(signaling_state);
 
@@ -572,6 +587,13 @@ async fn main() -> Result<()> {
     // worth surfacing -- otherwise dropped frames look identical to a pacing
     // bug from the receiving end.
     let mut dropped_frames = 0u64;
+    // Wall-clock of the last frame actually handed to the encoder. Gates the
+    // damage-driven early render below so it can never exceed the target
+    // framerate. Backdated one interval so the very first damage renders
+    // immediately rather than waiting out a frame.
+    let mut last_capture = std::time::Instant::now()
+        .checked_sub(frame_interval)
+        .unwrap_or_else(std::time::Instant::now);
 
     loop {
         if *shutdown_rx.borrow() {
@@ -612,8 +634,26 @@ async fn main() -> Result<()> {
             
             info!("Resize complete: {}x{}", new_width, new_height);
         }
-        
-        // Process touch and pointer events (non-blocking, drain all available)
+
+        // Dispatch Wayland events, capped at 16ms but never waiting past the
+        // next frame deadline — otherwise this wait dominates the loop period
+        // and capture lands at ~2x frame_interval instead of on cadence. An
+        // input-wake ping (see `wake_input_loop`) also breaks this out early so
+        // queued input is serviced now rather than at the deadline.
+        let dispatch_timeout = next_frame
+            .saturating_duration_since(loop_start)
+            .min(std::time::Duration::from_millis(16));
+        event_loop.dispatch(dispatch_timeout, &mut state)
+            .context("Event loop dispatch failed")?;
+
+        display.dispatch_clients(&mut state)
+            .context("Failed to dispatch Wayland clients")?;
+
+        // Inject any input that arrived (non-blocking, drain all available so a
+        // burst of moves collapses to the latest). Done here, after client
+        // dispatch and before the flush below, so the resulting seat events
+        // reach the client in this same iteration; the wake ping above means
+        // this runs the moment an event is queued, not at the frame deadline.
         while let Ok(touch_event) = touch_rx.try_recv() {
             touch_handler.handle_event(touch_event, &mut state);
         }
@@ -623,18 +663,6 @@ async fn main() -> Result<()> {
         while let Ok(key_event) = key_rx.try_recv() {
             input::keyboard::handle_event(key_event, &mut state);
         }
-        
-        // Dispatch Wayland events, capped at 16ms but never waiting past the
-        // next frame deadline — otherwise this wait dominates the loop period
-        // and capture lands at ~2x frame_interval instead of on cadence.
-        let dispatch_timeout = next_frame
-            .saturating_duration_since(loop_start)
-            .min(std::time::Duration::from_millis(16));
-        event_loop.dispatch(dispatch_timeout, &mut state)
-            .context("Event loop dispatch failed")?;
-
-        display.dispatch_clients(&mut state)
-            .context("Failed to dispatch Wayland clients")?;
 
         display.flush_clients()
             .context("Failed to flush Wayland clients")?;
@@ -646,13 +674,24 @@ async fn main() -> Result<()> {
             let _ = cursor_tx.send(cursor_pending_to_update(pending));
         }
 
-        // Render and send frame at target framerate. Frame callbacks are sent
-        // from here too, at the same cadence, rather than every loop tick:
+        // Render and send a frame. Two triggers: the periodic deadline
+        // (`next_frame`) keeps Wayland frame callbacks and the idle keyframe
+        // cadence ticking even on a static screen, while fresh work — damage or
+        // a newly connected client — triggers an *early* capture as soon as one
+        // frame interval has elapsed since the last one. Damage usually lands
+        // mid-interval on an otherwise idle screen, so waiting for the grid
+        // point would add up to a full frame of latency; gating the early path
+        // on the elapsed interval still caps throughput at the framerate.
+        //
+        // Frame callbacks ride this same cadence rather than every loop tick:
         // clients that redraw on every `frame.done` (e.g. cage) would otherwise
         // repaint as fast as the event loop spins instead of at the rate we
         // actually capture and encode, burning CPU for frames nobody captures.
         let now = std::time::Instant::now();
-        if now >= next_frame {
+        let min_gap_elapsed = now.duration_since(last_capture) >= frame_interval;
+        let early_work =
+            (state.is_dirty() || force_render.load(Ordering::Relaxed)) && min_gap_elapsed;
+        if now >= next_frame || early_work {
             state.send_frames();
 
             while let Ok(buf) = buffer_return_rx.try_recv() {
@@ -689,6 +728,7 @@ async fn main() -> Result<()> {
                     match frame_sender.try_send(captured_frame) {
                         Ok(()) => {
                             ticks_since_render = 0;
+                            last_capture = now;
                         }
                         Err(_) => {
                             // Queue full: the encoder hasn't drained the
