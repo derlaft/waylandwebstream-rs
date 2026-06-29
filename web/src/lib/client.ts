@@ -204,13 +204,19 @@ export class ClientChannel {
       );
       return;
     }
-    const payload = buf.slice(8, totalLen);
+    // View the payload directly over the received buffer rather than slicing
+    // out a copy: every video frame would otherwise pay a full-frame memcpy on
+    // the main thread before dispatch. `buf` is a fresh ArrayBuffer per message
+    // (binaryType 'arraybuffer'), so it's safe to view -- and for video the
+    // decode worker transfers this very buffer (zero-copy) immediately after.
+    // Clipboard images are rare, so they keep the simple slice-copy.
+    const { flags, payloadLen } = header;
 
     switch (header.msgType) {
       case MSG_VIDEO_FRAME: {
         if (!this.onVideoFrame) return;
         try {
-          this.onVideoFrame(parseVideoFramePayload(payload, header.flags));
+          this.onVideoFrame(parseVideoFramePayload(buf, flags, 8, payloadLen));
         } catch (e) {
           console.error('Failed to parse MSG_VIDEO_FRAME payload:', e);
         }
@@ -219,20 +225,20 @@ export class ClientChannel {
       case MSG_AUDIO_FRAME: {
         if (!this.onAudioFrame) return;
         try {
-          this.onAudioFrame(parseAudioFramePayload(payload));
+          this.onAudioFrame(parseAudioFramePayload(buf, 8, payloadLen));
         } catch (e) {
           console.error('Failed to parse MSG_AUDIO_FRAME payload:', e);
         }
         return;
       }
       case MSG_CONTROL: {
-        this.onControlPayload(payload);
+        this.onControlPayload(buf, 8, payloadLen);
         return;
       }
       case MSG_CLIPBOARD_IMAGE: {
         if (!this.onClipboardImage) return;
         try {
-          const { mime, bytes } = parseClipboardImage(payload);
+          const { mime, bytes } = parseClipboardImage(buf.slice(8, totalLen));
           this.onClipboardImage(mime, bytes);
         } catch (e) {
           console.error('Failed to parse MSG_CLIPBOARD_IMAGE payload:', e);
@@ -248,10 +254,14 @@ export class ClientChannel {
     }
   }
 
-  private onControlPayload(payload: ArrayBuffer): void {
+  private onControlPayload(
+    buf: ArrayBuffer,
+    byteOffset = 0,
+    byteLength = buf.byteLength - byteOffset,
+  ): void {
     let msg: ServerMessage;
     try {
-      msg = JSON.parse(new TextDecoder().decode(new Uint8Array(payload)));
+      msg = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, byteOffset, byteLength)));
     } catch (e) {
       console.error('Failed to parse MSG_CONTROL JSON:', e);
       return;

@@ -70,13 +70,24 @@ buffers), as the resize path already does.
 ## 4. Kill the three whole-frame copies on the hot path  `[MEDIUM]`
 - [ ] Capture handoff (`compositor/state.rs:697-703`): full ~8MB memcpy to the
       encoder even for tiny damage. Pass damage rect / copy only damaged rows.
+      **DEFERRED** (2026-06-30): not a localized change. Encoder-input buffers
+      are pooled/recycled (not the immediately-previous frame), and x264/VAAPI
+      need a full-frame YUV buffer regardless, so copy-only-damaged-rows would
+      show stale pixels in undamaged regions without per-buffer damage history
+      or double-buffered canvases. The win is only the ~8MB memcpy (~1–3ms), not
+      the encode — too much architectural risk for an autonomous push. Revisit
+      deliberately, likely together with #11 (per-rect damage).
 - [x] Broadcast clone (`server.rs`): **done** — broadcast now carries
       `Arc<EncodedPacket>`, so `recv()` is a refcount bump not a full-frame deep
       copy; the wire builder uses `extend_from_slice` (the one unavoidable
       header-prepend memcpy). Alloc-count + byte-exact delivery tests still pass.
-- [ ] Client receive slice (`client.ts:207`): `buf.slice(8, totalLen)` memcpy's
-      the whole frame on the main thread. View directly over the received
-      ArrayBuffer instead (0 copies + 1 transfer).
+- [x] Client receive slice (`client.ts`): **done** — `parseVideoFramePayload`
+      /`parseAudioFramePayload`/`onControlPayload` now take a `(byteOffset,
+      byteLength)` window and view directly over the received `ArrayBuffer`
+      instead of `buf.slice` copying every frame on the main thread; video then
+      transfers that same buffer to the worker (0 copies + 1 transfer).
+      Clipboard images (rare) keep the slice. New protocol test asserts the
+      view points at the right bytes; 97 vitest pass; decoding verified live.
 
 ## 5. Decoder: `prefer-hardware` probe  `[MEDIUM]`
 `protocol.ts:255-258` uses default `no-preference`; Firefox intermittently

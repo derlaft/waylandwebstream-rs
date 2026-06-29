@@ -89,6 +89,26 @@ describe('parseVideoFramePayload', () => {
   it('throws on payloads shorter than the 20-byte prefix', () => {
     expect(() => parseVideoFramePayload(new ArrayBuffer(19), 0)).toThrow();
   });
+
+  it('views H.264 data over the source buffer at an offset, without copying', () => {
+    // Simulate a full WS frame: 8-byte unified header, 20-byte video prefix,
+    // then the H.264 payload -- exactly how the live client calls it.
+    const h264 = Uint8Array.of(1, 2, 3, 4, 5);
+    const buf = new ArrayBuffer(8 + 20 + h264.length);
+    new Uint8Array(buf).set(h264, 8 + 20);
+
+    const parsed = parseVideoFramePayload(buf, 0, 8, 20 + h264.length);
+
+    // No copy: the returned data is a view over the same ArrayBuffer, so the
+    // buffer can be transferred to the worker zero-copy.
+    expect(parsed.data.buffer).toBe(buf);
+    expect(parsed.data.byteOffset).toBe(8 + 20);
+    expect(Array.from(parsed.data)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it('throws when the offset/length window is shorter than the 20-byte prefix', () => {
+    expect(() => parseVideoFramePayload(new ArrayBuffer(100), 0, 90, 19)).toThrow();
+  });
 });
 
 describe('parseAudioFramePayload', () => {

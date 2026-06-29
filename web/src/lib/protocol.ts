@@ -207,18 +207,30 @@ export interface VideoFramePayload {
   data: Uint8Array;
 }
 
-export function parseVideoFramePayload(payload: ArrayBuffer, flags: number): VideoFramePayload {
-  if (payload.byteLength < 20) {
-    throw new Error(`MSG_VIDEO_FRAME payload too short: ${payload.byteLength} (need >= 20)`);
+/**
+ * Parses the video payload occupying `[byteOffset, byteOffset + byteLength)` of
+ * `buf`. The defaults span the whole buffer, so callers passing an exact-length
+ * payload still work; the live client passes the full WebSocket frame with
+ * offset 8 so the returned `data` is a *view* over the received buffer (no
+ * per-frame copy) -- the very buffer the decode worker then transfers.
+ */
+export function parseVideoFramePayload(
+  buf: ArrayBuffer,
+  flags: number,
+  byteOffset = 0,
+  byteLength = buf.byteLength - byteOffset,
+): VideoFramePayload {
+  if (byteLength < 20) {
+    throw new Error(`MSG_VIDEO_FRAME payload too short: ${byteLength} (need >= 20)`);
   }
-  const view = new DataView(payload);
+  const view = new DataView(buf, byteOffset, byteLength);
   const isKeyframe = (flags & FLAG_KEYFRAME) !== 0;
   const hasPing = (flags & FLAG_HAS_PING) !== 0;
   const pingRaw = view.getFloat64(4, false);
   return {
     isKeyframe,
     pingEchoClientTs: hasPing ? pingRaw : null,
-    data: new Uint8Array(payload, 20, payload.byteLength - 20),
+    data: new Uint8Array(buf, byteOffset + 20, byteLength - 20),
   };
 }
 
@@ -231,18 +243,22 @@ export interface AudioFramePayload {
   data: Uint8Array;
 }
 
-export function parseAudioFramePayload(payload: ArrayBuffer): AudioFramePayload {
-  if (payload.byteLength < 8) {
-    throw new Error(`MSG_AUDIO_FRAME payload too short: ${payload.byteLength} (need >= 8)`);
+export function parseAudioFramePayload(
+  buf: ArrayBuffer,
+  byteOffset = 0,
+  byteLength = buf.byteLength - byteOffset,
+): AudioFramePayload {
+  if (byteLength < 8) {
+    throw new Error(`MSG_AUDIO_FRAME payload too short: ${byteLength} (need >= 8)`);
   }
-  const view = new DataView(payload);
+  const view = new DataView(buf, byteOffset, byteLength);
   // JS numbers can exactly represent integers up to 2^53; PTS values for
   // audio (microseconds from stream start) stay well within that range.
   const high = view.getUint32(0, false);
   const low = view.getUint32(4, false);
   return {
     ptsUs: high * 2 ** 32 + low,
-    data: new Uint8Array(payload, 8, payload.byteLength - 8),
+    data: new Uint8Array(buf, byteOffset + 8, byteLength - 8),
   };
 }
 
