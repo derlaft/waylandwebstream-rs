@@ -155,7 +155,26 @@ Switch to `texSubImage2D` once dims are stable. Negligible at 1080p.
       New `viewport.test.ts` asserts one write across repeated same-size
       updates. 100 vitest pass.
 - [ ] Track damage as a small rect set, not a single merged bbox
-      (`compositor/state.rs:470-475`) — tracked as item #11 below.
+      (`compositor/state.rs`) — see item #11.
+
+## 11. Damage as a small rect set, not a single merged bbox  `[LOW]`
+`add_damage` unions into one bounding rectangle, so two disjoint small damages
+(cursor + caret) merge into a near-fullscreen box and `render()` recomposites
+almost everything. A bounded rect set would let the SW compositor clip-composite
+only the real regions.
+
+- [ ] **DEFERRED** (2026-06-30, autonomous run): highest-risk, lowest-contingent
+  item. (a) Correctness can't be hermetically tested with the current harness —
+  the screenshot capture and `render_pixels` test only exercise whole-screen /
+  single-window damage, never the disjoint-small-rect case this targets, so a
+  multi-rect clipping bug (stale pixels in undamaged gaps) would slip an
+  unattended push silently. (b) Value is mostly contingent on #4.1 (also
+  deferred): with the handoff still full-frame and the encoder doing full-frame
+  YUV+H.264 regardless, this only saves *compositing* memcpy. It touches the
+  damage structure throughout `state.rs` and restructures `render()`'s composite
+  into a per-rect loop. Do attended, alongside #4.1, with a hermetic test that
+  drives genuinely disjoint damage and asserts the gap is carried over, not
+  re-cleared.
 
 ---
 
