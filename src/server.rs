@@ -797,15 +797,27 @@ async fn dispatch_signaling_message(signal: SignalingMessage, state: &SignalingS
             state.wake_input_loop();
         }
         SignalingMessage::Touch { event } => {
-            // Touch events can be frequent, so only log at debug level
-            if let Err(e) = state.touch_tx.send(event).await {
+            // A touch *move* is idempotent -- it carries the absolute positions
+            // of every active contact -- so under a flood, drop it rather than
+            // `.await` on a full channel: a stale move is superseded by the next
+            // and must never head-of-line-block a start/end/cancel (real state
+            // transitions) queued behind it on this single receive loop. Those
+            // are delivered reliably.
+            if matches!(event, TouchEvent::Move { .. }) {
+                let _ = state.touch_tx.try_send(event);
+            } else if let Err(e) = state.touch_tx.send(event).await {
                 warn!("Failed to send touch event: {}", e);
             }
             state.wake_input_loop();
         }
         SignalingMessage::Pointer { event } => {
-            // Pointer events can be frequent, so only log at debug level
-            if let Err(e) = state.mouse_tx.send(event).await {
+            // Same idempotent-move reasoning as touch: a pointer move carries an
+            // absolute position, so drop it on a full channel rather than block
+            // the loop. down/up/cancel are state transitions and wheel deltas
+            // accumulate, so all of those go through reliably.
+            if matches!(event, MouseEvent::Move { .. }) {
+                let _ = state.mouse_tx.try_send(event);
+            } else if let Err(e) = state.mouse_tx.send(event).await {
                 warn!("Failed to send pointer event: {}", e);
             }
             state.wake_input_loop();
@@ -1436,6 +1448,78 @@ mod tests {
 
         let received = resize_rx.try_recv().expect("resize_rx should have a value");
         assert_eq!(received, (800, 600));
+    }
+
+    /// Pointer *moves* are idempotent, so on a full input channel they're
+    /// dropped (try_send) rather than awaited -- a flood of moves must never
+    /// head-of-line-block a click/keystroke queued behind it on the receive
+    /// loop. Verifies the drop-when-full behavior and, via the timeout, that
+    /// dispatching a move never blocks.
+    #[tokio::test]
+    async fn dispatch_pointer_moves_drop_when_full_instead_of_blocking() {
+        use crate::input::mouse::{MouseEvent, PointerPoint};
+
+        let (resize_tx, _resize_rx) = mpsc::channel::<(u32, u32)>(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (touch_tx, _) = mpsc::channel(4);
+        // Deliberately tiny so three moves overflow it.
+        let (mouse_tx, mut mouse_rx) = mpsc::channel(2);
+        let (key_tx, _) = mpsc::channel(4);
+        let (encoder_control_tx, _) = mpsc::channel(4);
+        let (pending_ping_tx, _) = mpsc::channel(4);
+        let (_, bitrate_rx) = watch::channel(2_000_000usize);
+        let (_, codec_rx) = watch::channel(String::new());
+        let (_, cursor_rx) = watch::channel(CursorUpdate::Default);
+        let force_render = Arc::new(AtomicBool::new(false));
+        let state = SignalingState::new(
+            resize_tx,
+            touch_tx,
+            mouse_tx,
+            key_tx,
+            None,
+            None,
+            encoder_control_tx,
+            force_render,
+            pending_ping_tx,
+            bitrate_rx,
+            codec_rx,
+            shutdown_rx,
+            SessionManager::new(Vec::new(), String::new(), shutdown_tx),
+            None,
+            cursor_rx,
+            mpsc::channel(4).0,
+            watch::channel(ClipboardData::Text(String::new())).1,
+        );
+
+        let move_msg = || SignalingMessage::Pointer {
+            event: MouseEvent::Move {
+                pointer: PointerPoint {
+                    x: 0.5,
+                    y: 0.5,
+                    button: 0,
+                    pointer_type: "mouse".to_string(),
+                    pressure: 0.0,
+                },
+            },
+        };
+
+        // Three moves into a capacity-2 channel: each dispatch must return
+        // promptly (never block), even once the channel is full.
+        for _ in 0..3 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                dispatch_signaling_message(move_msg(), &state),
+            )
+            .await
+            .expect("dispatching a pointer move must never block, even on a full channel");
+        }
+
+        assert!(mouse_rx.try_recv().is_ok(), "first move should be queued");
+        assert!(mouse_rx.try_recv().is_ok(), "second move should be queued");
+        assert!(
+            mouse_rx.try_recv().is_err(),
+            "the third move should have been dropped, not queued"
+        );
     }
 
     #[test]

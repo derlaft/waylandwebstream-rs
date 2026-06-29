@@ -111,7 +111,20 @@ channels fill and the server `.await`-send (`server.rs:769-780`) head-of-line
 blocks clicks/keystrokes. Coalesce moves per rAF (always flush final position);
 `try_send`/drop-oldest for moves server-side, keep down/up/key reliable.
 
-- [ ] Done
+- [x] **Server-side done.** `dispatch_signaling_message` (`server.rs`) now
+  `try_send`s pointer/touch **moves** (idempotent — each carries an absolute
+  position) so a flood drops stale moves instead of `.await`-blocking the
+  receive loop and head-of-line-blocking a click/key behind them; down/up/
+  cancel/wheel/keys stay reliable (`.await`). Latency-neutral (identical to
+  before when the channel isn't full). New unit test: 3 moves into a cap-2
+  channel drop the 3rd and never block. 63 bin tests pass.
+- [ ] **Client rAF coalescing DEFERRED** (2026-06-30): inherently adds up to
+  ~16ms of latency to pointer moves (there's no synchronous way to coalesce
+  separate move events — only by deferring to rAF/timeout), which is a poor
+  trade for a remote desktop. Item #1's input-wake ping already makes the
+  compositor drain moves promptly, so the flood is largely mitigated. Input
+  responsiveness also can't be verified by the screenshot harness. Revisit
+  attended, measuring real drag feel, if move volume proves to be a problem.
 
 ## 8. GL compositor: drop redundant fence / async readback  `[LOW]`
 `compositor/gl.rs:226-267` is fully serial (render → sync.wait → blocking
