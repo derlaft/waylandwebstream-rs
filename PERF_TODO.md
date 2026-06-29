@@ -137,7 +137,13 @@ real overlap. Lower priority (zero-copy VAAPI pairing sidesteps it).
 `glRenderer.ts:181` reallocates texture storage per frame (~1–4ms GPU at 4K).
 Switch to `texSubImage2D` once dims are stable. Negligible at 1080p.
 
-- [ ] Done
+- [x] **Done.** `glRenderer.ts` `draw()` now `texImage2D`-allocates only when
+  the frame's coded size changes and `texSubImage2D`-updates in place
+  otherwise (both derive size from the same VideoFrame, so no coded-vs-display
+  assumption; the size-change path is byte-identical to the old behavior).
+  Reset on context loss. New mock-GL unit test (`glRenderer.test.ts`) asserts
+  alloc-once-then-update-in-place and realloc-on-size-change; 99 vitest pass,
+  rendering verified live.
 
 ## 10. Misc hardening  `[LOW]`
 - [ ] try/finally around `renderer.draw(frame)` so a throw can't leak a

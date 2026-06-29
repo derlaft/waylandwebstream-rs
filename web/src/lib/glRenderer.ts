@@ -62,7 +62,9 @@ const QUAD = new Float32Array([
   1, 1, 1, 0,
 ]);
 
-class WebGlVideoRenderer implements VideoRenderer {
+// Exported for unit testing the upload path with a mock GL context; the public
+// entry point is `createVideoRenderer`.
+export class WebGlVideoRenderer implements VideoRenderer {
   readonly backend: 'webgl' | 'webgl2';
 
   private readonly canvas: RenderCanvas;
@@ -77,6 +79,11 @@ class WebGlVideoRenderer implements VideoRenderer {
   private contextLost = false;
   private lastW = -1;
   private lastH = -1;
+  // Coded size of the frame the texture storage is currently allocated for.
+  // While it's unchanged we update in place with texSubImage2D instead of
+  // reallocating storage every frame with texImage2D. Reset on context loss.
+  private texW = -1;
+  private texH = -1;
 
   constructor(canvas: RenderCanvas, gl: WebGLRenderingContext, backend: 'webgl' | 'webgl2') {
     this.canvas = canvas;
@@ -99,6 +106,10 @@ class WebGlVideoRenderer implements VideoRenderer {
     console.info('WebGL context restored; rebuilding video render resources');
     this.lastW = -1;
     this.lastH = -1;
+    // The texture is recreated in initResources, so its storage is unallocated
+    // again -- force a texImage2D on the next frame.
+    this.texW = -1;
+    this.texH = -1;
     this.initResources();
     this.contextLost = false;
   };
@@ -178,7 +189,21 @@ class WebGlVideoRenderer implements VideoRenderer {
     // Texture, program, buffer and attribute pointers are all left bound from
     // initResources -- nothing else touches GL state -- so per frame is just
     // the upload plus the draw.
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+    //
+    // texImage2D *reallocates* the texture's backing store every call; for an
+    // unchanging frame size that's pure waste (a few ms of GPU time at 4K).
+    // Allocate once per size with texImage2D, then update in place with
+    // texSubImage2D. Both derive their dimensions from the same VideoFrame, so
+    // a same-size texSubImage2D always fills the storage texImage2D allocated
+    // -- no coded-vs-display size assumptions. A size change falls back to
+    // texImage2D, exactly as before.
+    if (frame.codedWidth !== this.texW || frame.codedHeight !== this.texH) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+      this.texW = frame.codedWidth;
+      this.texH = frame.codedHeight;
+    } else {
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+    }
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 }
