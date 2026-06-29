@@ -33,10 +33,6 @@ These only matter if the single-controller policy is ever relaxed
 
 ## Performance (optional, measure first)
 
-- **Damage-driven partial repaint.** Frame-level damage *gating* is done, but
-  `render()` still `fill(0)`s and repaints every window each frame it does run.
-  With the accumulated damage rect already available, only the damaged region
-  needs repainting. Optional — the encoder already sees a full frame either way.
 - **A/B measurement** against Selkies: quantify the frame-pacing and
   jitter-buffer behavior on identical content (never formally measured).
 
@@ -58,4 +54,6 @@ surface forwarded to a client-side overlay); on-screen keyboard; bidirectional
 text + PNG clipboard sync; single-controller enforcement + manual reconnect;
 HiDPI native-resolution toggle; WebGL renderer; the 2× `scaleFactor` plumbing;
 server-side `max_resolution` clamping; logging-level cleanup (quiet default
-`RUST_LOG=info`, hot-path chatter demoted to `debug`).
+`RUST_LOG=info`, hot-path chatter demoted to `debug`); damage-driven partial
+repaint (SW compositor keeps a persistent canvas, repaints only the damaged
+sub-rect).
