@@ -58,7 +58,14 @@ to 4 stale frames each cost ~33ms and back-pressure capture.
 **Fix:** `try_recv`-drain to the freshest frame before encoding (return skipped
 buffers), as the resize path already does.
 
-- [ ] Done
+- [x] **Done.** `src/encoder/mod.rs`: added `skip_to_newest_frame`, called right
+  after `blocking_recv` — drains any frames queued behind the one just pulled,
+  keeping only the newest and returning each skipped `Cpu` buffer via
+  `buffer_return_tx` for reuse (mirrors the resize-drain path). Self-regulating:
+  a no-op when the encoder is keeping up (only one frame queued), skips ahead
+  only when it fell behind. Extracted as a pure helper so it's deterministically
+  unit-tested (no encoder-thread race). Verified on s8: 62 bin + 26 lib (2 new
+  drain tests) pass, streams firefox cleanly.
 
 ## 4. Kill the three whole-frame copies on the hot path  `[MEDIUM]`
 - [ ] Capture handoff (`compositor/state.rs:697-703`): full ~8MB memcpy to the

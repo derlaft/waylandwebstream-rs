@@ -437,6 +437,34 @@ fn drain_control_messages(
     }
 }
 
+/// Skip ahead to the freshest frame currently queued behind `first`.
+///
+/// If the encoder fell behind real-time -- a heavy IDR, a CPU spike, or a
+/// bitrate-change rebuild -- frames pile up in `frame_rx` (cap 4). Encoding
+/// them in order would add a frame interval of latency for every stale frame
+/// and keep back-pressuring the capture loop, which then drops frames of its
+/// own. Only the newest frame matters for a live stream, so drain the rest
+/// non-blockingly, returning each skipped `Cpu` buffer for reuse exactly as
+/// the resize path does. Returns the newest frame and how many were skipped.
+fn skip_to_newest_frame(
+    first: CapturedFrame,
+    frame_rx: &mut mpsc::Receiver<CapturedFrame>,
+    buffer_return_tx: &std::sync::mpsc::Sender<Vec<u8>>,
+) -> (CapturedFrame, u32) {
+    let mut newest = first;
+    let mut skipped = 0;
+    while let Ok(newer) = frame_rx.try_recv() {
+        let stale = std::mem::replace(&mut newest, newer);
+        if let CapturedFrame::Cpu(raw_frame) = stale {
+            // Ignore failure: a dropped receiver just means the render loop is
+            // gone and the buffer frees normally (mirrors submit()).
+            let _ = buffer_return_tx.send(raw_frame.data);
+        }
+        skipped += 1;
+    }
+    (newest, skipped)
+}
+
 /// Encoder thread main loop
 fn encoder_thread(
     config: EncoderConfig,
@@ -492,6 +520,18 @@ fn encoder_thread(
                 break;
             }
         };
+
+        // If more frames queued up behind this one while we were busy, skip
+        // straight to the newest -- the older ones are stale for a live stream
+        // and encoding them would only add latency. See `skip_to_newest_frame`.
+        let (captured_frame, skipped_frames) =
+            skip_to_newest_frame(captured_frame, &mut frame_rx, &buffer_return_tx);
+        if skipped_frames > 0 {
+            debug!(
+                "Encoder fell behind; skipped {} stale frame(s) to the newest",
+                skipped_frames
+            );
+        }
 
         // Safety net: normally the resize check above already reconfigures
         // the encoder ahead of the frame that needs it (and drains anything
@@ -971,5 +1011,48 @@ mod tests {
             .expect("follow-up frame at the same size should encode without hanging")
             .expect("expected a packet");
         assert!(!packet.is_keyframe, "frame after the reinit should not force another IDR");
+    }
+
+    /// Drain-to-newest: when several frames have queued up behind the one the
+    /// encoder just pulled (it fell behind real-time), it skips straight to the
+    /// freshest and hands every skipped Cpu buffer back for reuse, rather than
+    /// encoding stale frames and adding a frame interval of latency each.
+    #[test]
+    fn skip_to_newest_frame_drains_to_latest_and_returns_buffers() {
+        let (tx, mut rx) = mpsc::channel::<CapturedFrame>(4);
+        let (ret_tx, ret_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+        // Queue three frames, tagged by width so the newest is identifiable.
+        for w in [10u32, 20, 30] {
+            tx.try_send(CapturedFrame::Cpu(make_raw_frame(w, 1))).unwrap();
+        }
+
+        // The first pull mirrors the encoder loop's blocking_recv.
+        let first = rx.try_recv().unwrap();
+        let (newest, skipped) = skip_to_newest_frame(first, &mut rx, &ret_tx);
+
+        assert_eq!(skipped, 2, "two older frames should be skipped");
+        assert_eq!(newest.dimensions(), (30, 1), "the newest frame should be kept");
+        assert_eq!(
+            ret_rx.try_iter().count(),
+            2,
+            "both skipped Cpu buffers should be returned for reuse"
+        );
+    }
+
+    /// The normal real-time case: only one frame queued (the encoder is keeping
+    /// up), so nothing is skipped and that frame is encoded as-is.
+    #[test]
+    fn skip_to_newest_frame_keeps_sole_frame() {
+        let (tx, mut rx) = mpsc::channel::<CapturedFrame>(4);
+        let (ret_tx, ret_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+        tx.try_send(CapturedFrame::Cpu(make_raw_frame(42, 1))).unwrap();
+        let first = rx.try_recv().unwrap();
+        let (newest, skipped) = skip_to_newest_frame(first, &mut rx, &ret_tx);
+
+        assert_eq!(skipped, 0);
+        assert_eq!(newest.dimensions(), (42, 1));
+        assert_eq!(ret_rx.try_iter().count(), 0, "nothing skipped, nothing returned");
     }
 }
