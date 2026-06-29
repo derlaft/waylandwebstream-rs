@@ -137,6 +137,18 @@ pub struct WaylandWebStreamState {
     // screen provably hasn't changed.
     damage: Option<Rectangle<i32, Logical>>,
 
+    // The damage region `take_dirty()` last consumed, stashed for the SW
+    // `render()` to use as its repaint clip. `None` means "repaint everything"
+    // (a forced render with no tracked damage). The GL backend ignores it.
+    repaint_region: Option<Rectangle<i32, Logical>>,
+
+    // Persistent last fully-composited frame (BGRA, `width*height*4` bytes).
+    // `render()` updates only the damaged sub-rect each frame and hands the
+    // encoder a full copy, so unchanged regions aren't recomposited. Empty
+    // until the first render and whenever the output resizes (size mismatch
+    // forces a full repaint). Unused by the GL backend.
+    canvas: Vec<u8>,
+
     // Counts calls to `render()`, used to throttle its debug/trace logging.
     frame_counter: u32,
 
@@ -164,10 +176,58 @@ pub struct WaylandWebStreamState {
     cursor_pending: Option<CursorPending>,
 }
 
+/// Half-open pixel rectangle `[x0, x1) × [y0, y1)` used to restrict
+/// compositing to a damaged sub-region of the output. Coordinates are clamped
+/// to the output bounds on construction, so a `Clip` never addresses outside
+/// the framebuffer.
+#[derive(Clone, Copy, Debug)]
+struct Clip {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+}
+
+impl Clip {
+    /// The whole `width × height` output.
+    fn full(width: u32, height: u32) -> Self {
+        Self { x0: 0, y0: 0, x1: width, y1: height }
+    }
+
+    /// Converts a logical-space damage rectangle to a pixel clip, clamped to
+    /// the output. The compositor blits buffers 1:1 (scale 1, no transform),
+    /// so logical coordinates are output pixels.
+    fn from_logical(rect: Rectangle<i32, Logical>, width: u32, height: u32) -> Self {
+        let x0 = rect.loc.x.clamp(0, width as i32) as u32;
+        let y0 = rect.loc.y.clamp(0, height as i32) as u32;
+        let x1 = (rect.loc.x + rect.size.w).clamp(0, width as i32) as u32;
+        let y1 = (rect.loc.y + rect.size.h).clamp(0, height as i32) as u32;
+        Self { x0, y0, x1, y1 }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.x0 >= self.x1 || self.y0 >= self.y1
+    }
+}
+
+/// Zeroes the `clip` region of `dst` (a `width`-wide BGRA buffer), one row
+/// span at a time. Clears only the area that's about to be repainted.
+fn clear_region(dst: &mut [u8], width: u32, clip: Clip) {
+    for y in clip.y0..clip.y1 {
+        let start = ((y * width + clip.x0) * 4) as usize;
+        let end = ((y * width + clip.x1) * 4) as usize;
+        if end <= dst.len() {
+            dst[start..end].fill(0);
+        }
+    }
+}
+
 /// Copies a window's BGRA buffer into the output framebuffer `dst` at
-/// `(pos_x, pos_y)`, 1:1, clipping to the output bounds. `src` holds `src_h`
-/// rows of `src_stride` bytes; only the first `src_w * 4` bytes of each row are
-/// copied. Rows/bytes that would fall outside either buffer are skipped.
+/// `(pos_x, pos_y)`, 1:1, clipping to the output bounds and to `clip` (the
+/// damaged sub-region being repainted this frame). `src` holds `src_h` rows of
+/// `src_stride` bytes; only the first `src_w * 4` bytes of each row are
+/// candidates. Rows/bytes that would fall outside either buffer or outside
+/// `clip` are skipped.
 #[allow(clippy::too_many_arguments)] // a pixel blit is clearest with explicit dims
 fn blit_bgra(
     dst: &mut [u8],
@@ -179,6 +239,7 @@ fn blit_bgra(
     src_w: u32,
     src_h: u32,
     src_stride: u32,
+    clip: Clip,
 ) {
     let target_width = dst_width.saturating_sub(pos_x);
     let target_height = dst_height.saturating_sub(pos_y);
@@ -187,10 +248,19 @@ fn blit_bgra(
     }
     let copy_w = src_w.min(target_width);
     let copy_h = src_h.min(target_height);
-    let row_bytes = (copy_w * 4) as usize;
-    for dest_y in 0..copy_h {
-        let src_idx = (dest_y * src_stride) as usize;
-        let dest_idx = (((pos_y + dest_y) * dst_width + pos_x) * 4) as usize;
+    // Intersect the blit's destination extent with the clip region.
+    let dx0 = pos_x.max(clip.x0);
+    let dx1 = (pos_x + copy_w).min(clip.x1);
+    let dy0 = pos_y.max(clip.y0);
+    let dy1 = (pos_y + copy_h).min(clip.y1);
+    if dx0 >= dx1 || dy0 >= dy1 {
+        return;
+    }
+    let row_bytes = ((dx1 - dx0) * 4) as usize;
+    for dest_y in dy0..dy1 {
+        // Source pixel for output (dx0, dest_y): offset back by the blit origin.
+        let src_idx = ((dest_y - pos_y) * src_stride + (dx0 - pos_x) * 4) as usize;
+        let dest_idx = ((dest_y * dst_width + dx0) * 4) as usize;
         if src_idx + row_bytes <= src.len() && dest_idx + row_bytes <= dst.len() {
             dst[dest_idx..dest_idx + row_bytes].copy_from_slice(&src[src_idx..src_idx + row_bytes]);
         }
@@ -198,14 +268,25 @@ fn blit_bgra(
 }
 
 /// Fills the output region covered by a single-pixel buffer with its solid
-/// colour. `rgba` is the source colour; the output is BGRA-packed.
-fn fill_solid(dst: &mut [u8], dst_width: u32, dst_height: u32, pos_x: u32, pos_y: u32, rgba: [u8; 4]) {
+/// colour, restricted to `clip`. `rgba` is the source colour; the output is
+/// BGRA-packed.
+fn fill_solid(
+    dst: &mut [u8],
+    dst_width: u32,
+    dst_height: u32,
+    pos_x: u32,
+    pos_y: u32,
+    rgba: [u8; 4],
+    clip: Clip,
+) {
     let [r, g, b, a] = rgba;
-    let target_width = dst_width.saturating_sub(pos_x);
-    let target_height = dst_height.saturating_sub(pos_y);
-    for dest_y in 0..target_height {
-        for dest_x in 0..target_width {
-            let dest_idx = (((pos_y + dest_y) * dst_width + (pos_x + dest_x)) * 4) as usize;
+    let x0 = pos_x.max(clip.x0);
+    let x1 = dst_width.min(clip.x1);
+    let y0 = pos_y.max(clip.y0);
+    let y1 = dst_height.min(clip.y1);
+    for dest_y in y0..y1 {
+        for dest_x in x0..x1 {
+            let dest_idx = ((dest_y * dst_width + dest_x) * 4) as usize;
             if let Some(px) = dst.get_mut(dest_idx..dest_idx + 4) {
                 px.copy_from_slice(&[b, g, r, a]);
             }
@@ -215,11 +296,15 @@ fn fill_solid(dst: &mut [u8], dst_width: u32, dst_height: u32, pos_x: u32, pos_y
 
 /// Renders the classic X11 "root weave" stipple (a 4x4 basket-weave bitmap in
 /// black and white) into `dst`, used when no window is mapped.
-fn render_root_weave(dst: &mut [u8], width: u32, height: u32) {
+fn render_root_weave(dst: &mut [u8], width: u32, height: u32, clip: Clip) {
     const ROOT_WEAVE_BITS: [u8; 4] = [0b0110, 0b1001, 0b1001, 0b0110];
-    for y in 0..height {
+    let y1 = height.min(clip.y1);
+    let x1 = width.min(clip.x1);
+    // The pattern is keyed off absolute (x, y), so clipping only limits which
+    // pixels are touched -- the weave stays aligned across partial repaints.
+    for y in clip.y0..y1 {
         let row = ROOT_WEAVE_BITS[(y % 4) as usize];
-        for x in 0..width {
+        for x in clip.x0..x1 {
             let bit = (row >> (x % 4)) & 1;
             let color = if bit == 1 { 255 } else { 0 };
             let idx = ((y * width + x) * 4) as usize;
@@ -316,6 +401,8 @@ impl WaylandWebStreamState {
             height,
             clock: Clock::new(),
             damage: Some(Rectangle::new((0, 0).into(), (width as i32, height as i32).into())),
+            repaint_region: None,
+            canvas: Vec::new(),
             frame_counter: 0,
             dmabuf_state: None,
             dmabuf_renderer: None,
@@ -369,8 +456,14 @@ impl WaylandWebStreamState {
     /// per-surface damage can't be determined (e.g. a surface commit that
     /// doesn't map to a positioned window): such commits mark the whole
     /// output damaged rather than risk missing a real change.
+    ///
+    /// The consumed damage rectangle is stashed in `repaint_region` so the
+    /// SW `render()` (called moments later in the same loop tick) can repaint
+    /// only that sub-region. A `true` return is always followed by a
+    /// `render()` call, so the stash never goes stale across frames.
     pub fn take_dirty(&mut self) -> bool {
-        self.damage.take().is_some()
+        self.repaint_region = self.damage.take();
+        self.repaint_region.is_some()
     }
 
     /// Unions `rect` into the accumulated damage for the current frame.
@@ -468,18 +561,39 @@ impl WaylandWebStreamState {
         });
     }
 
-    /// Renders the current frame. `reuse_buffer`, if given, is an
-    /// already-allocated buffer (typically handed back by the encoder once
-    /// it's done with a previous frame) that gets cleared and rendered into
-    /// instead of allocating a fresh ~8MB buffer every frame.
+    /// Renders the current frame into the persistent `canvas`, repainting only
+    /// the region damaged since the last frame, then hands the encoder a full
+    /// copy. `reuse_buffer`, if given, is an already-allocated buffer (handed
+    /// back by the encoder once it's done with a previous frame) reused as the
+    /// output instead of allocating a fresh ~8MB buffer each frame.
+    ///
+    /// `take_dirty()` stashes the frame's damage in `repaint_region`;
+    /// everything outside it is carried over from the previous frame still
+    /// sitting in `canvas`, so unchanged windows aren't recomposited. A size
+    /// mismatch (first frame or just-resized output) or a missing region (a
+    /// forced render with no tracked damage) falls back to a full repaint. The
+    /// encoder always receives a complete frame, so its BGRA->YUV conversion
+    /// and keyframe logic are unaffected.
     pub fn render(&mut self, reuse_buffer: Option<Vec<u8>>) -> Option<Vec<u8>> {
         let buffer_size = (self.width * self.height * 4) as usize;
-        let mut render_buffer = reuse_buffer.unwrap_or_default();
-        render_buffer.resize(buffer_size, 0);
-        // Alpha is irrelevant here -- this buffer only ever feeds the BGRA->
-        // YUV420P conversion in the encoder, which doesn't read it -- so a
-        // plain memset clear (vs. a per-pixel store loop) is safe.
-        render_buffer.fill(0);
+
+        // Pull the canvas out so the window loop can borrow `self.space` while
+        // compositing into it; it's restored before returning. A size mismatch
+        // (first frame or post-resize) means last frame's pixels can't be
+        // trusted, so the whole output is repainted.
+        let mut canvas = std::mem::take(&mut self.canvas);
+        let size_changed = canvas.len() != buffer_size;
+        if size_changed {
+            canvas.clear();
+            canvas.resize(buffer_size, 0);
+        }
+
+        // Repaint clip: the damaged sub-rect, or the whole output when the
+        // canvas was just (re)sized or no damage rect was recorded.
+        let clip = match self.repaint_region.take() {
+            Some(rect) if !size_changed => Clip::from_logical(rect, self.width, self.height),
+            _ => Clip::full(self.width, self.height),
+        };
 
         let window_count = self.space.elements().count();
 
@@ -489,6 +603,12 @@ impl WaylandWebStreamState {
         if frame_counter.is_multiple_of(30) {
             trace!("Rendering {} windows", window_count);
         }
+
+        // Clear only the area being repainted; the rest stays as last frame.
+        // Alpha is irrelevant here -- the buffer only ever feeds the BGRA->
+        // YUV420P conversion in the encoder, which doesn't read it.
+        if !clip.is_empty() {
+        clear_region(&mut canvas, self.width, clip);
 
         // Render each window
         for window in self.space.elements() {
@@ -531,9 +651,9 @@ impl WaylandWebStreamState {
                                 // Copy the buffer into the output at 1:1 scale (see
                                 // `blit_bgra`). Both SW and GL renderers blit at 1:1 so
                                 // `surface_at` can share one coordinate formula; the
-                                // zero-initialised render_buffer leaves uncovered pixels black.
+                                // zero-cleared canvas leaves uncovered pixels black.
                                 blit_bgra(
-                                    &mut render_buffer,
+                                    &mut canvas,
                                     self.width,
                                     self.height,
                                     window_pos_x,
@@ -542,6 +662,7 @@ impl WaylandWebStreamState {
                                     buffer_width,
                                     buffer_height,
                                     buffer_stride,
+                                    clip,
                                 );
                             }
                         }
@@ -550,12 +671,13 @@ impl WaylandWebStreamState {
                         if matches!(shm_result, Err(smithay::wayland::shm::BufferAccessError::NotManaged)) {
                             if let Ok(spb) = smithay::wayland::single_pixel_buffer::get_single_pixel_buffer(buffer) {
                                 fill_solid(
-                                    &mut render_buffer,
+                                    &mut canvas,
                                     self.width,
                                     self.height,
                                     window_pos_x,
                                     window_pos_y,
                                     spb.rgba8888(),
+                                    clip,
                                 );
                             }
                         }
@@ -568,10 +690,17 @@ impl WaylandWebStreamState {
         // basket-weave bitmap (X11's default root window pattern before any
         // window manager or client connects), rendered in black and white.
         if window_count == 0 {
-            render_root_weave(&mut render_buffer, self.width, self.height);
+            render_root_weave(&mut canvas, self.width, self.height, clip);
         }
-        
-        Some(render_buffer)
+        } // end `if !clip.is_empty()`
+
+        // Hand the encoder a full copy of the canvas, reusing the recycled
+        // buffer's allocation, and keep the canvas for next frame's update.
+        let mut output = reuse_buffer.unwrap_or_default();
+        output.clear();
+        output.extend_from_slice(&canvas);
+        self.canvas = canvas;
+        Some(output)
     }
 
     /// Resolves a point given in output-pixel coordinates to the topmost
@@ -1385,7 +1514,7 @@ mod render_tests {
         // 4x4 output, blit a 2x2 source (stride 8 = 2px*4) at (1,1).
         let mut dst = vec![0u8; 4 * 4 * 4];
         let src = vec![0xAAu8; 2 * 2 * 4];
-        blit_bgra(&mut dst, 4, 4, 1, 1, &src, 2, 2, 8);
+        blit_bgra(&mut dst, 4, 4, 1, 1, &src, 2, 2, 8, Clip::full(4, 4));
         let idx = (4 + 1) * 4; // pixel (1,1) in a 4-wide buffer, 4 bytes/px
         assert_eq!(&dst[idx..idx + 4], &[0xAA, 0xAA, 0xAA, 0xAA]);
         assert_eq!(&dst[0..4], &[0, 0, 0, 0]); // (0,0) untouched
@@ -1395,15 +1524,43 @@ mod render_tests {
     fn blit_bgra_clips_oversized_source_without_panicking() {
         let mut dst = vec![0u8; 2 * 2 * 4];
         let src = vec![0x11u8; 4 * 4 * 4];
-        blit_bgra(&mut dst, 2, 2, 1, 1, &src, 4, 4, 16);
+        blit_bgra(&mut dst, 2, 2, 1, 1, &src, 4, 4, 16, Clip::full(2, 2));
         let idx = (2 + 1) * 4; // pixel (1,1) in a 2-wide buffer, 4 bytes/px
         assert_eq!(&dst[idx..idx + 4], &[0x11, 0x11, 0x11, 0x11]);
     }
 
     #[test]
+    fn blit_bgra_only_writes_inside_clip() {
+        // 4x4 output, blit a full-cover 4x4 source but clip to the single
+        // pixel (2,2). Only that pixel should change; the rest stays zero.
+        let mut dst = vec![0u8; 4 * 4 * 4];
+        let src = vec![0xCCu8; 4 * 4 * 4];
+        let clip = Clip { x0: 2, y0: 2, x1: 3, y1: 3 };
+        blit_bgra(&mut dst, 4, 4, 0, 0, &src, 4, 4, 16, clip);
+        let inside = ((2 * 4) + 2) * 4; // pixel (2,2)
+        assert_eq!(&dst[inside..inside + 4], &[0xCC, 0xCC, 0xCC, 0xCC]);
+        // A pixel just outside the clip (1,2) is untouched.
+        let outside = ((2 * 4) + 1) * 4;
+        assert_eq!(&dst[outside..outside + 4], &[0, 0, 0, 0]);
+        // Exactly one pixel was written.
+        assert_eq!(dst.iter().filter(|&&b| b == 0xCC).count(), 4);
+    }
+
+    #[test]
+    fn clear_region_zeroes_only_the_clip() {
+        let mut dst = vec![0xFFu8; 4 * 4 * 4];
+        clear_region(&mut dst, 4, Clip { x0: 1, y0: 1, x1: 3, y1: 3 });
+        // 2x2 cleared region = 4 pixels = 16 bytes zeroed.
+        assert_eq!(dst.iter().filter(|&&b| b == 0).count(), 16);
+        let inside = ((1 * 4) + 1) * 4; // pixel (1,1)
+        assert_eq!(&dst[inside..inside + 4], &[0, 0, 0, 0]);
+        assert_eq!(&dst[0..4], &[0xFF, 0xFF, 0xFF, 0xFF]); // (0,0) untouched
+    }
+
+    #[test]
     fn fill_solid_swaps_rgba_to_bgra() {
         let mut dst = vec![0u8; 4];
-        fill_solid(&mut dst, 1, 1, 0, 0, [10, 20, 30, 40]); // r,g,b,a
+        fill_solid(&mut dst, 1, 1, 0, 0, [10, 20, 30, 40], Clip::full(1, 1)); // r,g,b,a
         assert_eq!(&dst[0..4], &[30, 20, 10, 40]); // b,g,r,a
     }
 
@@ -1411,7 +1568,7 @@ mod render_tests {
     fn render_root_weave_fills_every_pixel_opaque() {
         let (w, h) = (8u32, 8u32);
         let mut dst = vec![0u8; (w * h * 4) as usize];
-        render_root_weave(&mut dst, w, h);
+        render_root_weave(&mut dst, w, h, Clip::full(w, h));
         for px in dst.chunks_exact(4) {
             assert_eq!(px[3], 255);
             assert!(px[0] == px[1] && px[1] == px[2]);
