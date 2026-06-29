@@ -110,8 +110,14 @@ fn cage_window_renders_visible_content_not_black() {
 }
 
 fn spawn_cage(display_name: &str) -> Child {
+    // No `-d`/decoration flags: older cage accepted `-D`, but current cage
+    // (>= 0.2) rejects it and exits before mapping anything. Run with
+    // defaults -- the test only checks for non-black content. Note cage still
+    // needs a wlroots renderer that can come up in this environment; on a
+    // headless box with no /dev/dri it fails its output test regardless, so
+    // this regression is exercised on GPU-capable hosts. `render_pixels_test`
+    // is the GPU-free equivalent (client connects directly, no nested cage).
     Command::new("cage")
-        .arg("-D")
         .arg("--")
         .arg("weston-simple-shm")
         .env("WAYLAND_DISPLAY", display_name)

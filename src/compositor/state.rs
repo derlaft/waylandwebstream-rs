@@ -1552,7 +1552,7 @@ mod render_tests {
         clear_region(&mut dst, 4, Clip { x0: 1, y0: 1, x1: 3, y1: 3 });
         // 2x2 cleared region = 4 pixels = 16 bytes zeroed.
         assert_eq!(dst.iter().filter(|&&b| b == 0).count(), 16);
-        let inside = ((1 * 4) + 1) * 4; // pixel (1,1)
+        let inside = (4 + 1) * 4; // pixel (1,1) in a 4-wide buffer: (1*4 + 1)*4
         assert_eq!(&dst[inside..inside + 4], &[0, 0, 0, 0]);
         assert_eq!(&dst[0..4], &[0xFF, 0xFF, 0xFF, 0xFF]); // (0,0) untouched
     }
