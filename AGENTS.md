@@ -3,7 +3,8 @@
 Orientation for anyone (human or agent) changing this codebase. Focuses on
 *why* things are the way they are and the traps that aren't obvious from the
 code. For a user-facing overview see `README.md`; remaining work is in
-`TODO.md`.
+`TODO.md`, and the performance/latency backlog (with rationale for what was
+done vs. deliberately deferred) is in `PERF_TODO.md`.
 
 Note: this is a **WS + WebCodecs** system. An earlier WebRTC/RTP/ICE/STUN/TURN
 implementation was fully removed — if you see references to it anywhere (old
@@ -88,6 +89,19 @@ GPU-less dev box.
   `keyframe_interval` ticks (so idle screens still emit periodic resync
   keyframes and late joiners aren't stuck). `take_dirty()` must run
   unconditionally (not short-circuited by `||`) so the flag is always consumed.
+- **Capture is damage/input-driven, not grid-locked.** The loop renders as soon
+  as there's damage (`is_dirty()` peeks it non-consumingly; `take_dirty()` still
+  does the actual consume) *and* one `frame_interval` has elapsed since the last
+  capture (`last_capture`) — it does **not** wait for the periodic `next_frame`
+  deadline. The periodic tick still fires so `send_frames()` and the idle
+  keyframe cadence keep ticking on a static screen. Reverting to a grid-only
+  gate puts ~½ frame of latency back on every interactive update.
+- **Input does not wake the loop by itself.** The touch/mouse/key/resize
+  channels are tokio `mpsc`, which calloop can't poll, so the async handlers
+  fire a `calloop::ping::Ping` (`SignalingState::wake_input_loop`) to break
+  `dispatch()` out the instant an event is queued; input is then drained right
+  after `dispatch_clients` so the resulting seat events flush in the same
+  iteration. Without the ping, input waits out the dispatch timeout (~½ frame).
 
 ### Encoder
 - **Forcing a keyframe = tagging the frame `AV_PICTURE_TYPE_I`.** Resetting the
@@ -118,6 +132,20 @@ GPU-less dev box.
 - **`Bitrate` mode sets a VBV cap** (`vbv-maxrate`/`vbv-bufsize` ≈ 250ms) so a
   keyframe can't balloon the client jitter buffer every GOP. `Quality` (CRF)
   mode deliberately has no cap.
+- **There is no in-place bitrate change.** libavcodec (via `ffmpeg-next`)
+  exposes no runtime rate-control reconfig for libx264 *or* `h264_vaapi`, so
+  `change_bitrate` tears the encoder down and rebuilds it — and a fresh encoder
+  always emits an IDR on its first frame. The `frame_count = 0` reset does
+  **not** force that IDR (libx264 places IDRs on its own counter; same as
+  `ForceKeyframe`) — the rebuild does. Don't re-add a "reset counter to force
+  IDR" comment, and don't expect `set_bit_rate` after `open` to take effect. The
+  rebuild's IDR is unavoidable, so the cost is controlled by *coalescing* how
+  often the rate actually changes (see Adaptive bitrate).
+- **The encoder skips to the newest queued frame** (`skip_to_newest_frame`,
+  right after `blocking_recv`). If it fell behind (a heavy IDR, a CPU spike, a
+  bitrate rebuild), frames pile in `frame_rx` (cap 4); only the latest matters
+  for a live stream, so the rest are dropped and their buffers returned for
+  reuse (like the resize-drain). Intentional, not a frame-dropping bug.
 
 ### Hardware acceleration (optional GL compositor / VAAPI encoder)
 
@@ -186,6 +214,21 @@ GL compositor specifics:
 - **The video broadcast channel is intentionally tiny (cap 3).** A slow client
   should `Lagged`-skip to a recent frame and resync on the next keyframe, never
   build a backlog of stale P-frames. Don't enlarge it to "fix" lag.
+- **The broadcast carries `Arc<EncodedPacket>`, not `EncodedPacket`.**
+  `tokio::broadcast` clones the stored value on every `recv()`, and an
+  `EncodedPacket` clone deep-copies its whole H.264 buffer — wasteful even for
+  the single client. `Arc` makes `recv()` a refcount bump; the wire frame still
+  pays the one unavoidable header-prepend `memcpy` (`encode_unified_video_frame`
+  takes `&EncodedPacket` and uses `extend_from_slice`, not `Vec::append`). The
+  `*_allocates_exactly_once` test guards the single per-frame allocation — don't
+  revert to broadcasting the packet by value.
+- **Idempotent input moves are dropped on a full channel, never awaited.**
+  `dispatch_signaling_message` `try_send`s pointer/touch *moves* (each carries an
+  absolute position, so a stale one is harmless once the next arrives); a move
+  flood must not `.await`-fill the bounded channel and head-of-line-block a
+  click/keystroke on the single WS receive loop. down/up/cancel, **wheel** (its
+  deltas accumulate — dropping loses scroll), and keys stay reliable (`.await`).
+  Don't make moves reliable; don't make wheel/buttons droppable.
 - **One encoder feeds all clients.** An adaptive-bitrate cut triggered by one
   struggling client lowers quality for everyone — a property of the shared-
   encoder design, not a bug.
@@ -206,6 +249,16 @@ GL compositor specifics:
 - All decisions live in pure `BitrateAlgorithm` (synthetic `Instant`s, no
   channels) so they're deterministically testable. Keep new logic there, not in
   the async `Controller`.
+- **Encoder writes are coalesced — that throttle lives in the `Controller`, not
+  the algorithm, on purpose.** Each `ChangeBitrate` rebuilds the encoder + emits
+  an IDR (see Encoder), and AIMD proposes a new target every tick, so the
+  `Controller` only actuates a *growth* step once the target has pulled
+  `APPLY_THRESHOLD_FRACTION` (15%) past the last-applied rate (`should_actuate` +
+  `last_applied_bitrate`); congestion *cuts* and the `max_bitrate` ceiling
+  always actuate immediately. This is deliberately not in `BitrateAlgorithm`:
+  the algorithm decides the ideal *target*, but "how often is it worth paying an
+  encoder rebuild to actuate it" is an encoder-cost actuation policy. The pure
+  target still moves every tick (its tests are unchanged).
 
 ### Client (`web/`)
 - **`ensureCanvasSize` re-checks every frame**, deliberately not gated by a
@@ -251,6 +304,22 @@ GL compositor specifics:
   work from blit work; measuring after blends both into "decode latency" and
   hides the real bottleneck. Track blit time in a separate sample array and
   surface it in both the UI and the server's latency report.
+- **The receive buffer is viewed, not sliced.** `onUnifiedFrame` hands
+  `(buf, byteOffset, byteLength)` to `parseVideoFramePayload`/
+  `parseAudioFramePayload`/`onControlPayload` so the payload is a *view* over the
+  WebSocket message's `ArrayBuffer` (fresh per message), not a `buf.slice` copy
+  on the main thread. The video view's buffer is then **transferred** to the
+  decode worker (zero-copy), so `buf` must not be touched after dispatch.
+  Clipboard images (rare) keep the slice. Don't reintroduce a per-frame slice.
+- **`VideoFrame.close()` runs in a `finally`.** An un-closed frame holds a slot
+  in the decoder's output pool and stalls decoding once the pool drains, so
+  `handleFrame` closes it even if `renderer.draw()` throws.
+- **The WebGL renderer updates the texture in place.** `texImage2D(frame)`
+  *reallocates* the texture's backing store every call; `draw()` only
+  `texImage2D`s when the frame's coded size changes and `texSubImage2D`s
+  otherwise. Both derive their size from the same `VideoFrame`, so a same-size
+  `texSubImage2D` always fits what `texImage2D` allocated (no coded-vs-display
+  assumption). `texW`/`texH` reset on context loss (the texture is recreated).
 
 ### Clipboard bridge (`src/clipboard.rs` + `web/src/lib/clipboard.ts`)
 
