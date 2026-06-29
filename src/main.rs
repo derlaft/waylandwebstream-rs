@@ -553,8 +553,9 @@ async fn main() -> Result<()> {
 
             // Fire-and-forget broadcast: with no client connected there are no
             // subscribers, and a dropped frame is recovered by the next one --
-            // intentionally not logged per frame.
-            let _ = video_tx.send(packet);
+            // intentionally not logged per frame. `Arc` so each subscriber's
+            // `recv()` is a refcount bump rather than a full-frame copy.
+            let _ = video_tx.send(std::sync::Arc::new(packet));
         }
     });
 

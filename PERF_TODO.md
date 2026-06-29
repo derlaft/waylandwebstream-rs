@@ -70,8 +70,10 @@ buffers), as the resize path already does.
 ## 4. Kill the three whole-frame copies on the hot path  `[MEDIUM]`
 - [ ] Capture handoff (`compositor/state.rs:697-703`): full ~8MB memcpy to the
       encoder even for tiny damage. Pass damage rect / copy only damaged rows.
-- [ ] Broadcast clone (`server.rs:476`): `tokio::broadcast` deep-copies the
-      payload per recv. Single-client design → broadcast `Arc<EncodedPacket>`.
+- [x] Broadcast clone (`server.rs`): **done** — broadcast now carries
+      `Arc<EncodedPacket>`, so `recv()` is a refcount bump not a full-frame deep
+      copy; the wire builder uses `extend_from_slice` (the one unavoidable
+      header-prepend memcpy). Alloc-count + byte-exact delivery tests still pass.
 - [ ] Client receive slice (`client.ts:207`): `buf.slice(8, totalLen)` memcpy's
       the whole frame on the main thread. View directly over the received
       ArrayBuffer instead (0 copies + 1 transfer).

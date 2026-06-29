@@ -206,7 +206,12 @@ pub struct SignalingState {
     /// frame rather than build up a backlog, since H.264 P-frames in the
     /// backlog would be stale by the time they're sent anyway. The next
     /// periodic keyframe resyncs any client that fell behind and missed some.
-    video_tx: broadcast::Sender<EncodedPacket>,
+    /// `Arc`-wrapped so a `recv()` is a refcount bump, not a full-frame deep
+    /// copy: `tokio::broadcast` clones the stored value for every receiver, and
+    /// an `EncodedPacket` clone copies its whole H.264 buffer. The wire frame
+    /// still pays one unavoidable `memcpy` to prepend its header
+    /// (`encode_unified_video_frame`), but the broadcast copy is eliminated.
+    video_tx: broadcast::Sender<Arc<EncodedPacket>>,
     /// Lets a new `/client` client request a fresh keyframe -- without this,
     /// a client connecting while the screen is idle could wait until the
     /// next damage or GOP-cycle keyframe before seeing anything decodable.
@@ -338,7 +343,7 @@ impl SignalingState {
     /// Cloneable sender for feeding encoded video packets in from the
     /// encoder forwarding task; every `/client` client subscribes to the
     /// same underlying broadcast channel.
-    pub fn get_video_sender(&self) -> broadcast::Sender<EncodedPacket> {
+    pub fn get_video_sender(&self) -> broadcast::Sender<Arc<EncodedPacket>> {
         self.video_tx.clone()
     }
 
@@ -520,7 +525,7 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
-                let frame = encode_unified_video_frame(packet);
+                let frame = encode_unified_video_frame(&packet);
                 if sender.send(Message::Binary(frame)).await.is_err() {
                     break;
                 }
@@ -641,10 +646,12 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
 /// `is_keyframe` and `has_ping_echo` are carried in the header `flags`
 /// byte, not inline in the payload.
 ///
-/// Takes the packet by ownership so the H.264 buffer can be moved into the
-/// framed message with `Vec::append` (no extra allocation or copy beyond
-/// the single `memcpy` a contiguous wire buffer inevitably requires).
-fn encode_unified_video_frame(mut packet: EncodedPacket) -> Vec<u8> {
+/// Borrows the packet (it's shared via `Arc` across the broadcast, so it can't
+/// be consumed): the H.264 buffer is copied into the framed message with a
+/// single `extend_from_slice` -- the one `memcpy` a contiguous wire buffer
+/// prepending an 8+20-byte header inevitably requires, and still exactly one
+/// allocation (the final `Vec`).
+fn encode_unified_video_frame(packet: &EncodedPacket) -> Vec<u8> {
     let mut flags = 0u8;
     if packet.is_keyframe {
         flags |= proto::FLAG_KEYFRAME;
@@ -664,7 +671,7 @@ fn encode_unified_video_frame(mut packet: EncodedPacket) -> Vec<u8> {
     let ping_val = packet.ping_echo_client_ts.unwrap_or(0.0);
     buf.extend_from_slice(&ping_val.to_be_bytes());
     buf.extend_from_slice(&packet.capture_to_encode_ms.to_be_bytes());
-    buf.append(&mut packet.data);
+    buf.extend_from_slice(&packet.data);
     buf
 }
 
@@ -1199,7 +1206,7 @@ mod tests {
 
         assert!(
             video_tx
-                .send(test_packet(vec![0xAA, 0xBB, 0xCC], true, 42))
+                .send(Arc::new(test_packet(vec![0xAA, 0xBB, 0xCC], true, 42)))
                 .is_ok()
         );
 
@@ -1348,7 +1355,7 @@ mod tests {
         let packet = test_packet(expected_h264.clone(), true, 99);
 
         let (allocs, framed) = alloc_counter::delta_with(|| {
-            let framed = encode_unified_video_frame(packet);
+            let framed = encode_unified_video_frame(&packet);
             assert_eq!(framed.len(), proto::HEADER_LEN + 20 + 8192);
             let header: [u8; proto::HEADER_LEN] =
                 framed[..proto::HEADER_LEN].try_into().unwrap();
