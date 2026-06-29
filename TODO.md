@@ -6,15 +6,13 @@ constraints each item has to respect.
 
 ## Server robustness / hardening
 
-- **`max_resolution` is not enforced server-side.** `--max-resolution` is
-  parsed into `config.rs` but nothing reads it; the resize handler never clamps
-  to it, and the client clamps to a hardcoded 3840×2160 instead. Enforce on the
-  server and consider advertising the real bound over `/client` so the client
-  stops guessing.
-- **Logging reactor.** Too many messages are noisy or at the wrong level
-  (per-event/per-frame chatter that should be `debug`/`trace`, things logged at
-  `info` that are really diagnostics). Audit log sites and pick consistent
-  levels so a default `RUST_LOG` is quiet but useful; demote the hot-path spam.
+- **Advertise `max_resolution` to the client (optional).** Server-side
+  enforcement is done (`sanitize_resolution` clamps every resize request), but
+  the server doesn't advertise its configured max over `/client`, so the client
+  still uses a hardcoded 3840×2160 safety-net cap (`web/src/lib/viewport.ts`).
+  Pushing the real bound on connect would let the client cap correctly when an
+  admin sets `--max-resolution` below that. Marginal — the server clamps
+  regardless, so this only saves a wasted round-trip.
 
 ## Multi-client
 
@@ -58,4 +56,6 @@ These only matter if the single-controller policy is ever relaxed
 Audio (PipeWire → Opus over `/client`); cursor rendering (shape + custom
 surface forwarded to a client-side overlay); on-screen keyboard; bidirectional
 text + PNG clipboard sync; single-controller enforcement + manual reconnect;
-HiDPI native-resolution toggle; WebGL renderer; the 2× `scaleFactor` plumbing.
+HiDPI native-resolution toggle; WebGL renderer; the 2× `scaleFactor` plumbing;
+server-side `max_resolution` clamping; logging-level cleanup (quiet default
+`RUST_LOG=info`, hot-path chatter demoted to `debug`).

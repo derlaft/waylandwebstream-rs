@@ -16,11 +16,14 @@ import type { ClientMessage } from './protocol';
 export const nativeResolution = writable(false);
 
 // Mirrors the CLI default in src/config.rs (`--max-resolution`, default
-// "3840x2160"). The server doesn't expose its actually-configured value
-// over the wire and doesn't even clamp resize requests to it server-side
-// today (see src/main.rs's resize handling), so this is only a
-// conservative client-side sanity clamp against requesting something
-// absurd on very high-DPI/multi-monitor setups -- not authoritative.
+// "3840x2160"). The server is authoritative: it clamps every resize request
+// to its configured max server-side (`sanitize_resolution` in src/config.rs,
+// applied in src/main.rs's resize handler), since the request arrives over
+// the untrusted /client socket. This client-side cap is just a conservative
+// safety net so we don't render/send something absurd on very high-DPI or
+// multi-monitor setups. The server doesn't advertise its actual configured
+// value over the wire, so if it's set below this the client may still send a
+// larger request and have it clamped -- harmless, just a wasted round-trip.
 const MAX_RENDER_WIDTH = 3840;
 const MAX_RENDER_HEIGHT = 2160;
 
