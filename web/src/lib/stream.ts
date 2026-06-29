@@ -225,13 +225,20 @@ export class VideoStream {
     // performance.now()*1000 set on the chunk in `handleVideoFrame`.
     const decodeDoneMs = performance.now();
     this.decodeLatencySamples.push(decodeDoneMs - frame.timestamp / 1000);
-    this.renderer.draw(frame);
-    // With the WebGL backend this is just the texture upload + draw-call
-    // submission (the GPU work is async), so it should stay near zero. A
-    // large value means the 2D fallback is active and its VideoFrame→canvas
-    // readback is the bottleneck, not the decoder.
-    this.blitLatencySamples.push(performance.now() - decodeDoneMs);
-    frame.close();
+    // A VideoFrame must be closed exactly once; an un-closed frame holds a slot
+    // in the decoder's output pool and will stall decoding once the pool is
+    // exhausted. So close it even if the blit throws (e.g. a transient WebGL
+    // error) -- losing one frame to a failed draw is fine, leaking it is not.
+    try {
+      this.renderer.draw(frame);
+      // With the WebGL backend this is just the texture upload + draw-call
+      // submission (the GPU work is async), so it should stay near zero. A
+      // large value means the 2D fallback is active and its VideoFrame→canvas
+      // readback is the bottleneck, not the decoder.
+      this.blitLatencySamples.push(performance.now() - decodeDoneMs);
+    } finally {
+      frame.close();
+    }
   }
 
   private sendPing(): void {

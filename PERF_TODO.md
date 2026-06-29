@@ -146,11 +146,16 @@ Switch to `texSubImage2D` once dims are stable. Negligible at 1080p.
   rendering verified live.
 
 ## 10. Misc hardening  `[LOW]`
-- [ ] try/finally around `renderer.draw(frame)` so a throw can't leak a
-      VideoFrame (`stream.ts:234`).
-- [ ] Debounce mobile `visualViewport` CSS-size writes (`viewport.ts:120-146`).
+- [x] **Done** — try/finally around `renderer.draw(frame)` in `stream.ts` so
+      `frame.close()` always runs even if the blit throws (an un-closed
+      VideoFrame holds a decoder output-pool slot and stalls decoding).
+- [x] **Done** — `viewport.ts` skips the (layout-invalidating) `canvas.style`
+      write when the CSS size is unchanged, guarded like the existing
+      `lastSent`; stops momentum-scroll visualViewport floods thrashing layout.
+      New `viewport.test.ts` asserts one write across repeated same-size
+      updates. 100 vitest pass.
 - [ ] Track damage as a small rect set, not a single merged bbox
-      (`compositor/state.rs:470-475`) — once #4 handoff is damage-proportional.
+      (`compositor/state.rs:470-475`) — tracked as item #11 below.
 
 ---
 

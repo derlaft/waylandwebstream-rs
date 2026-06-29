@@ -68,6 +68,11 @@ export class Viewport {
 
   private useNative = false;
   private lastSent: RenderResolution | null = null;
+  // Last CSS size written to the canvas. Writing canvas.style invalidates
+  // layout, and visualViewport 'scroll' fires unthrottled during mobile
+  // momentum scrolling -- where the CSS size usually hasn't changed -- so the
+  // (idempotent) write is skipped when the size is unchanged.
+  private lastCssSize: { width: number; height: number } | null = null;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private unsubscribeNative: (() => void) | null = null;
 
@@ -142,8 +147,18 @@ export class Viewport {
     // screen, where it read as touches near the edge being swallowed.
     // Top-left alignment within the black full-viewport container is
     // plain static CSS on Stage.svelte; this only ever sets width/height.
-    this.canvas.style.width = `${viewport.width}px`;
-    this.canvas.style.height = `${viewport.height}px`;
+    // Skip the (layout-invalidating) style write when the size is unchanged --
+    // a momentum-scroll flood of visualViewport events otherwise thrashes
+    // layout every frame for no visible change.
+    if (
+      !this.lastCssSize ||
+      this.lastCssSize.width !== viewport.width ||
+      this.lastCssSize.height !== viewport.height
+    ) {
+      this.canvas.style.width = `${viewport.width}px`;
+      this.canvas.style.height = `${viewport.height}px`;
+      this.lastCssSize = { width: viewport.width, height: viewport.height };
+    }
 
     if (this.lastSent && this.lastSent.width === render.width && this.lastSent.height === render.height) {
       return;
