@@ -102,6 +102,25 @@ GPU-less dev box.
   `dispatch()` out the instant an event is queued; input is then drained right
   after `dispatch_clients` so the resulting seat events flush in the same
   iteration. Without the ping, input waits out the dispatch timeout (~½ frame).
+- **The interactive frame rate is the *app's* content rate, not a capture-loop
+  cap — measured, don't re-chase it.** On the GPU-less dev box a nested
+  labwc+Firefox produces only ~30 fps of *content* commits while scrolling
+  (software WebRender, ~34% CPU → an internal throttle), interleaved with empty
+  re-commits that carry no buffer damage. The capture loop already renders
+  **every** damage-bearing commit 1:1 — there is no pipeline coalescing cap.
+  Confirmed by a one-binary A/B (env-toggled, vigor-independent
+  `render ÷ content-commit` ratio) of three plausible "fixes": (1) registering
+  the Wayland *client* fd as a calloop wake source on
+  `display.backend().poll_fd()` (only the *listening* socket is a source today,
+  so client commits are drained by the post-dispatch `dispatch_clients`, not an
+  fd wake); (2) capping the dispatch timeout at `frame_interval` instead of the
+  hardcoded 16 ms; (3) a sub-`frame_interval` `min_gap` slack. **All three were
+  inert** — ratio ~1.0 with and without — and the fd-wake gave **no** latency
+  benefit either (commit→capture ~7 ms either way, because `input_ping` already
+  wakes the loop during any interaction and the residual is the `min_gap`
+  cadence gate, not the wake). Before "fixing" the frame rate here, measure
+  `render` vs damage-bearing-commit rate first; the lever for smoother scroll is
+  app/Firefox-side (its software render rate), not this loop.
 
 ### Encoder
 - **Forcing a keyframe = tagging the frame `AV_PICTURE_TYPE_I`.** Resetting the
