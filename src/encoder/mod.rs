@@ -6,14 +6,15 @@ use tracing::{debug, error, info, warn};
 
 mod vaapi;
 
-/// A changed pixel rectangle within a frame, in output pixels. Carried from
-/// the compositor so the encoder can convert only the changed rows BGRA->YUV
-/// instead of the whole frame (see `convert_damaged_rows`).
+/// A changed *row band* of a frame, in output pixels (`y..y+height`). Carried
+/// from the compositor so the encoder can convert only the changed rows
+/// BGRA->YUV instead of the whole frame (see `convert_damaged_rows`). Only the
+/// vertical extent is tracked: the encoder works whole-row (YUV420's chroma is
+/// 2x-subsampled vertically and the handoff copies full rows), so a horizontal
+/// extent would be unused.
 #[derive(Clone, Copy, Debug)]
 pub struct DamageRect {
-    pub x: u32,
     pub y: u32,
-    pub width: u32,
     pub height: u32,
 }
 
@@ -934,7 +935,12 @@ fn encode_frame(
     // previous frame's YUV), unless a full convert is forced -- the first frame
     // or just after a resize, when `yuv_frame` can't be trusted -- or the
     // damage list is empty (whole frame changed; the GL readback path).
-    if force_full_convert || raw_frame.damage.is_empty() {
+    //
+    // A keyframe also forces a full convert: it must be self-contained, so if
+    // any damage was ever missed (a dropped frame whose rows weren't carried
+    // forward), the keyframe re-syncs the whole picture. This bounds any
+    // damage-tracking gap to one GOP and guarantees every IDR is pixel-correct.
+    if force_full_convert || force_keyframe || raw_frame.damage.is_empty() {
         scaler.run(input_frame, yuv_frame)?;
     } else {
         convert_damaged_rows(scaler, input_frame, yuv_frame, &raw_frame.damage, raw_frame.height);
@@ -1068,7 +1074,7 @@ mod tests {
             &mut scaler,
             &input,
             &mut yuv,
-            &[DamageRect { x: 0, y: 16, width: w, height: 16 }],
+            &[DamageRect { y: 16, height: 16 }],
             h,
         );
 

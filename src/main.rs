@@ -731,11 +731,17 @@ async fn main() -> Result<()> {
                             ticks_since_render = 0;
                             last_capture = now;
                         }
-                        Err(_) => {
+                        Err(e) => {
                             // Queue full: the encoder hasn't drained the
-                            // previous frame(s) yet. Counts toward staleness
-                            // too -- the encoder didn't actually get a fresh
-                            // frame this tick.
+                            // previous frame(s) yet. Re-mark this dropped
+                            // frame's damage so the next frame re-renders it --
+                            // otherwise the encoder's persistent YUV frame keeps
+                            // stale rows for the dropped content (old pixels show
+                            // after a big change). Counts toward staleness too --
+                            // the encoder didn't actually get a fresh frame.
+                            if let mpsc::error::TrySendError::Full(encoder::CapturedFrame::Cpu(raw)) = &e {
+                                state.readd_damage(&raw.damage);
+                            }
                             dropped_frames += 1;
                             ticks_since_render += 1;
                             if dropped_frames == 1 || dropped_frames.is_multiple_of(30) {

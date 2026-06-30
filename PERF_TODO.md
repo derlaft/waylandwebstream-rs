@@ -179,15 +179,21 @@ only the real regions.
   `skip_to_newest_frame` unions skipped frames' damage so the persistent YUV
   never misses a region. Hermetic band-conversion test + 31 lib + 68 bin tests;
   live firefox render artifact-free.
-- [x] **Stage C done** (2026-06-30): the SW handoff now copies only the damaged
-  row bands into the (pooled) encoder buffer instead of the whole frame
-  (`copy_damaged_rows`); full copy only on a full repaint or wrong-size buffer.
-  No double-buffering needed — since Stage B's encoder reads *only* the damaged
-  rows, the untouched rows (stale pooled content) are never read. The damage
-  rects' vertical span is even-snapped at creation so the handoff and the
-  encoder's chroma-aligned bands cover identical rows (no stale read at a band
-  edge). Unit test + 32 lib + 69 bin tests; live render artifact-free. The full
-  damage-proportional SW pipeline (compositing + handoff + swscale) is complete.
+- [x] **Stage C REVERTED** (2026-06-30) — the partial handoff was wrong. It
+  caused rare corruption (old pixels) on big screen changes: when the encoder
+  falls behind it skips frames and unions their damage onto the *newest* frame's
+  buffer (`skip_to_newest_frame`), but a partial copy leaves the skipped rows
+  stale in that buffer, so the encoder converted garbage. A correct partial
+  handoff would need per-buffer damage accumulation (the complexity Stage C
+  claimed to avoid), so the handoff is back to a full copy. Stages A
+  (compositing) and B (swscale) stay — the bigger wins.
+- [x] **Damage-completeness hardening** (2026-06-30), since Stage B's persistent
+  YUV frame requires every changed row to reach the encoder: (1) a compositor
+  frame dropped at the bounded send queue re-marks its damage (`readd_damage`)
+  so it isn't lost; (2) every keyframe forces a full convert, so any residual
+  damage gap self-heals within a GOP and every IDR is pixel-correct.
+  `DamageRect` trimmed to a row band `{y, height}` (the encoder is row-based).
+  31 lib + 68 bin tests; live render artifact-free.
 
 ---
 

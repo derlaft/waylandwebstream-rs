@@ -146,6 +146,23 @@ GPU-less dev box.
   bitrate rebuild), frames pile in `frame_rx` (cap 4); only the latest matters
   for a live stream, so the rest are dropped and their buffers returned for
   reuse (like the resize-drain). Intentional, not a frame-dropping bug.
+- **Damage-aware BGRA→YUV has a hard invariant: every changed row must reach the
+  encoder, or you get *persistent* corruption** (old pixels in a region until it
+  next changes). The encoder converts only the rows in `RawFrame::damage` into a
+  **persistent** `yuv_frame` reused across calls (`convert_damaged_rows`,
+  via `sws_scale` with `srcSliceY=0` + plane pointers offset to the band — the
+  slice API rejects a mid-frame `srcSliceY`). So any path that loses a frame's
+  damage must carry it forward: `skip_to_newest_frame` **unions** skipped frames'
+  damage onto the kept frame; the capture loop **`readd_damage`s** a frame
+  dropped at the bounded send queue; and **every keyframe forces a full convert**
+  (`force_keyframe ⇒ scaler.run`) as a self-healing backstop so any gap clears
+  within a GOP and every IDR is whole. Corollary that bit once: the encoder
+  handoff buffer (`render()`'s output) **must be a full copy of the canvas**, not
+  just the damaged rows — the skip-union reads *other* frames' rows out of the
+  kept buffer, so a partial copy leaves them stale (this is why the "Stage C"
+  partial handoff was reverted; a correct one needs per-buffer damage history).
+  The GL path leaves `damage` empty → full convert. `DamageRect` is a row band
+  `{y, height}`; the encoder is whole-row (chroma is vertically 2x-subsampled).
 
 ### Hardware acceleration (optional GL compositor / VAAPI encoder)
 

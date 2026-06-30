@@ -231,20 +231,6 @@ fn accumulate_damage(
     }
 }
 
-/// Copies only the rows covered by `rects` from `src` into `dst` (both
-/// `width`-wide BGRA buffers of equal length). The damage-proportional encoder
-/// handoff: the encoder converts only these same rows, so the rest of `dst`
-/// (stale pooled content) is never read. `rects`' vertical spans are within the
-/// buffer and even-aligned by construction (see `render`).
-fn copy_damaged_rows(dst: &mut [u8], src: &[u8], rects: &[DamageRect], width: u32) {
-    let stride = (width * 4) as usize;
-    for r in rects {
-        let y0 = r.y as usize * stride;
-        let y1 = (r.y + r.height) as usize * stride;
-        dst[y0..y1].copy_from_slice(&src[y0..y1]);
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct Clip {
     x0: u32,
@@ -539,6 +525,20 @@ impl WaylandWebStreamState {
         std::mem::take(&mut self.last_repaint_rects)
     }
 
+    /// Re-marks `rects` as damage. Used when a frame was rendered but dropped
+    /// before it reached the encoder (the capture loop's bounded send queue was
+    /// full): without this the encoder's persistent YUV frame keeps the dropped
+    /// frame's stale rows, since the *next* frame's damage no longer covers
+    /// them. Pixel coords are output-local, i.e. 1:1 with logical space.
+    pub fn readd_damage(&mut self, rects: &[DamageRect]) {
+        let width = self.width as i32;
+        for r in rects {
+            // Row bands are full-width (the encoder is row-based); re-mark the
+            // whole rows so the next render re-composites and re-converts them.
+            self.add_damage(Rectangle::new((0, r.y as i32).into(), (width, r.height as i32).into()));
+        }
+    }
+
     /// Whether there is accumulated damage, *without* consuming it. The capture
     /// loop uses this to decide whether to render early (as soon as a frame
     /// interval has elapsed since the last capture) instead of waiting for the
@@ -680,8 +680,7 @@ impl WaylandWebStreamState {
         // canvas was just (re)sized or no damage was recorded. Each is
         // composited independently so disjoint damage doesn't repaint the
         // bounding box between the regions.
-        let full_repaint = size_changed || self.repaint_region.is_empty();
-        let clips: Vec<Clip> = if full_repaint {
+        let clips: Vec<Clip> = if size_changed || self.repaint_region.is_empty() {
             self.repaint_region.clear();
             vec![Clip::full(self.width, self.height)]
         } else {
@@ -693,18 +692,11 @@ impl WaylandWebStreamState {
         };
 
         // Hand these exact regions to the encoder so it converts only these rows
-        // BGRA->YUV, and so the partial handoff copy below moves only these
-        // rows. The vertical span is snapped to even rows up front so the
-        // handoff and the encoder's YUV420 chroma-aligned bands agree exactly
-        // (no stale row read at a band edge); the x-extent is irrelevant to both
-        // (they work by whole rows).
+        // BGRA->YUV. (The handoff below copies the whole frame -- see the note
+        // there on why a partial copy is unsafe under frame skipping.)
         self.last_repaint_rects = clips
             .iter()
-            .map(|c| {
-                let y0 = c.y0 & !1;
-                let y1 = ((c.y1 + 1) & !1).min(self.height);
-                DamageRect { x: c.x0, y: y0, width: c.x1 - c.x0, height: y1.saturating_sub(y0) }
-            })
+            .map(|c| DamageRect { y: c.y0, height: c.y1 - c.y0 })
             .collect();
 
         let window_count = self.space.elements().count();
@@ -808,20 +800,16 @@ impl WaylandWebStreamState {
 
         // Hand the canvas to the encoder, reusing the recycled buffer's
         // allocation, and keep the canvas for next frame's update.
+        // Always a full copy. A partial copy (only the damaged rows) is unsafe:
+        // when the encoder falls behind it skips frames and unions their damage
+        // onto the *newest* frame's buffer (see `skip_to_newest_frame`), so that
+        // buffer must hold current pixels for every row -- a partial copy leaves
+        // the skipped frames' rows stale and the encoder converts garbage. The
+        // damage-only saving is on the BGRA->YUV conversion (encoder) and the
+        // compositing (above), not this memcpy.
         let mut output = reuse_buffer.unwrap_or_default();
-        if full_repaint || output.len() != buffer_size {
-            // Full repaint, or the recycled buffer is missing / the wrong size
-            // (its rows can't be trusted): copy the whole frame -- the encoder
-            // converts it in full too.
-            output.clear();
-            output.extend_from_slice(&canvas);
-        } else {
-            // Partial: copy only the damaged row bands. The encoder reads only
-            // these same rows (damage-aware swscale), so the rest -- stale
-            // content from when this pooled buffer last held a frame -- is never
-            // read. Saves the full width*height*4 memcpy on a small-damage frame.
-            copy_damaged_rows(&mut output, &canvas, &self.last_repaint_rects, self.width);
-        }
+        output.clear();
+        output.extend_from_slice(&canvas);
         self.canvas = canvas;
         Some(output)
     }
@@ -1734,23 +1722,6 @@ mod render_tests {
         // Further adds are no-ops while fully damaged.
         accumulate_damage(&mut set, rect(5, 5, 5, 5), full);
         assert_eq!(set, vec![full]);
-    }
-
-    #[test]
-    fn copy_damaged_rows_copies_only_the_listed_rows() {
-        let (w, h) = (4u32, 6u32);
-        let stride = (w * 4) as usize;
-        let mut dst = vec![0xAAu8; stride * h as usize];
-        let src = vec![0xBBu8; stride * h as usize];
-        copy_damaged_rows(&mut dst, &src, &[DamageRect { x: 0, y: 2, width: w, height: 2 }], w);
-        for row in 0..h as usize {
-            let line = &dst[row * stride..(row + 1) * stride];
-            if (2..4).contains(&row) {
-                assert!(line.iter().all(|&b| b == 0xBB), "row {row} should be copied from src");
-            } else {
-                assert!(line.iter().all(|&b| b == 0xAA), "row {row} should keep dst's prior bytes");
-            }
-        }
     }
 
     #[test]
