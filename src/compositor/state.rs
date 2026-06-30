@@ -130,17 +130,21 @@ pub struct WaylandWebStreamState {
     // Clock for timing
     pub clock: Clock<Monotonic>,
 
-    // Accumulated logical-space damage since the last `take_dirty()`, unioned
-    // across every surface commit, window map/unmap, and resize that may
-    // have changed the rendered picture. `None` means provably nothing
-    // changed. Lets the main loop skip render()+encode() on frames where the
-    // screen provably hasn't changed.
-    damage: Option<Rectangle<i32, Logical>>,
+    // Accumulated logical-space damage since the last `take_dirty()`: a small
+    // *set* of rectangles, not one merged bounding box, so two disjoint
+    // damages -- a cursor in one corner and a caret in another -- don't blow up
+    // into a near-fullscreen repaint. Unioned across every surface commit,
+    // window map/unmap, and resize that may have changed the picture; bounded
+    // to `MAX_DAMAGE_RECTS` (collapsing to a single bbox past that, and a
+    // full-output rect supersedes the rest). Empty means provably nothing
+    // changed -- the main loop skips render()+encode() then.
+    damage: Vec<Rectangle<i32, Logical>>,
 
-    // The damage region `take_dirty()` last consumed, stashed for the SW
-    // `render()` to use as its repaint clip. `None` means "repaint everything"
-    // (a forced render with no tracked damage). The GL backend ignores it.
-    repaint_region: Option<Rectangle<i32, Logical>>,
+    // The damage rectangles `take_dirty()` last consumed, stashed for the SW
+    // `render()` to clip each composite pass to. Empty means "repaint
+    // everything" (a forced render with no tracked damage). The GL backend
+    // ignores it.
+    repaint_region: Vec<Rectangle<i32, Logical>>,
 
     // Persistent last fully-composited frame (BGRA, `width*height*4` bytes).
     // `render()` updates only the damaged sub-rect each frame and hands the
@@ -180,6 +184,44 @@ pub struct WaylandWebStreamState {
 /// compositing to a damaged sub-region of the output. Coordinates are clamped
 /// to the output bounds on construction, so a `Clip` never addresses outside
 /// the framebuffer.
+/// Upper bound on tracked damage rectangles before they collapse to a single
+/// bounding box. Small: a handful of disjoint damages (cursor, caret, a couple
+/// of updating widgets) is the case worth keeping separate; beyond that the
+/// per-rect compositing overhead outweighs the saving over one bbox repaint.
+const MAX_DAMAGE_RECTS: usize = 8;
+
+/// Accumulates `rect` into a damage `set`, keeping disjoint regions separate.
+/// Separated from `CompositorState::add_damage` so the set logic (dedup,
+/// full-output supersede, bounded collapse) is unit-testable without building a
+/// whole compositor. `full` is the output-covering rectangle.
+fn accumulate_damage(
+    set: &mut Vec<Rectangle<i32, Logical>>,
+    rect: Rectangle<i32, Logical>,
+    full: Rectangle<i32, Logical>,
+) {
+    // Already fully damaged -> nothing finer worth tracking.
+    if set.first() == Some(&full) {
+        return;
+    }
+    if rect == full {
+        set.clear();
+        set.push(full);
+        return;
+    }
+    // Skip exact duplicates (the same surface re-damaged within a frame).
+    if set.contains(&rect) {
+        return;
+    }
+    if set.len() >= MAX_DAMAGE_RECTS {
+        // Collapse to the bounding box of everything plus the newcomer.
+        let merged = set.iter().copied().fold(rect, |a, r| a.merge(r));
+        set.clear();
+        set.push(merged);
+    } else {
+        set.push(rect);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Clip {
     x0: u32,
@@ -400,8 +442,8 @@ impl WaylandWebStreamState {
             width,
             height,
             clock: Clock::new(),
-            damage: Some(Rectangle::new((0, 0).into(), (width as i32, height as i32).into())),
-            repaint_region: None,
+            damage: vec![Rectangle::new((0, 0).into(), (width as i32, height as i32).into())],
+            repaint_region: Vec::new(),
             canvas: Vec::new(),
             frame_counter: 0,
             dmabuf_state: None,
@@ -462,8 +504,8 @@ impl WaylandWebStreamState {
     /// only that sub-region. A `true` return is always followed by a
     /// `render()` call, so the stash never goes stale across frames.
     pub fn take_dirty(&mut self) -> bool {
-        self.repaint_region = self.damage.take();
-        self.repaint_region.is_some()
+        self.repaint_region = std::mem::take(&mut self.damage);
+        !self.repaint_region.is_empty()
     }
 
     /// Whether there is accumulated damage, *without* consuming it. The capture
@@ -474,15 +516,19 @@ impl WaylandWebStreamState {
     /// frame of latency. The actual consume still happens in `take_dirty()`
     /// when the frame is rendered, so the `repaint_region` stash stays correct.
     pub fn is_dirty(&self) -> bool {
-        self.damage.is_some()
+        !self.damage.is_empty()
     }
 
-    /// Unions `rect` into the accumulated damage for the current frame.
+    /// Adds `rect` to the accumulated damage for the current frame. Tracked as
+    /// a small set of rectangles rather than one merged bounding box (see the
+    /// `damage` field) so `render()` only recomposites the regions that
+    /// actually changed. A full-output rect supersedes everything (and
+    /// short-circuits further adds); past `MAX_DAMAGE_RECTS` the set collapses
+    /// to its bounding box so pathological churn can't make per-frame
+    /// compositing unbounded.
     fn add_damage(&mut self, rect: Rectangle<i32, Logical>) {
-        self.damage = Some(match self.damage {
-            Some(existing) => existing.merge(rect),
-            None => rect,
-        });
+        let full = self.full_output_damage();
+        accumulate_damage(&mut self.damage, rect, full);
     }
 
     /// Returns the rectangle covering the entire output, in logical space.
@@ -599,11 +645,19 @@ impl WaylandWebStreamState {
             canvas.resize(buffer_size, 0);
         }
 
-        // Repaint clip: the damaged sub-rect, or the whole output when the
-        // canvas was just (re)sized or no damage rect was recorded.
-        let clip = match self.repaint_region.take() {
-            Some(rect) if !size_changed => Clip::from_logical(rect, self.width, self.height),
-            _ => Clip::full(self.width, self.height),
+        // Repaint clips: the damaged sub-rects, or the whole output when the
+        // canvas was just (re)sized or no damage was recorded. Each is
+        // composited independently so disjoint damage doesn't repaint the
+        // bounding box between the regions.
+        let clips: Vec<Clip> = if size_changed || self.repaint_region.is_empty() {
+            self.repaint_region.clear();
+            vec![Clip::full(self.width, self.height)]
+        } else {
+            std::mem::take(&mut self.repaint_region)
+                .into_iter()
+                .map(|rect| Clip::from_logical(rect, self.width, self.height))
+                .filter(|clip| !clip.is_empty())
+                .collect()
         };
 
         let window_count = self.space.elements().count();
@@ -618,7 +672,7 @@ impl WaylandWebStreamState {
         // Clear only the area being repainted; the rest stays as last frame.
         // Alpha is irrelevant here -- the buffer only ever feeds the BGRA->
         // YUV420P conversion in the encoder, which doesn't read it.
-        if !clip.is_empty() {
+        for &clip in &clips {
         clear_region(&mut canvas, self.width, clip);
 
         // Render each window
@@ -703,7 +757,7 @@ impl WaylandWebStreamState {
         if window_count == 0 {
             render_root_weave(&mut canvas, self.width, self.height, clip);
         }
-        } // end `if !clip.is_empty()`
+        } // end `for clip in clips`
 
         // Hand the encoder a full copy of the canvas, reusing the recycled
         // buffer's allocation, and keep the canvas for next frame's update.
@@ -1585,6 +1639,60 @@ mod render_tests {
             assert!(px[0] == px[1] && px[1] == px[2]);
             assert!(px[0] == 0 || px[0] == 255);
         }
+    }
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
+        Rectangle::new((x, y).into(), (w, h).into())
+    }
+
+    #[test]
+    fn accumulate_damage_keeps_disjoint_rects_separate() {
+        let full = rect(0, 0, 1920, 1080);
+        let (a, b) = (rect(0, 0, 16, 16), rect(1900, 1060, 16, 16));
+        let mut set = Vec::new();
+        accumulate_damage(&mut set, a, full);
+        accumulate_damage(&mut set, b, full);
+        // The whole point of #11: two corner damages stay two small rects,
+        // not one near-fullscreen bounding box.
+        assert_eq!(set, vec![a, b]);
+    }
+
+    #[test]
+    fn accumulate_damage_dedups_exact_repeats() {
+        let full = rect(0, 0, 1920, 1080);
+        let a = rect(10, 10, 20, 20);
+        let mut set = Vec::new();
+        accumulate_damage(&mut set, a, full);
+        accumulate_damage(&mut set, a, full);
+        assert_eq!(set, vec![a], "an identical rect should not be tracked twice");
+    }
+
+    #[test]
+    fn accumulate_damage_full_output_supersedes_and_short_circuits() {
+        let full = rect(0, 0, 1920, 1080);
+        let mut set = Vec::new();
+        accumulate_damage(&mut set, rect(10, 10, 20, 20), full);
+        accumulate_damage(&mut set, full, full);
+        assert_eq!(set, vec![full], "a full-output rect collapses the set to itself");
+        // Further adds are no-ops while fully damaged.
+        accumulate_damage(&mut set, rect(5, 5, 5, 5), full);
+        assert_eq!(set, vec![full]);
+    }
+
+    #[test]
+    fn accumulate_damage_collapses_past_the_cap() {
+        let full = rect(0, 0, 10000, 10000);
+        let mut set = Vec::new();
+        for i in 0..MAX_DAMAGE_RECTS as i32 {
+            accumulate_damage(&mut set, rect(i * 100, 0, 10, 10), full);
+        }
+        assert_eq!(set.len(), MAX_DAMAGE_RECTS);
+        accumulate_damage(&mut set, rect(9000, 9000, 10, 10), full);
+        assert_eq!(set.len(), 1, "past the cap the set collapses to one bbox");
+        let b = set[0];
+        // The bbox must enclose both the first rect's origin and the last's far corner.
+        assert!(b.loc.x <= 0 && b.loc.y <= 0);
+        assert!(b.loc.x + b.size.w >= 9010 && b.loc.y + b.size.h >= 9010);
     }
 }
 
