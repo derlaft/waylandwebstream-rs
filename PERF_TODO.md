@@ -172,6 +172,15 @@ only the real regions.
   `render_pixels` partial-repaint test + 67 bin tests pass; live render clean.
   Stage A of the full damage-proportional SW pipeline (Stage B = damage-aware
   swscale in the encoder; Stage C = damaged-rows-only handoff).
+- [x] **Stage B done** (2026-06-30): `RawFrame` carries the damage rects; the
+  encoder converts only the damaged row bands BGRA→YUV into its persistent
+  `yuv_frame` (unchanged rows keep the previous frame's YUV) via `sws_scale`
+  with offset plane pointers + `srcSliceY=0` (the slice API rejects a mid-frame
+  `srcSliceY`; chroma offset by y0/2, bands snapped even). Full-convert fallback
+  on first frame / resize (`needs_full_convert`) and empty damage (GL readback);
+  `skip_to_newest_frame` unions skipped frames' damage so the persistent YUV
+  never misses a region. Hermetic band-conversion test + 31 lib + 68 bin tests;
+  live firefox render artifact-free.
 
 ---
 

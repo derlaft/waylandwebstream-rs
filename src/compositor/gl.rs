@@ -263,6 +263,9 @@ impl GlCompositor {
             width,
             height,
             capture_instant,
+            // The GL path has no per-rect damage (it uses Smithay's own damage
+            // tracker), so leave it empty -> the encoder converts in full.
+            damage: Vec::new(),
         }))
     }
 }

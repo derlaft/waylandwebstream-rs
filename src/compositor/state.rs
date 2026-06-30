@@ -62,6 +62,8 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use tracing::{debug, info, trace, warn};
 
+use crate::encoder::DamageRect;
+
 /// Name reported for the single headless `wl_output` we expose.
 const OUTPUT_NAME: &str = "HEADLESS-1";
 
@@ -145,6 +147,13 @@ pub struct WaylandWebStreamState {
     // everything" (a forced render with no tracked damage). The GL backend
     // ignores it.
     repaint_region: Vec<Rectangle<i32, Logical>>,
+
+    // The pixel rectangles the last `render()` actually repainted, handed to
+    // the encoder (via `take_repaint_rects`) so it converts only those rows
+    // BGRA->YUV. Mirrors `repaint_region` but as output-pixel `DamageRect`s and
+    // *after* the full-repaint fallback is resolved (so a forced/first/resized
+    // frame reports the whole output, matching what was composited).
+    last_repaint_rects: Vec<DamageRect>,
 
     // Persistent last fully-composited frame (BGRA, `width*height*4` bytes).
     // `render()` updates only the damaged sub-rect each frame and hands the
@@ -444,6 +453,7 @@ impl WaylandWebStreamState {
             clock: Clock::new(),
             damage: vec![Rectangle::new((0, 0).into(), (width as i32, height as i32).into())],
             repaint_region: Vec::new(),
+            last_repaint_rects: Vec::new(),
             canvas: Vec::new(),
             frame_counter: 0,
             dmabuf_state: None,
@@ -506,6 +516,13 @@ impl WaylandWebStreamState {
     pub fn take_dirty(&mut self) -> bool {
         self.repaint_region = std::mem::take(&mut self.damage);
         !self.repaint_region.is_empty()
+    }
+
+    /// Takes the pixel rectangles the most recent `render()` repainted, for the
+    /// encoder to convert damage-only (see `RawFrame::damage`). Empty if the
+    /// last render repainted nothing (it never hands the encoder a frame then).
+    pub fn take_repaint_rects(&mut self) -> Vec<DamageRect> {
+        std::mem::take(&mut self.last_repaint_rects)
     }
 
     /// Whether there is accumulated damage, *without* consuming it. The capture
@@ -659,6 +676,14 @@ impl WaylandWebStreamState {
                 .filter(|clip| !clip.is_empty())
                 .collect()
         };
+
+        // Hand these exact regions to the encoder so it converts only these
+        // rows BGRA->YUV. Captured here, after the full-repaint fallback, so
+        // they always match what's actually composited below.
+        self.last_repaint_rects = clips
+            .iter()
+            .map(|c| DamageRect { x: c.x0, y: c.y0, width: c.x1 - c.x0, height: c.y1 - c.y0 })
+            .collect();
 
         let window_count = self.space.elements().count();
 

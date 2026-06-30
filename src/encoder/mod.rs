@@ -6,6 +6,17 @@ use tracing::{debug, error, info, warn};
 
 mod vaapi;
 
+/// A changed pixel rectangle within a frame, in output pixels. Carried from
+/// the compositor so the encoder can convert only the changed rows BGRA->YUV
+/// instead of the whole frame (see `convert_damaged_rows`).
+#[derive(Clone, Copy, Debug)]
+pub struct DamageRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Raw frame data to be encoded
 #[derive(Clone)]
 pub struct RawFrame {
@@ -20,6 +31,13 @@ pub struct RawFrame {
     /// When the render loop captured this frame -- the start of the
     /// server-side latency pipeline (see `capture_to_encode_ms` below).
     pub capture_instant: std::time::Instant,
+    /// Regions changed since the previous *encoded* frame, in output pixels.
+    /// The encoder converts only these rows BGRA->YUV into its persistent YUV
+    /// frame; an **empty** list means "whole frame changed" (full convert) --
+    /// the GL readback path, which has no per-rect damage, leaves it empty.
+    /// `skip_to_newest_frame` unions in the damage of any frames it drops so
+    /// the persistent YUV frame never misses a region.
+    pub damage: Vec<DamageRect>,
 }
 
 /// A frame handed from a `Compositor` to a `VideoEncoder`, in whichever
@@ -286,6 +304,11 @@ struct X264Encoder {
     frame_count: i64,
     next_frame_id: u32,
     buffer_return_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    /// When set, the next frame is converted in full rather than damage-only:
+    /// the persistent `yuv_frame` can't be trusted to hold the previous frame
+    /// yet (it was just (re)allocated -- startup or resize). Cleared after the
+    /// first successful full convert.
+    needs_full_convert: bool,
 }
 
 impl X264Encoder {
@@ -303,6 +326,7 @@ impl X264Encoder {
             frame_count: 0,
             next_frame_id: 0,
             buffer_return_tx,
+            needs_full_convert: true,
         })
     }
 }
@@ -321,6 +345,7 @@ impl VideoEncoder for X264Encoder {
             }
         };
 
+        let force_full_convert = self.needs_full_convert;
         let result = encode_frame(
             &mut self.encoder,
             &mut self.scaler,
@@ -330,6 +355,7 @@ impl VideoEncoder for X264Encoder {
             self.frame_count,
             &mut self.next_frame_id,
             force_keyframe,
+            force_full_convert,
             capture_to_encode_ms,
         );
 
@@ -342,6 +368,10 @@ impl VideoEncoder for X264Encoder {
         let _ = self.buffer_return_tx.send(raw_frame.data);
 
         let packets = result?;
+        // Only clear after a successful encode: an error may have left the
+        // yuv_frame half-converted, so keep forcing a full convert until one
+        // actually lands.
+        self.needs_full_convert = false;
         self.frame_count += 1;
         Ok(packets)
     }
@@ -355,6 +385,9 @@ impl VideoEncoder for X264Encoder {
         self.input_frame = create_input_frame(width, height);
         self.yuv_frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, width, height);
         self.frame_count = 0;
+        // The fresh yuv_frame holds nothing -> the next frame must convert in
+        // full before damage-only conversion is safe again.
+        self.needs_full_convert = true;
 
         Ok(())
     }
@@ -456,6 +489,18 @@ fn skip_to_newest_frame(
     while let Ok(newer) = frame_rx.try_recv() {
         let stale = std::mem::replace(&mut newest, newer);
         if let CapturedFrame::Cpu(raw_frame) = stale {
+            // Carry the skipped frame's damage forward: the kept (newer) frame's
+            // BGRA is current for every region, but the encoder's persistent YUV
+            // frame still needs every row that changed across the skipped frames
+            // re-converted. Empty damage means "whole frame" on either side, so
+            // it propagates as a full convert.
+            if let CapturedFrame::Cpu(keep) = &mut newest {
+                if keep.damage.is_empty() || raw_frame.damage.is_empty() {
+                    keep.damage.clear();
+                } else {
+                    keep.damage.extend_from_slice(&raw_frame.damage);
+                }
+            }
             // Ignore failure: a dropped receiver just means the render loop is
             // gone and the buffer frees normally (mirrors submit()).
             let _ = buffer_return_tx.send(raw_frame.data);
@@ -774,6 +819,76 @@ pub(crate) fn create_input_frame(width: u32, height: u32) -> ffmpeg::frame::Vide
     frame
 }
 
+/// Converts only the row bands covered by `damage` from `input` (BGRA) into
+/// `output` (YUV420P), leaving every other row as whatever `output` already
+/// held -- the encoder reuses one `output` frame across calls, so unchanged
+/// rows keep the previous frame's YUV. Each band is snapped to even rows so
+/// YUV420's vertically-2x-subsampled chroma planes stay aligned, and clamped to
+/// the frame. Uses `sws_scale`'s slice API (`srcSliceY`/`srcSliceH`) on the
+/// same full-frame scaler context the full-convert path uses -- mirrors
+/// `scaling::Context::run`'s pointer handling exactly, only the slice range
+/// differs.
+fn convert_damaged_rows(
+    scaler: &mut ffmpeg::software::scaling::Context,
+    input: &ffmpeg::frame::Video,
+    output: &mut ffmpeg::frame::Video,
+    damage: &[DamageRect],
+    height: u32,
+) {
+    // SAFETY: `scaler` is a live SwsContext; `input`/`output` are valid AVFrames
+    // sized `height` with the formats the scaler was built for. Each band
+    // `[y0, y1)` is clamped to `[0, height)` and even-aligned. We pass
+    // srcSliceY=0 and instead offset every plane pointer to row y0 -- chroma by
+    // y0/2 (YUV420 is 2x-subsampled vertically) -- because sws_scale rejects a
+    // slice that "starts in the middle" (srcSliceY>0). The offsets stay within
+    // each plane (band within [0,height)), and strides come straight from the
+    // frames as in `Context::run`.
+    unsafe {
+        let ctx = scaler.as_mut_ptr();
+        let src = input.as_ptr();
+        let dst = output.as_mut_ptr();
+        let src_stride = (*src).linesize.as_ptr() as *const _;
+        let dst_stride = (*dst).linesize.as_ptr() as *mut _;
+        let src_ls0 = (*src).linesize[0] as isize;
+        let (dy, du, dv) = (
+            (*dst).linesize[0] as isize,
+            (*dst).linesize[1] as isize,
+            (*dst).linesize[2] as isize,
+        );
+        let src0 = (*src).data[0];
+        let (dst0, dst1, dst2) = ((*dst).data[0], (*dst).data[1], (*dst).data[2]);
+        for rect in damage {
+            let y0 = (rect.y & !1) as isize; // round down to even
+            let y1 = (((rect.y.saturating_add(rect.height).saturating_add(1)) & !1).min(height))
+                as isize; // round up, clamp
+            if y1 <= y0 {
+                continue;
+            }
+            let src_planes: [*const u8; 4] = [
+                src0.offset(y0 * src_ls0) as *const u8,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            ];
+            let dst_planes: [*mut u8; 4] = [
+                dst0.offset(y0 * dy),
+                dst1.offset((y0 / 2) * du),
+                dst2.offset((y0 / 2) * dv),
+                std::ptr::null_mut(),
+            ];
+            ffmpeg::ffi::sws_scale(
+                ctx,
+                src_planes.as_ptr() as *const *const _,
+                src_stride,
+                0,
+                (y1 - y0) as i32,
+                dst_planes.as_ptr(),
+                dst_stride,
+            );
+        }
+    }
+}
+
 /// Encode a single frame
 #[allow(clippy::too_many_arguments)] // per-frame encode params; grouping them hurts readability
 fn encode_frame(
@@ -785,6 +900,7 @@ fn encode_frame(
     frame_number: i64,
     next_frame_id: &mut u32,
     force_keyframe: bool,
+    force_full_convert: bool,
     capture_to_encode_ms: f64,
 ) -> Result<Vec<EncodedPacket>> {
     // Point the input frame straight at the render buffer instead of
@@ -813,8 +929,16 @@ fn encode_frame(
         (*ptr).linesize[0] = (input_frame.width() * 4) as i32;
     }
 
-    // Convert BGRA to YUV420P
-    scaler.run(input_frame, yuv_frame)?;
+    // Convert BGRA to YUV420P. Damage-driven: only the changed rows are
+    // converted into the persistent `yuv_frame` (unchanged rows keep the
+    // previous frame's YUV), unless a full convert is forced -- the first frame
+    // or just after a resize, when `yuv_frame` can't be trusted -- or the
+    // damage list is empty (whole frame changed; the GL readback path).
+    if force_full_convert || raw_frame.damage.is_empty() {
+        scaler.run(input_frame, yuv_frame)?;
+    } else {
+        convert_damaged_rows(scaler, input_frame, yuv_frame, &raw_frame.damage, raw_frame.height);
+    }
 
     // Set frame properties. Tagging the frame `I` is what actually forces
     // libx264 to emit an IDR on demand -- `None` lets it decide normally per
@@ -895,6 +1019,70 @@ mod tests {
             width,
             height,
             capture_instant: std::time::Instant::now(),
+            damage: Vec::new(),
+        }
+    }
+
+    fn vec_bgra(w: u32, h: u32, px: [u8; 4]) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            v.extend_from_slice(&px);
+        }
+        v
+    }
+
+    // Points a BGRA `frame`'s plane at `data` (no copy), mirroring how
+    // `encode_frame` aliases the render buffer. `data` must outlive every use.
+    fn point_input_at(frame: &mut ffmpeg::frame::Video, data: &[u8], width: u32) {
+        // SAFETY: valid AVFrame; `data` holds a full width*height*4 BGRA image
+        // and outlives the conversion calls in the test below.
+        unsafe {
+            let ptr = frame.as_mut_ptr();
+            (*ptr).data[0] = data.as_ptr() as *mut u8;
+            (*ptr).linesize[0] = (width * 4) as i32;
+        }
+    }
+
+    /// Damage-driven conversion: only the damaged row band is re-converted into
+    /// the persistent YUV frame; every other row keeps the previous frame's
+    /// bytes. This is the core of Stage B's correctness.
+    #[test]
+    fn convert_damaged_rows_only_rewrites_the_damaged_band() {
+        ffmpeg::init().unwrap();
+        let (w, h) = (64u32, 64u32);
+        let config = EncoderConfig { width: w, height: h, ..Default::default() };
+        let mut scaler = create_scaler(&config).unwrap();
+        let mut input = create_input_frame(w, h);
+        let mut yuv = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, w, h);
+
+        // Frame 1: all red -> full convert establishes the baseline YUV.
+        let red = vec_bgra(w, h, [0, 0, 255, 255]); // BGRA
+        point_input_at(&mut input, &red, w);
+        scaler.run(&input, &mut yuv).unwrap();
+        let baseline_y: Vec<u8> = yuv.data(0).to_vec();
+
+        // Frame 2: all blue, but only rows [16, 32) are reported damaged.
+        let blue = vec_bgra(w, h, [255, 0, 0, 255]);
+        point_input_at(&mut input, &blue, w);
+        convert_damaged_rows(
+            &mut scaler,
+            &input,
+            &mut yuv,
+            &[DamageRect { x: 0, y: 16, width: w, height: 16 }],
+            h,
+        );
+
+        let new_y = yuv.data(0);
+        let ystride = yuv.stride(0);
+        for row in 0..h as usize {
+            let off = row * ystride;
+            let line = &new_y[off..off + w as usize];
+            let base = &baseline_y[off..off + w as usize];
+            if (16..32).contains(&row) {
+                assert_ne!(line, base, "damaged row {row} should have been re-converted to blue");
+            } else {
+                assert_eq!(line, base, "untouched row {row} must keep the previous frame's YUV");
+            }
         }
     }
 

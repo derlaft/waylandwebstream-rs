@@ -1031,6 +1031,7 @@ mod tests {
             width,
             height,
             capture_instant: std::time::Instant::now(),
+            damage: Vec::new(),
         }
     }
 

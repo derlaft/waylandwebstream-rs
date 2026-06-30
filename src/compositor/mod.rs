@@ -36,6 +36,9 @@ impl Compositor for SwCompositor {
                 width,
                 height,
                 capture_instant: std::time::Instant::now(),
+                // The rects render() just composited -> the encoder converts
+                // only those rows BGRA->YUV (damage-driven swscale).
+                damage: state.take_repaint_rects(),
             })
         })
     }
