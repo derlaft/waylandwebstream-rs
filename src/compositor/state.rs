@@ -1264,8 +1264,7 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
         // dispatched -- a permanent, silent hang on the client side.
         self.configure_toplevel_fullscreen(&surface);
 
-        #[allow(deprecated)]
-        let window = Window::new(surface);
+        let window = Window::new_wayland_window(surface);
         self.space.map_element(window, (0, 0), false);
         let full_damage = self.full_output_damage();
         self.add_damage(full_damage);
