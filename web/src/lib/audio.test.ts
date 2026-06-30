@@ -3,8 +3,19 @@ import { AudioStream } from './audio';
 
 // ─── Minimal Web Audio / WebCodecs stubs ─────────────────────────────────────
 
+interface FakeSource {
+  buffer: unknown;
+  onended: (() => void) | null;
+  connect: ReturnType<typeof vi.fn>;
+  start: ReturnType<typeof vi.fn>;
+  stop: ReturnType<typeof vi.fn>;
+}
+
 class FakeAudioContext {
   static instances: FakeAudioContext[] = [];
+  // Every source handed out by createBufferSource, across all instances, in
+  // creation order -- lets tests inspect scheduled start times and stop() calls.
+  static sources: FakeSource[] = [];
 
   state: AudioContextState = 'running'; // created inside gesture → immediately running
   currentTime = 0;
@@ -25,11 +36,17 @@ class FakeAudioContext {
     getChannelData: vi.fn(() => new Float32Array(frames)),
   }));
 
-  createBufferSource = vi.fn(() => ({
-    buffer: null as unknown,
-    connect: vi.fn(),
-    start: vi.fn(),
-  }));
+  createBufferSource = vi.fn((): FakeSource => {
+    const source: FakeSource = {
+      buffer: null,
+      onended: null,
+      connect: vi.fn(),
+      start: vi.fn(),
+      stop: vi.fn(),
+    };
+    FakeAudioContext.sources.push(source);
+    return source;
+  });
 
   constructor() { FakeAudioContext.instances.push(this); }
 }
@@ -77,6 +94,7 @@ class FakeEncodedAudioChunk {
 
 function installFakeAudioAPIs(): void {
   FakeAudioContext.instances = [];
+  FakeAudioContext.sources = [];
   FakeAudioDecoder.instances = [];
   lastChunkInit = null;
   vi.stubGlobal('AudioContext', FakeAudioContext);
@@ -183,6 +201,69 @@ describe('AudioStream', () => {
       // Should not throw, and shouldn't decode anything into a new decoder.
       stream.handleAudioFrame({ ptsUs: 0, data: new Uint8Array([0xCC]) });
       expect(FakeAudioDecoder.instances).toHaveLength(1);
+    });
+  });
+
+  describe('playback scheduling / desync recovery', () => {
+    // The FakeAudioDecoder emits one 960-sample (20 ms) buffer synchronously per
+    // decode(), and FakeAudioContext.currentTime is whatever the test sets it to
+    // -- so feeding frames while currentTime stays frozen simulates a backlog
+    // burst decoded all at once, the situation that grows the lead unbounded.
+    const startOf = (s: FakeSource) => s.start.mock.calls[0][0] as number;
+
+    it('resyncs to the live edge when a burst pushes the lead past the cap', () => {
+      const stream = new AudioStream();
+      simulateGesture();
+      const ctx = FakeAudioContext.instances[0];
+      ctx.currentTime = 0; // live clock frozen: a pile of packets arriving at once
+
+      for (let i = 0; i < 20; i++) {
+        stream.handleAudioFrame({ ptsUs: i * 20_000, data: new Uint8Array([i]) });
+      }
+
+      // The resync stops the sources still queued ahead of the live edge...
+      const stopped = FakeAudioContext.sources.filter((s) => s.stop.mock.calls.length > 0);
+      expect(stopped.length).toBeGreaterThan(0);
+
+      // ...and nothing is ever scheduled more than the cap (+lookahead) ahead of
+      // the frozen clock, so latency stays bounded instead of climbing 20 ms per
+      // buffer (without the fix this would reach ~0.45 s after 20 frames).
+      const maxStart = Math.max(...FakeAudioContext.sources.map(startOf));
+      expect(maxStart).toBeLessThanOrEqual(0.3 + 0.05 + 1e-9);
+
+      stream.close();
+    });
+
+    it('does not resync during steady real-time playback', () => {
+      const stream = new AudioStream();
+      simulateGesture();
+      const ctx = FakeAudioContext.instances[0];
+
+      // Clock advances in lockstep with the 20 ms buffers: the lead stays at the
+      // scheduling lookahead and never approaches the cap.
+      for (let i = 0; i < 50; i++) {
+        ctx.currentTime = i * 0.02;
+        stream.handleAudioFrame({ ptsUs: i * 20_000, data: new Uint8Array([i & 0xff]) });
+      }
+
+      const anyStopped = FakeAudioContext.sources.some((s) => s.stop.mock.calls.length > 0);
+      expect(anyStopped).toBe(false);
+
+      stream.close();
+    });
+
+    it('drops a finished source from the pending set via onended', () => {
+      const stream = new AudioStream();
+      simulateGesture();
+
+      stream.handleAudioFrame({ ptsUs: 0, data: new Uint8Array([0x01]) });
+      const [source] = FakeAudioContext.sources;
+      // The scheduler wires onended to prune the pending set; firing it must not
+      // throw and leaves the set ready for the next buffer.
+      expect(source.onended).toBeTypeOf('function');
+      expect(() => source.onended!()).not.toThrow();
+
+      stream.close();
     });
   });
 });

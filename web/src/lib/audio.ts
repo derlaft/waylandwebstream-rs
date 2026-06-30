@@ -23,12 +23,26 @@ const CHANNELS = 2;
 // Playback scheduling lookahead: schedule a decoded buffer this many seconds
 // ahead of audioCtx.currentTime so we stay glitch-free even under GC pauses.
 const SCHEDULE_AHEAD_S = 0.05;
+// Maximum the playback head (`nextPlayTime`) may run ahead of the live
+// AudioContext clock before we force a resync. Audio is chained gaplessly via
+// `nextPlayTime`, so a backlog burst (network/GC stall, or tab throttling that
+// doesn't actually suspend the context) or slow sample-clock drift would
+// otherwise push the lead up by 20 ms per buffer with nothing to pull it back
+// -- audio ends up seconds late until the page is refreshed. When the lead
+// exceeds this we drop the queued-ahead audio and snap back to the live edge.
+// Kept comfortably above SCHEDULE_AHEAD_S, low enough to feel in sync.
+const MAX_LEAD_S = 0.3;
 
 export class AudioStream {
   private decoder: AudioDecoder | null = null;
   private audioCtx: AudioContext | null = null;
   // Wall-clock time at which the next decoded buffer should start playing.
   private nextPlayTime = 0;
+  // Buffers we've scheduled but that haven't finished playing yet. Tracked so a
+  // resync can stop() the ones still queued ahead of the live edge -- moving
+  // nextPlayTime alone can't un-schedule sources that source.start() already
+  // committed. Pruned via each source's onended.
+  private pendingSources = new Set<AudioBufferSourceNode>();
 
   // Capture-phase gesture listeners that create the AudioContext on first
   // interaction. Stored so they can be cleaned up on close().
@@ -53,6 +67,7 @@ export class AudioStream {
       try { this.decoder.close(); } catch (_) { /* ignore */ }
     }
     this.decoder = null;
+    this.pendingSources.clear();
     this.audioCtx?.close();
     this.audioCtx = null;
     this.removeGestureHandlers();
@@ -115,6 +130,9 @@ export class AudioStream {
     if (this.decoder && this.decoder.state !== 'closed') {
       try { this.decoder.close(); } catch (_) { /* ignore */ }
     }
+    // Stale timing from before the fault would otherwise schedule the fresh
+    // decoder's output relative to an old playback head.
+    this.nextPlayTime = 0;
     this.setupDecoder();
   }
 
@@ -137,15 +155,31 @@ export class AudioStream {
     }
     audioData.close();
 
+    // If the playback head has drifted too far ahead of the live clock -- a
+    // backlog burst chained 20 ms at a time, or accumulated sample-clock drift
+    // -- discard the queued-ahead audio and snap back to the live edge.
+    // Otherwise the lead never shrinks and audio plays seconds late until the
+    // page is refreshed.
+    if (this.nextPlayTime - ctx.currentTime > MAX_LEAD_S) {
+      for (const queued of this.pendingSources) {
+        try { queued.stop(); } catch (_) { /* already started/ended */ }
+      }
+      this.pendingSources.clear();
+      this.nextPlayTime = 0;
+    }
+
     // Gapless precision scheduling: each buffer starts right after the previous
     // one. If we've fallen behind (e.g. reconnect or context-resume after
-    // suspension), snap to now + lookahead so we don't schedule in the past.
+    // suspension) or just resynced above, snap to now + lookahead so we don't
+    // schedule in the past.
     const startAt = Math.max(ctx.currentTime + SCHEDULE_AHEAD_S, this.nextPlayTime);
     this.nextPlayTime = startAt + buffer.duration;
 
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     source.connect(ctx.destination);
+    this.pendingSources.add(source);
+    source.onended = () => { this.pendingSources.delete(source); };
     source.start(startAt);
   }
 
