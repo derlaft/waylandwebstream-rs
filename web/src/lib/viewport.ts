@@ -164,6 +164,9 @@ export class Viewport {
       return;
     }
     this.lastSent = render;
-    this.sendControl({ type: 'resize', width: render.width, height: render.height });
+    // `scale` (devicePixelRatio when native-resolution is on, else 1) is
+    // advertised to Wayland clients via wp_fractional_scale so HiDPI-aware apps
+    // render crisply at the output resolution.
+    this.sendControl({ type: 'resize', width: render.width, height: render.height, scale: pixelRatio });
   }
 }

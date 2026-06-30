@@ -33,7 +33,10 @@ export type PointerMessage =
   | { eventType: 'pointermove'; pointer: PointerPoint }
   | { eventType: 'pointerup'; pointer: PointerPoint }
   | { eventType: 'pointercancel'; pointer: PointerPoint }
-  | { eventType: 'wheel'; x: number; y: number; deltaX: number; deltaY: number };
+  | { eventType: 'wheel'; x: number; y: number; deltaX: number; deltaY: number }
+  // Relative motion from the Pointer Lock API while a client holds a pointer
+  // lock. dx/dy are pre-scaled to compositor/output pixels.
+  | { eventType: 'pointerrelative'; dx: number; dy: number };
 
 // `code` is `KeyboardEvent.code` -- the physical, layout-independent key
 // identifier (e.g. "KeyA", "ShiftLeft") -- never `KeyboardEvent.key`, which
@@ -49,7 +52,7 @@ export type KeyMessage =
 /// Mirrors `SignalingMessage` in src/server.rs.
 export type ClientMessage =
   | { type: 'ready' }
-  | { type: 'resize'; width: number; height: number }
+  | { type: 'resize'; width: number; height: number; scale?: number }
   | ({ type: 'touch' } & TouchMessage)
   | ({ type: 'pointer' } & PointerMessage)
   | ({ type: 'key' } & KeyMessage)
@@ -98,7 +101,26 @@ export type ServerMessage =
   | { type: 'cursor'; cursor: CursorUpdate }
   // The remote (nested compositor) clipboard text; the browser writes it to
   // the device clipboard. Pushed on connect and whenever the remote changes.
-  | { type: 'clipboard'; text: string };
+  | { type: 'clipboard'; text: string }
+  // Topmost window's title/app_id for the browser tab. Pushed on connect and
+  // whenever the focused window's title/app_id changes. Generic in nested mode.
+  | { type: 'title'; title: string; app_id: string }
+  // Topmost window's favicon (base64 RGBA, like surface cursors) or null to
+  // clear. Pushed on connect (only when present) and on icon changes.
+  | { type: 'favicon'; favicon: Favicon | null }
+  // A client engaged/released a pointer lock; the browser enters/leaves Pointer
+  // Lock (relative-motion) mode. Pushed on change and on connect when locked.
+  | { type: 'pointer_lock'; locked: boolean };
+
+/// The topmost window's icon from `xdg_toplevel_icon`. Mirrors `Favicon` in
+/// src/server.rs. The browser builds a PNG data-URL from the RGBA and sets it
+/// as `<link rel="icon">`.
+export interface Favicon {
+  width: number;
+  height: number;
+  /// Base64-encoded RGBA (top-down), width × height × 4 bytes.
+  rgba: string;
+}
 
 // ─── Unified binary protocol framing ─────────────────────────────────────────
 //

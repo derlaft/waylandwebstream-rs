@@ -26,6 +26,7 @@ import {
   type AudioFramePayload,
   type ClientMessage,
   type CursorUpdate,
+  type Favicon,
   type ServerMessage,
   type VideoFramePayload,
 } from './protocol';
@@ -45,6 +46,15 @@ export interface ClientChannelOptions {
   /// Called when the remote clipboard holds an image. The caller writes the
   /// bytes to the device clipboard as a ClipboardItem (see lib/clipboard.ts).
   onClipboardImage?: (mime: string, bytes: Uint8Array) => void;
+  /// Called when the topmost window's title/app_id changes. The caller updates
+  /// the browser tab title. Generic in nested-compositor mode.
+  onTitle?: (title: string, appId: string) => void;
+  /// Called when the topmost window's favicon changes (null to clear). The
+  /// caller builds a PNG data-URL and sets it as the tab icon.
+  onFavicon?: (favicon: Favicon | null) => void;
+  /// Called when a client engages/releases a pointer lock. The caller arms or
+  /// exits the browser's Pointer Lock (relative-motion) mode.
+  onPointerLock?: (locked: boolean) => void;
   /// Called for every decoded `MSG_VIDEO_FRAME` payload (frame_id,
   /// is_keyframe, ping echo, and the raw H.264 data). The caller feeds the
   /// H.264 to a VideoDecoder.
@@ -70,6 +80,9 @@ export class ClientChannel {
   private readonly onCursor?: (cursor: CursorUpdate) => void;
   private readonly onClipboard?: (text: string) => void;
   private readonly onClipboardImage?: (mime: string, bytes: Uint8Array) => void;
+  private readonly onTitle?: (title: string, appId: string) => void;
+  private readonly onFavicon?: (favicon: Favicon | null) => void;
+  private readonly onPointerLock?: (locked: boolean) => void;
   private readonly onVideoFrame?: (frame: VideoFramePayload) => void;
   private readonly onAudioFrame?: (frame: AudioFramePayload) => void;
   private readonly onClosed?: () => void;
@@ -91,6 +104,9 @@ export class ClientChannel {
     this.onCursor = opts.onCursor;
     this.onClipboard = opts.onClipboard;
     this.onClipboardImage = opts.onClipboardImage;
+    this.onTitle = opts.onTitle;
+    this.onFavicon = opts.onFavicon;
+    this.onPointerLock = opts.onPointerLock;
     this.onVideoFrame = opts.onVideoFrame;
     this.onAudioFrame = opts.onAudioFrame;
     this.onClosed = opts.onClosed;
@@ -274,6 +290,12 @@ export class ClientChannel {
       this.onCursor?.(msg.cursor);
     } else if (msg.type === 'clipboard') {
       this.onClipboard?.(msg.text);
+    } else if (msg.type === 'title') {
+      this.onTitle?.(msg.title, msg.app_id);
+    } else if (msg.type === 'favicon') {
+      this.onFavicon?.(msg.favicon);
+    } else if (msg.type === 'pointer_lock') {
+      this.onPointerLock?.(msg.locked);
     }
   }
 }

@@ -3,8 +3,8 @@
   import { AudioStream } from '../lib/audio';
   import { ClientChannel } from '../lib/client';
   import { ClipboardBridge } from '../lib/clipboard';
-  import { attachInput } from '../lib/input';
-  import type { ClientMessage, CursorUpdate } from '../lib/protocol';
+  import { attachInput, type InputHandle } from '../lib/input';
+  import type { ClientMessage, CursorUpdate, Favicon } from '../lib/protocol';
   import { observeRect } from '../lib/rectCache';
   import { onScreenKeyboardEnabled } from '../lib/softKeyboard';
   import { streamStats } from '../lib/stats';
@@ -26,7 +26,7 @@
   let pipeline: VideoPipeline | null = null;
   let audio: AudioStream | null = null;
   let viewport: Viewport | null = null;
-  let detachInput: (() => void) | null = null;
+  let input: InputHandle | null = null;
   let removeCursorListeners: (() => void) | null = null;
   // The video pipeline resolves asynchronously (it probes worker WebGL before
   // committing the canvas). If the component is torn down during that probe,
@@ -35,6 +35,45 @@
 
   function sendControl(msg: ClientMessage): void {
     client?.send(msg);
+  }
+
+  // Default tab title, restored when no window is focused (empty title).
+  const DEFAULT_TITLE = 'WaylandWebStream';
+
+  // Updates the browser tab title from the focused window's title (falling back
+  // to app_id, then the default). In nested-compositor mode this reflects the
+  // inner compositor's generic toplevel, not the app inside it. Capped to keep
+  // a pathological client title from bloating the tab.
+  function applyTitle(title: string, appId: string): void {
+    const label = (title || appId || DEFAULT_TITLE).slice(0, 200);
+    document.title = label === DEFAULT_TITLE ? label : `${label} — ${DEFAULT_TITLE}`;
+  }
+
+  // Applies a favicon update: builds a PNG data-URL from the RGBA pixels (same
+  // approach as surface cursors) and points the document's <link rel="icon"> at
+  // it. A null favicon restores the default. In nested-compositor mode the icon
+  // is the inner compositor's (usually absent), so this mostly affects
+  // single-app mode.
+  function applyFavicon(favicon: Favicon | null): void {
+    let link = document.querySelector<HTMLLinkElement>('link#app-favicon');
+    if (!link) {
+      link = document.createElement('link');
+      link.id = 'app-favicon';
+      link.rel = 'icon';
+      document.head.appendChild(link);
+    }
+    if (!favicon) {
+      link.removeAttribute('href');
+      return;
+    }
+    const raw = atob(favicon.rgba);
+    const bytes = new Uint8ClampedArray(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    const oc = document.createElement('canvas');
+    oc.width = favicon.width;
+    oc.height = favicon.height;
+    oc.getContext('2d')!.putImageData(new ImageData(bytes, favicon.width, favicon.height), 0, 0);
+    link.href = oc.toDataURL('image/png');
   }
 
   // Applies a compositor cursor update. For surface cursors the RGBA pixels
@@ -84,8 +123,8 @@
     disposed = true;
     removeCursorListeners?.();
     removeCursorListeners = null;
-    detachInput?.();
-    detachInput = null;
+    input?.detach();
+    input = null;
     clipboard?.destroy();
     clipboard = null;
     viewport?.stop();
@@ -118,6 +157,9 @@
       onCursor: applyCursor,
       onClipboard: (text) => clipboard?.onRemoteClipboard(text),
       onClipboardImage: (mime, bytes) => clipboard?.onRemoteImage(mime, bytes),
+      onTitle: applyTitle,
+      onFavicon: applyFavicon,
+      onPointerLock: (locked) => input?.setPointerLockWanted(locked),
       onVideoFrame: (frame) => pipeline?.handleVideoFrame(frame),
       onAudioFrame: (frame) => audio?.handleAudioFrame(frame),
       onClosed: () => {
@@ -148,7 +190,7 @@
       client?.connect();
     });
 
-    detachInput = attachInput(canvas, sendControl);
+    input = attachInput(canvas, sendControl);
 
     // Keyboard events only reach a focused element, and there's no other
     // focusable content on the page competing for it -- so focus the canvas

@@ -64,6 +64,12 @@ const ARRIVAL_STALL_BURST_THRESHOLD: u32 = 5;
 /// exists independent of whether the bitrate is allowed to change.
 const KEYFRAME_FORCE_COOLDOWN: Duration = Duration::from_millis(500);
 
+/// serde default for `SignalingMessage::Resize::scale` -- a client that predates
+/// the fractional-scale field sends no `scale`, which means "no DPI scaling".
+fn default_scale() -> f64 {
+    1.0
+}
+
 /// Signaling messages between client and server
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -71,7 +77,15 @@ pub enum SignalingMessage {
     #[serde(rename = "ready")]
     Ready,
     #[serde(rename = "resize")]
-    Resize { width: u32, height: u32 },
+    Resize {
+        width: u32,
+        height: u32,
+        /// Browser devicePixelRatio when the native-resolution toggle is on,
+        /// else 1.0. Advertised to clients via `wp_fractional_scale_v1` so
+        /// HiDPI-aware apps render crisply. Defaults to 1.0 for older clients.
+        #[serde(default = "default_scale")]
+        scale: f64,
+    },
     #[serde(rename = "touch")]
     Touch {
         #[serde(flatten)]
@@ -161,6 +175,29 @@ pub enum CursorUpdate {
     },
 }
 
+/// The topmost window's favicon (from `xdg_toplevel_icon`) as base64 RGBA. The
+/// browser builds a PNG data-URL from it (like surface cursors) and sets it as
+/// the tab icon. `None` clears the favicon.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Favicon {
+    pub width: u32,
+    pub height: u32,
+    /// Base64-encoded RGBA (top-down), width × height × 4 bytes.
+    pub rgba: String,
+}
+
+/// The topmost (focused) window's title/app_id/favicon, pushed to the browser
+/// so it can update the tab title and icon. Carried on a watch channel
+/// (latest-wins) and sent as `ServerMessage::Title`/`Favicon`. In
+/// nested-compositor mode this is the inner compositor's generic toplevel, not
+/// the app inside it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AppMeta {
+    pub title: String,
+    pub app_id: String,
+    pub favicon: Option<Favicon>,
+}
+
 /// Messages the server pushes to the client over `/client`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -182,13 +219,26 @@ pub enum ServerMessage {
     /// selection changes; see the clipboard bridge in src/clipboard.rs.
     #[serde(rename = "clipboard")]
     Clipboard { text: String },
+    /// Topmost window's title/app_id for the browser tab. Pushed on connect and
+    /// whenever the focused window's title or app_id changes.
+    #[serde(rename = "title")]
+    Title { title: String, app_id: String },
+    /// Topmost window's favicon (or `null` to clear). Pushed on connect (only
+    /// when present) and whenever the focused window's icon changes.
+    #[serde(rename = "favicon")]
+    Favicon { favicon: Option<Favicon> },
+    /// Whether a client holds a pointer lock (`zwp_locked_pointer`). The browser
+    /// enters/leaves Pointer Lock (relative-motion) mode accordingly. Pushed
+    /// when the lock state changes, and on connect only when already locked.
+    #[serde(rename = "pointer_lock")]
+    PointerLock { locked: bool },
 }
 
 /// Shared state for the server
 #[derive(Clone)]
 pub struct SignalingState {
     /// Channel to send resize requests from clients
-    resize_tx: mpsc::Sender<(u32, u32)>,
+    resize_tx: mpsc::Sender<(u32, u32, f64)>,
     /// Channel to send touch events from clients
     touch_tx: mpsc::Sender<TouchEvent>,
     /// Channel to send pointer (mouse/pen) events from clients
@@ -257,6 +307,13 @@ pub struct SignalingState {
     /// `ServerMessage::Cursor` messages. A new client also receives the
     /// current cursor immediately on connect.
     cursor_rx: watch::Receiver<CursorUpdate>,
+    /// Topmost window's title/app_id from the compositor. Each `/client`
+    /// connection subscribes and pushes updates as `ServerMessage::Title`; a
+    /// new client gets the current value on connect.
+    app_meta_rx: watch::Receiver<AppMeta>,
+    /// Whether a client holds a pointer lock. Each `/client` connection
+    /// subscribes and pushes `ServerMessage::PointerLock` on change.
+    pointer_lock_rx: watch::Receiver<bool>,
     /// Monotonic counter identifying the most recent `/client` connection.
     /// Only one client is allowed at a time: each new `/client` connection
     /// claims the next generation here and publishes it on `client_gen_tx`,
@@ -287,7 +344,7 @@ pub struct SignalingState {
 impl SignalingState {
     #[allow(clippy::too_many_arguments)] // wires up many independent channels; a params struct would just move the noise
     pub fn new(
-        resize_tx: mpsc::Sender<(u32, u32)>,
+        resize_tx: mpsc::Sender<(u32, u32, f64)>,
         touch_tx: mpsc::Sender<TouchEvent>,
         mouse_tx: mpsc::Sender<MouseEvent>,
         key_tx: mpsc::Sender<KeyboardEvent>,
@@ -302,6 +359,8 @@ impl SignalingState {
         session: SessionManager,
         audio_tx: Option<broadcast::Sender<AudioPacket>>,
         cursor_rx: watch::Receiver<CursorUpdate>,
+        app_meta_rx: watch::Receiver<AppMeta>,
+        pointer_lock_rx: watch::Receiver<bool>,
         clipboard_in_tx: mpsc::Sender<ClipboardData>,
         clipboard_out_rx: watch::Receiver<ClipboardData>,
     ) -> Self {
@@ -332,6 +391,8 @@ impl SignalingState {
             last_keyframe_force: Arc::new(Mutex::new(last_keyframe_force)),
             audio_tx,
             cursor_rx,
+            app_meta_rx,
+            pointer_lock_rx,
             client_gen: Arc::new(AtomicU64::new(0)),
             client_gen_tx,
             clipboard_in_tx,
@@ -447,6 +508,8 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
     let mut bitrate_rx = state.bitrate_rx.clone();
     let mut codec_rx = state.codec_rx.clone();
     let mut cursor_rx = state.cursor_rx.clone();
+    let mut app_meta_rx = state.app_meta_rx.clone();
+    let mut pointer_lock_rx = state.pointer_lock_rx.clone();
     let mut clipboard_out_rx = state.clipboard_out_rx.clone();
     let mut shutdown_rx = state.shutdown_rx.clone();
 
@@ -483,12 +546,52 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
             return;
         }
     }
+    // Tracks the title/favicon last sent to this client, so the change arm
+    // below only re-sends the part that actually changed (a chatty terminal
+    // updating its title shouldn't re-push the favicon bytes every time).
+    let mut last_app_meta;
+    {
+        let meta = app_meta_rx.borrow().clone();
+        if send_unified_control(
+            &mut sender,
+            &ServerMessage::Title { title: meta.title.clone(), app_id: meta.app_id.clone() },
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+        // Favicon only when present: a default (no icon) needs no message,
+        // keeping the initial control burst minimal.
+        if meta.favicon.is_some() {
+            if send_unified_control(&mut sender, &ServerMessage::Favicon { favicon: meta.favicon.clone() })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        last_app_meta = meta;
+    }
     {
         // Send the current remote clipboard up front so a freshly connected
         // client can paste it immediately. (send_clipboard skips the empty-text
         // "nothing copied yet" sentinel so we don't clobber the device.)
         let data = clipboard_out_rx.borrow().clone();
         if send_clipboard(&mut sender, &data).await.is_err() {
+            return;
+        }
+    }
+    {
+        // Pointer lock only when already engaged: a fresh client is normally
+        // unlocked, so skip the message (keeping the initial control burst
+        // minimal) unless a client is mid-lock when this one connects.
+        let locked = *pointer_lock_rx.borrow();
+        if locked
+            && send_unified_control(&mut sender, &ServerMessage::PointerLock { locked })
+                .await
+                .is_err()
+        {
             return;
         }
     }
@@ -574,6 +677,40 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
                 if changed.is_err() { continue; }
                 let cursor = cursor_rx.borrow().clone();
                 if send_unified_control(&mut sender, &ServerMessage::Cursor { cursor })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            changed = app_meta_rx.changed() => {
+                if changed.is_err() { continue; }
+                let meta = app_meta_rx.borrow().clone();
+                if meta.title != last_app_meta.title || meta.app_id != last_app_meta.app_id {
+                    if send_unified_control(
+                        &mut sender,
+                        &ServerMessage::Title { title: meta.title.clone(), app_id: meta.app_id.clone() },
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+                if meta.favicon != last_app_meta.favicon {
+                    if send_unified_control(&mut sender, &ServerMessage::Favicon { favicon: meta.favicon.clone() })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                last_app_meta = meta;
+            }
+            changed = pointer_lock_rx.changed() => {
+                if changed.is_err() { continue; }
+                let locked = *pointer_lock_rx.borrow();
+                if send_unified_control(&mut sender, &ServerMessage::PointerLock { locked })
                     .await
                     .is_err()
                 {
@@ -791,9 +928,9 @@ async fn dispatch_signaling_message(signal: SignalingMessage, state: &SignalingS
         SignalingMessage::Ready => {
             debug!("Client is ready");
         }
-        SignalingMessage::Resize { width, height } => {
-            info!("Received resize request from client: {}x{}", width, height);
-            let _ = state.resize_tx.send((width, height)).await;
+        SignalingMessage::Resize { width, height, scale } => {
+            info!("Received resize request from client: {}x{} scale={}", width, height, scale);
+            let _ = state.resize_tx.send((width, height, scale)).await;
             state.wake_input_loop();
         }
         SignalingMessage::Touch { event } => {
@@ -1015,6 +1152,8 @@ mod tests {
         let (_, bitrate_rx) = watch::channel(2_000_000usize);
         let (_, codec_rx) = watch::channel(String::new());
         let (_, cursor_rx) = watch::channel(CursorUpdate::Default);
+        let (_, app_meta_rx) = watch::channel(AppMeta::default());
+        let (_, pointer_lock_rx) = watch::channel(false);
         let force_render = Arc::new(AtomicBool::new(false));
         SignalingState::new(
             resize_tx,
@@ -1032,6 +1171,8 @@ mod tests {
             SessionManager::new(Vec::new(), String::new(), shutdown_tx),
             audio_tx,
             cursor_rx,
+            app_meta_rx,
+            pointer_lock_rx,
             mpsc::channel(4).0,
             watch::channel(ClipboardData::Text(String::new())).1,
         )
@@ -1068,7 +1209,7 @@ mod tests {
         let _stream = ws_handshake(addr, "/client").await;
     }
 
-    /// /client pushes the initial bitrate/codec/cursor state in the
+    /// /client pushes the initial bitrate/codec/cursor/title state in the
     /// unified `MSG_CONTROL` framing, in that order, so the client can
     /// render and decode correctly from the very first frame.
     #[tokio::test]
@@ -1095,9 +1236,10 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let mut stream = ws_handshake(addr, "/client").await;
 
-        // The handler pushes three CONTROL frames in order; each must be
-        // a binary WS message whose first byte is MSG_CONTROL.
-        for _ in 0..3 {
+        // The handler pushes four CONTROL frames in order (bitrate, codec,
+        // cursor, title); each must be a binary WS message whose first byte
+        // is MSG_CONTROL.
+        for _ in 0..4 {
             let payload = read_ws_binary_frame(&mut stream).await;
             let (msg_type, _flags, payload_len) = parse_unified_header(&payload);
             assert_eq!(msg_type, proto::MSG_CONTROL, "expected MSG_CONTROL");
@@ -1159,6 +1301,8 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let force_render = Arc::new(AtomicBool::new(false));
         let (_, cursor_rx) = watch::channel(CursorUpdate::Default);
+        let (_, app_meta_rx) = watch::channel(AppMeta::default());
+        let (_, pointer_lock_rx) = watch::channel(false);
         let state = SignalingState::new(
             mpsc::channel(4).0,
             mpsc::channel(4).0,
@@ -1175,6 +1319,8 @@ mod tests {
             SessionManager::new(Vec::new(), String::new(), shutdown_tx),
             None,
             cursor_rx,
+            app_meta_rx,
+            pointer_lock_rx,
             mpsc::channel(4).0,
             watch::channel(ClipboardData::Text(String::new())).1,
         );
@@ -1186,12 +1332,12 @@ mod tests {
             server.serve("127.0.0.1", 27350, std::future::pending()).await.unwrap();
         });
 
-        // Drain the three initial CONTROL frames before sending the
+        // Drain the four initial CONTROL frames before sending the
         // packet, otherwise the test's `recv` order would be wrong.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let mut stream = ws_handshake(addr, "/client").await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        for _ in 0..3 {
+        for _ in 0..4 {
             let _ = read_ws_binary_frame(&mut stream).await;
         }
 
@@ -1412,7 +1558,7 @@ mod tests {
     /// dimensions to `resize_tx` so the compositor render loop picks them up.
     #[tokio::test]
     async fn dispatch_resize_forwards_to_channel() {
-        let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32)>(4);
+        let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32, f64)>(4);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (touch_tx, _) = mpsc::channel(4);
         let (mouse_tx, _) = mpsc::channel(4);
@@ -1422,6 +1568,8 @@ mod tests {
         let (_, bitrate_rx) = watch::channel(2_000_000usize);
         let (_, codec_rx) = watch::channel(String::new());
         let (_, cursor_rx) = watch::channel(CursorUpdate::Default);
+        let (_, app_meta_rx) = watch::channel(AppMeta::default());
+        let (_, pointer_lock_rx) = watch::channel(false);
         let force_render = Arc::new(AtomicBool::new(false));
         let state = SignalingState::new(
             resize_tx,
@@ -1439,15 +1587,20 @@ mod tests {
             SessionManager::new(Vec::new(), String::new(), shutdown_tx),
             None,
             cursor_rx,
+            app_meta_rx,
+            pointer_lock_rx,
             mpsc::channel(4).0,
             watch::channel(ClipboardData::Text(String::new())).1,
         );
 
-        dispatch_signaling_message(SignalingMessage::Resize { width: 800, height: 600 }, &state)
-            .await;
+        dispatch_signaling_message(
+            SignalingMessage::Resize { width: 800, height: 600, scale: 1.0 },
+            &state,
+        )
+        .await;
 
         let received = resize_rx.try_recv().expect("resize_rx should have a value");
-        assert_eq!(received, (800, 600));
+        assert_eq!(received, (800, 600, 1.0));
     }
 
     /// Pointer *moves* are idempotent, so on a full input channel they're
@@ -1459,7 +1612,7 @@ mod tests {
     async fn dispatch_pointer_moves_drop_when_full_instead_of_blocking() {
         use crate::input::mouse::{MouseEvent, PointerPoint};
 
-        let (resize_tx, _resize_rx) = mpsc::channel::<(u32, u32)>(4);
+        let (resize_tx, _resize_rx) = mpsc::channel::<(u32, u32, f64)>(4);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (touch_tx, _) = mpsc::channel(4);
         // Deliberately tiny so three moves overflow it.
@@ -1470,6 +1623,8 @@ mod tests {
         let (_, bitrate_rx) = watch::channel(2_000_000usize);
         let (_, codec_rx) = watch::channel(String::new());
         let (_, cursor_rx) = watch::channel(CursorUpdate::Default);
+        let (_, app_meta_rx) = watch::channel(AppMeta::default());
+        let (_, pointer_lock_rx) = watch::channel(false);
         let force_render = Arc::new(AtomicBool::new(false));
         let state = SignalingState::new(
             resize_tx,
@@ -1487,6 +1642,8 @@ mod tests {
             SessionManager::new(Vec::new(), String::new(), shutdown_tx),
             None,
             cursor_rx,
+            app_meta_rx,
+            pointer_lock_rx,
             mpsc::channel(4).0,
             watch::channel(ClipboardData::Text(String::new())).1,
         );
@@ -1550,6 +1707,8 @@ mod tests {
         let (_, bitrate_rx) = watch::channel(2_000_000usize);
         let (_, codec_rx) = watch::channel(String::new());
         let (_, cursor_rx) = watch::channel(CursorUpdate::Default);
+        let (_, app_meta_rx) = watch::channel(AppMeta::default());
+        let (_, pointer_lock_rx) = watch::channel(false);
         let force_render = Arc::new(AtomicBool::new(false));
         let state = SignalingState::new(
             mpsc::channel(4).0,
@@ -1567,6 +1726,8 @@ mod tests {
             SessionManager::new(Vec::new(), String::new(), shutdown_tx),
             None,
             cursor_rx,
+            app_meta_rx,
+            pointer_lock_rx,
             clipboard_in_tx,
             watch::channel(ClipboardData::Text(String::new())).1,
         );
@@ -1588,7 +1749,7 @@ mod tests {
     /// native client sends it) through to `resize_tx`.
     #[tokio::test]
     async fn client_endpoint_routes_resize_binary_message() {
-        let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32)>(4);
+        let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32, f64)>(4);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (touch_tx, _) = mpsc::channel(4);
         let (mouse_tx, _) = mpsc::channel(4);
@@ -1598,6 +1759,8 @@ mod tests {
         let (_, bitrate_rx) = watch::channel(2_000_000usize);
         let (_, codec_rx) = watch::channel(String::new());
         let (_, cursor_rx) = watch::channel(CursorUpdate::Default);
+        let (_, app_meta_rx) = watch::channel(AppMeta::default());
+        let (_, pointer_lock_rx) = watch::channel(false);
         let force_render = Arc::new(AtomicBool::new(false));
         let state = SignalingState::new(
             resize_tx,
@@ -1615,6 +1778,8 @@ mod tests {
             SessionManager::new(Vec::new(), String::new(), shutdown_tx),
             None,
             cursor_rx,
+            app_meta_rx,
+            pointer_lock_rx,
             mpsc::channel(4).0,
             watch::channel(ClipboardData::Text(String::new())).1,
         );
@@ -1627,16 +1792,16 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let mut stream = ws_handshake(addr, "/client").await;
-        // Drain the 3 initial CONTROL frames (bitrate, codec, cursor).
+        // Drain the 4 initial CONTROL frames (bitrate, codec, cursor, title).
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        for _ in 0..3 {
+        for _ in 0..4 {
             let _ = read_ws_frame(&mut stream).await;
         }
 
         // Build a MSG_CLIENT_MSG binary frame containing a Resize JSON (the
         // same format WsTransport::send() produces).
         let resize_json =
-            serde_json::to_vec(&SignalingMessage::Resize { width: 1280, height: 720 }).unwrap();
+            serde_json::to_vec(&SignalingMessage::Resize { width: 1280, height: 720, scale: 2.0 }).unwrap();
         let frame = proto::encode_msg(proto::MSG_CLIENT_MSG, 0, &resize_json);
 
         // Send a masked WebSocket binary frame (client→server must be masked).
@@ -1656,7 +1821,7 @@ mod tests {
         // Give the server handler a moment to dispatch the message.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let received = resize_rx.try_recv().expect("resize_rx should have received (1280, 720)");
-        assert_eq!(received, (1280, 720));
+        let received = resize_rx.try_recv().expect("resize_rx should have received (1280, 720, 2.0)");
+        assert_eq!(received, (1280, 720, 2.0));
     }
 }

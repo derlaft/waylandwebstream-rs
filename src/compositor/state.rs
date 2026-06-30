@@ -11,15 +11,16 @@ use smithay::{
         renderer::{gles::GlesRenderer, utils::with_renderer_surface_state, ImportDma},
     },
     delegate_compositor, delegate_cursor_shape, delegate_dmabuf,
+    delegate_fractional_scale,
     delegate_keyboard_shortcuts_inhibit, delegate_output,
-    delegate_pointer_constraints, delegate_seat, delegate_shm,
+    delegate_pointer_constraints, delegate_relative_pointer, delegate_seat, delegate_shm,
     delegate_single_pixel_buffer, delegate_viewporter, delegate_xdg_shell,
     delegate_xdg_toplevel_icon,
     desktop::{Space, Window},
     input::{
         Seat, SeatState,
         keyboard::FilterResult,
-        pointer::{AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, MotionEvent as PointerMotionEvent},
+        pointer::{AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, MotionEvent as PointerMotionEvent, RelativeMotionEvent},
         touch::{DownEvent, MotionEvent, UpEvent},
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
@@ -28,7 +29,7 @@ use smithay::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason, ObjectId},
-            protocol::{wl_seat, wl_shm, wl_surface::WlSurface},
+            protocol::{wl_buffer::WlBuffer, wl_seat, wl_shm, wl_surface::WlSurface},
             Display, DisplayHandle, Resource,
         },
     },
@@ -36,25 +37,33 @@ use smithay::{
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            CompositorClientState, CompositorState as SmithayCompositorState, with_states,
+            CompositorClientState, CompositorState as SmithayCompositorState, send_surface_state,
+            with_states, RectangleKind, RegionAttributes,
+        },
+        fractional_scale::{
+            with_fractional_scale, FractionalScaleHandler, FractionalScaleManagerState,
         },
         dmabuf::{get_dmabuf, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         output::{OutputManagerState, OutputHandler},
         shell::xdg::{
-            XdgShellState, ToplevelSurface,
+            XdgShellState, ToplevelSurface, XdgToplevelSurfaceData,
         },
         shm::{ShmState, ShmHandler, with_buffer_contents},
         single_pixel_buffer::SinglePixelBufferState,
         viewporter::ViewporterState,
         seat::WaylandFocus,
-        pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState},
+        pointer_constraints::{
+            with_pointer_constraint, PointerConstraint, PointerConstraintsHandler,
+            PointerConstraintsState,
+        },
+        relative_pointer::RelativePointerManagerState,
         cursor_shape::CursorShapeManagerState,
         keyboard_shortcuts_inhibit::{
             KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState,
             KeyboardShortcutsInhibitor,
         },
         tablet_manager::TabletSeatHandler,
-        xdg_toplevel_icon::{XdgToplevelIconHandler, XdgToplevelIconManager},
+        xdg_toplevel_icon::{XdgToplevelIconHandler, XdgToplevelIconManager, ToplevelIconCachedState},
     },
 };
 use std::cell::RefCell;
@@ -112,6 +121,10 @@ pub struct WaylandWebStreamState {
     pub viewporter_state: ViewporterState,
     #[allow(dead_code)]
     pub pointer_constraints_state: PointerConstraintsState,
+    #[allow(dead_code)]
+    pub relative_pointer_manager_state: RelativePointerManagerState,
+    #[allow(dead_code)]
+    pub fractional_scale_manager_state: FractionalScaleManagerState,
     #[allow(dead_code)]
     pub keyboard_shortcuts_inhibit_state: KeyboardShortcutsInhibitState,
     #[allow(dead_code)]
@@ -187,6 +200,38 @@ pub struct WaylandWebStreamState {
     // WebSocket clients. Set by `try_extract_cursor` and consumed by
     // `take_cursor_pending`.
     cursor_pending: Option<CursorPending>,
+
+    // Topmost (focused) toplevel's title/app_id, surfaced to the browser tab.
+    // Recomputed by `refresh_app_meta` on title/app_id changes and on focus
+    // changes (map/unmap); `app_meta_dirty` gates the per-tick forward in the
+    // main loop (see `take_app_meta_pending`), mirroring the cursor pattern.
+    // In nested mode these reflect the inner compositor's generic toplevel
+    // (e.g. "sway"), not the app running inside it.
+    current_title: String,
+    current_app_id: String,
+    // Topmost window's favicon as raw top-down RGBA `(width, height, bytes)`,
+    // or `None` if it set no `xdg_toplevel_icon`. Carried alongside title on the
+    // app-metadata channel (main loop base64-encodes it for the wire).
+    current_favicon: Option<(u32, u32, Vec<u8>)>,
+    // A toplevel surface whose pending icon must be (re-)read after its next
+    // commit -- `xdg_toplevel_icon` is double-buffered with the toplevel commit,
+    // so `set_icon` only flags it and `commit()` does the extraction.
+    icon_dirty_surface: Option<WlSurface>,
+    app_meta_dirty: bool,
+
+    // Whether the focused surface currently holds an *active* pointer lock
+    // (`zwp_locked_pointer`). Tracked so `take_pointer_lock_pending` can tell
+    // the browser when to enter/leave Pointer Lock (relative-motion) mode.
+    // Polled each tick rather than event-driven: the constraints protocol has
+    // no "deactivated" callback, and a client can drop the lock at any time.
+    pointer_locked: bool,
+
+    // The fractional scale most recently requested by the browser (its
+    // devicePixelRatio when the HiDPI/native-resolution toggle is on, else
+    // 1.0). Advertised to clients via `wp_fractional_scale_v1` -- but only when
+    // the GL backend is active, since the SW blit can't downscale a larger
+    // fractional buffer (see `effective_scale`). Default 1.0.
+    preferred_scale: f64,
 }
 
 /// Half-open pixel rectangle `[x0, x1) × [y0, y1)` used to restrict
@@ -366,6 +411,29 @@ fn render_root_weave(dst: &mut [u8], width: u32, height: u32, clip: Clip) {
     }
 }
 
+/// Clamps `p` (surface-local logical coords) into the bounding box of a pointer
+/// constraint region's additive rectangles. Best-effort: non-rectangular
+/// regions (those using subtract rects) are approximated by the additive
+/// bounding box, which is sufficient for the common single-rect confine.
+fn clamp_point_to_region(
+    p: Point<f64, Logical>,
+    region: &RegionAttributes,
+) -> Point<f64, Logical> {
+    let mut bbox: Option<Rectangle<i32, Logical>> = None;
+    for (kind, rect) in &region.rects {
+        if matches!(kind, RectangleKind::Add) {
+            bbox = Some(match bbox {
+                Some(b) => b.merge(*rect),
+                None => *rect,
+            });
+        }
+    }
+    let Some(b) = bbox else { return p };
+    let x = p.x.clamp(b.loc.x as f64, (b.loc.x + b.size.w) as f64);
+    let y = p.y.clamp(b.loc.y as f64, (b.loc.y + b.size.h) as f64);
+    Point::from((x, y))
+}
+
 impl WaylandWebStreamState {
     pub fn new(
         _event_loop: &mut EventLoop<Self>,
@@ -386,6 +454,8 @@ impl WaylandWebStreamState {
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
         let pointer_constraints_state = PointerConstraintsState::new::<Self>(&dh);
+        let relative_pointer_manager_state = RelativePointerManagerState::new::<Self>(&dh);
+        let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(&dh);
         // NOTE: wp_presentation is intentionally NOT advertised. render()
         // bypasses Smithay's renderer and never records a scan-out, so we have
         // no presentation feedback to send; advertising the global while never
@@ -441,6 +511,8 @@ impl WaylandWebStreamState {
             single_pixel_buffer_state,
             viewporter_state,
             pointer_constraints_state,
+            relative_pointer_manager_state,
+            fractional_scale_manager_state,
             keyboard_shortcuts_inhibit_state,
             xdg_toplevel_icon_manager,
             cursor_shape_state,
@@ -461,6 +533,13 @@ impl WaylandWebStreamState {
             kicked_toplevels: HashSet::new(),
             cursor_surface: None,
             cursor_pending: None,
+            current_title: String::new(),
+            current_app_id: String::new(),
+            current_favicon: None,
+            icon_dirty_surface: None,
+            app_meta_dirty: false,
+            pointer_locked: false,
+            preferred_scale: 1.0,
         }
     }
 
@@ -942,7 +1021,44 @@ impl WaylandWebStreamState {
     /// Move the pointer to the given output-pixel coordinates.
     pub fn pointer_motion(&mut self, x: f64, y: f64) {
         let Some(pointer) = self.seat.get_pointer() else { return };
-        let location = Point::<f64, Logical>::from((x, y));
+        let mut location = Point::<f64, Logical>::from((x, y));
+
+        // Honor an active pointer constraint on the focused (topmost) surface: a
+        // lock freezes the pointer (the browser switches to relative deltas via
+        // `pointer_relative_motion`), a confine clamps it to the region.
+        if let Some(surface) = self
+            .space
+            .elements()
+            .last()
+            .and_then(|w| w.wl_surface())
+            .map(|s| s.into_owned())
+        {
+            enum Action {
+                Pass,
+                Suppress,
+                Clamp(Option<RegionAttributes>),
+            }
+            let action = with_pointer_constraint(&surface, &pointer, |c| match c {
+                Some(c) if c.is_active() => match &*c {
+                    PointerConstraint::Locked(_) => Action::Suppress,
+                    PointerConstraint::Confined(confined) => {
+                        Action::Clamp(confined.region().cloned())
+                    }
+                },
+                _ => Action::Pass,
+            });
+            match action {
+                // Locked: the pointer must stay put; relative deltas carry motion.
+                Action::Suppress => return,
+                Action::Clamp(region) => {
+                    if let Some(region) = region {
+                        location = clamp_point_to_region(location, &region);
+                    }
+                }
+                Action::Pass => {}
+            }
+        }
+
         let target = self.surface_at(location);
         tracing::debug!("pointer_motion ({x:.1},{y:.1}): surface={}", target.is_some());
         let time = self.clock.now().as_millis();
@@ -1005,6 +1121,112 @@ impl WaylandWebStreamState {
         }
     }
 
+    /// Injects relative pointer motion (browser Pointer Lock `movementX/Y`)
+    /// while a client holds a pointer lock. Smithay only delivers relative
+    /// events to the *focused* pointer surface -- the same topmost window the
+    /// lock is on -- so focus is already established by the absolute motion that
+    /// preceded the lock.
+    pub fn pointer_relative_motion(&mut self, dx: f64, dy: f64) {
+        let Some(pointer) = self.seat.get_pointer() else { return };
+        let utime = self.clock.now().as_micros();
+        let focus = self
+            .space
+            .elements()
+            .last()
+            .and_then(|w| w.wl_surface())
+            .map(|s| (s.into_owned(), Point::from((0.0, 0.0))));
+        let delta = Point::<f64, Logical>::from((dx, dy));
+        pointer.relative_motion(
+            self,
+            focus,
+            &RelativeMotionEvent {
+                delta,
+                delta_unaccel: delta,
+                utime,
+            },
+        );
+        pointer.frame(self);
+    }
+
+    /// Recomputes whether the focused surface holds an active pointer *lock*,
+    /// activating a not-yet-active constraint on it as a side effect (single
+    /// fullscreen window -> always granted), and returns `Some(locked)` when the
+    /// state changed since the last call. The main loop forwards the change to
+    /// the browser as `ServerMessage::PointerLock` so it can enter/leave Pointer
+    /// Lock. Polled because the constraints protocol has no deactivation
+    /// callback -- a client can drop its lock at any time.
+    pub fn take_pointer_lock_pending(&mut self) -> Option<bool> {
+        let locked = self.refresh_pointer_lock();
+        if locked != self.pointer_locked {
+            self.pointer_locked = locked;
+            Some(locked)
+        } else {
+            None
+        }
+    }
+
+    fn refresh_pointer_lock(&mut self) -> bool {
+        let Some(pointer) = self.seat.get_pointer() else { return false };
+        let Some(surface) = self
+            .space
+            .elements()
+            .last()
+            .and_then(|w| w.wl_surface())
+            .map(|s| s.into_owned())
+        else {
+            return false;
+        };
+        with_pointer_constraint(&surface, &pointer, |c| {
+            let Some(c) = c else { return false };
+            // Grant a still-pending constraint (lock or confine).
+            if !c.is_active() {
+                c.activate();
+            }
+            // Only a lock drives the browser into relative-motion mode; a
+            // confine is handled entirely server-side by clamping in
+            // `pointer_motion`.
+            matches!(&*c, PointerConstraint::Locked(_))
+        })
+    }
+
+    /// The fractional scale actually advertised to clients: the browser's
+    /// requested scale on the GL backend (which composites scaled buffers
+    /// correctly via the renderer), or 1.0 on the SW backend, whose 1:1 blit
+    /// would crop a larger fractional buffer. `dmabuf_renderer` is `Some`
+    /// exactly when the GL backend is active (see `enable_dmabuf`).
+    fn effective_scale(&self) -> f64 {
+        if self.dmabuf_renderer.is_some() {
+            self.preferred_scale
+        } else {
+            1.0
+        }
+    }
+
+    /// Updates the browser-requested fractional scale (its devicePixelRatio when
+    /// the native-resolution toggle is on, else 1.0) and re-advertises it to
+    /// every mapped surface: both the `wp_fractional_scale_v1` value and the
+    /// integer `wl_surface.preferred_buffer_scale` (v6) fallback for clients
+    /// that don't implement fractional scaling. Called from the resize path.
+    pub fn set_preferred_scale(&mut self, scale: f64) {
+        if scale <= 0.0 || scale == self.preferred_scale {
+            return;
+        }
+        self.preferred_scale = scale;
+        let effective = self.effective_scale();
+        let int_scale = (effective.round() as i32).max(1);
+        let surfaces: Vec<WlSurface> = self
+            .space
+            .elements()
+            .filter_map(|w| w.wl_surface().map(|s| s.into_owned()))
+            .collect();
+        for surface in surfaces {
+            with_states(&surface, |states| {
+                with_fractional_scale(states, |fs| fs.set_preferred_scale(effective));
+                send_surface_state(&surface, states, int_scale, Transform::Normal);
+            });
+        }
+    }
+
     /// Press or release a key (Linux evdev keycode, e.g. `KEY_A`).
     pub fn key(&mut self, keycode: u32, pressed: bool) {
         let Some(keyboard) = self.seat.get_keyboard() else { return };
@@ -1030,6 +1252,110 @@ impl WaylandWebStreamState {
         let surface = self.space.elements().last().and_then(|w| w.wl_surface()).map(|s| s.into_owned());
         let serial = SERIAL_COUNTER.next_serial();
         keyboard.set_focus(self, surface, serial);
+        // Focus moved to a different topmost window -> its title/app_id is now
+        // the one to show in the browser tab.
+        self.refresh_app_meta();
+    }
+
+    /// Recomputes the title/app_id of the topmost (focused) toplevel and, if
+    /// either changed, stages them for the main loop to forward to clients
+    /// (see `take_app_meta_pending`). Reading only the topmost window means a
+    /// title change on a background window is naturally ignored.
+    fn refresh_app_meta(&mut self) {
+        let (title, app_id) = self
+            .space
+            .elements()
+            .last()
+            .and_then(|w| w.toplevel().cloned())
+            .map(|tl| {
+                with_states(tl.wl_surface(), |states| {
+                    match states.data_map.get::<XdgToplevelSurfaceData>() {
+                        Some(data) => {
+                            let attrs = data.lock().unwrap();
+                            (
+                                attrs.title.clone().unwrap_or_default(),
+                                attrs.app_id.clone().unwrap_or_default(),
+                            )
+                        }
+                        None => (String::new(), String::new()),
+                    }
+                })
+            })
+            .unwrap_or_default();
+
+        if title != self.current_title || app_id != self.current_app_id {
+            self.current_title = title;
+            self.current_app_id = app_id;
+            self.app_meta_dirty = true;
+        }
+    }
+
+    /// Consumes and returns the topmost window's `(title, app_id, favicon)` if
+    /// any changed since the last call (`favicon` is raw top-down RGBA
+    /// `(w, h, bytes)`). `None` when unchanged. The main loop pushes the result
+    /// onto the app-metadata watch channel (see `ServerMessage::Title`/`Favicon`).
+    pub fn take_app_meta_pending(
+        &mut self,
+    ) -> Option<(String, String, Option<(u32, u32, Vec<u8>)>)> {
+        if self.app_meta_dirty {
+            self.app_meta_dirty = false;
+            Some((
+                self.current_title.clone(),
+                self.current_app_id.clone(),
+                self.current_favicon.clone(),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Reads the topmost toplevel's committed `xdg_toplevel_icon` (if any) and,
+    /// if it changed, stages it as the new favicon. Called from `commit()` once
+    /// a toplevel flagged by `set_icon` commits (the icon is double-buffered
+    /// with that commit). Named icons can't be resolved in the browser, so only
+    /// pixel buffers are surfaced; a name-only icon leaves the favicon cleared.
+    fn extract_toplevel_icon(&mut self, surface: &WlSurface) {
+        // Only the topmost (focused) window's icon is shown.
+        let is_topmost = self
+            .space
+            .elements()
+            .last()
+            .and_then(|w| w.wl_surface())
+            .map(|s| &*s == surface)
+            .unwrap_or(false);
+        if !is_topmost {
+            return;
+        }
+
+        let renderer = self.dmabuf_renderer.clone();
+        let favicon = with_states(surface, |states| {
+            let mut icon = states.cached_state.get::<ToplevelIconCachedState>();
+            let cur = icon.current();
+            // Pick the largest readable pixel buffer (capped at 256px/side) so
+            // the browser gets the crispest favicon without us reading a huge
+            // surface. Most clients provide a single buffer.
+            let mut best: Option<(u32, u32, Vec<u8>)> = None;
+            for (buf, _scale) in cur.buffers() {
+                let Some(cand) = Self::read_wl_buffer_rgba(buf, renderer.as_ref()) else {
+                    continue;
+                };
+                let replace = match &best {
+                    None => true,
+                    Some((bw, bh, _)) => {
+                        cand.0 <= 256 && cand.1 <= 256 && cand.0 * cand.1 > bw * bh
+                    }
+                };
+                if replace {
+                    best = Some(cand);
+                }
+            }
+            best
+        });
+
+        if favicon != self.current_favicon {
+            self.current_favicon = favicon;
+            self.app_meta_dirty = true;
+        }
     }
 
     /// Consumes and returns any pending cursor update from the last
@@ -1058,71 +1384,101 @@ impl WaylandWebStreamState {
         }
     }
 
-    /// Reads RGBA pixel data from `wl_surface`'s committed buffer (SHM or dmabuf).
-    /// Returns `None` if no buffer is committed yet or the format is unsupported.
+    /// Reads `wl_surface`'s committed cursor buffer and wraps it as a
+    /// `CursorPending::Surface` with the given hotspot.
     fn read_cursor_pixels(
         wl_surface: &WlSurface,
         hotspot: Point<i32, Logical>,
         renderer: Option<&Rc<RefCell<GlesRenderer>>>,
     ) -> Option<CursorPending> {
-        let mut result: Option<CursorPending> = None;
+        let (width, height, rgba) = Self::read_buffer_rgba(wl_surface, renderer)?;
+        Some(CursorPending::Surface {
+            width,
+            height,
+            hotspot_x: hotspot.x,
+            hotspot_y: hotspot.y,
+            rgba,
+        })
+    }
+
+    /// Reads `wl_surface`'s committed buffer (SHM or dmabuf) as tightly-packed,
+    /// top-down RGBA `(width, height, bytes)`. `None` if no buffer is committed
+    /// yet or the format is unsupported. Shared by the cursor and toplevel-icon
+    /// (favicon) extraction paths.
+    fn read_buffer_rgba(
+        wl_surface: &WlSurface,
+        renderer: Option<&Rc<RefCell<GlesRenderer>>>,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        let mut result: Option<(u32, u32, Vec<u8>)> = None;
 
         let had_renderer_state = with_renderer_surface_state(wl_surface, |rstate| {
             let Some(buffer) = rstate.buffer() else {
-                debug!("read_cursor_pixels: RendererSurfaceState exists but buffer is None");
+                debug!("read_buffer_rgba: RendererSurfaceState exists but buffer is None");
                 return;
             };
-
-            // Try SHM first.
-            let shm_result = with_buffer_contents(buffer, |ptr, len, data| {
-                let w = data.width as u32;
-                let h = data.height as u32;
-                let stride = data.stride as u32;
-                let offset = data.offset as isize;
-
-                let is_bgra = matches!(
-                    data.format,
-                    wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888
-                );
-                if !is_bgra { return; }
-
-                let expected = (stride * h) as usize;
-                if (offset as usize).saturating_add(expected) > len { return; }
-
-                // SAFETY: the (saturating) bounds check above guarantees
-                // `[offset, offset+expected)` lies within the mapped SHM pool of
-                // `len` bytes, so this read is in-bounds for the borrow's life.
-                let pixels = unsafe {
-                    std::slice::from_raw_parts(ptr.offset(offset), expected)
-                };
-                let mut rgba = vec![0u8; (w * h * 4) as usize];
-                for y in 0..h {
-                    for x in 0..w {
-                        let src = (y * stride + x * 4) as usize;
-                        let dst = (y * w + x) as usize * 4;
-                        rgba[dst]     = pixels[src + 2];
-                        rgba[dst + 1] = pixels[src + 1];
-                        rgba[dst + 2] = pixels[src];
-                        rgba[dst + 3] = if data.format == wl_shm::Format::Xrgb8888 { 255 } else { pixels[src + 3] };
-                    }
-                }
-                result = Some(CursorPending::Surface {
-                    width: w, height: h,
-                    hotspot_x: hotspot.x, hotspot_y: hotspot.y,
-                    rgba,
-                });
-            });
-
-            if matches!(shm_result, Err(smithay::wayland::shm::BufferAccessError::NotManaged)) {
-                // SHM failed — try dmabuf (wlroots uses dmabuf-backed cursor surfaces on GPU hardware).
-                if let Ok(dmabuf) = get_dmabuf(buffer) {
-                    result = Self::read_cursor_pixels_dmabuf(dmabuf, hotspot, renderer);
-                }
-            }
+            result = Self::read_wl_buffer_rgba(buffer, renderer);
         });
 
         if had_renderer_state.is_none() {
-            debug!("read_cursor_pixels: no RendererSurfaceState yet");
+            debug!("read_buffer_rgba: no RendererSurfaceState yet");
+        }
+
+        result
+    }
+
+    /// Reads a committed `wl_buffer` (SHM or dmabuf) as tightly-packed,
+    /// top-down RGBA `(width, height, bytes)`. `None` if the format is
+    /// unsupported. The buffer-level core shared by the cursor-surface path
+    /// (`read_buffer_rgba`) and the toplevel-icon path, whose buffers come
+    /// straight from `ToplevelIconCachedState` and aren't attached to a
+    /// surface, so they can't go through the renderer surface state.
+    fn read_wl_buffer_rgba(
+        buffer: &WlBuffer,
+        renderer: Option<&Rc<RefCell<GlesRenderer>>>,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        let mut result: Option<(u32, u32, Vec<u8>)> = None;
+
+        // Try SHM first.
+        let shm_result = with_buffer_contents(buffer, |ptr, len, data| {
+            let w = data.width as u32;
+            let h = data.height as u32;
+            let stride = data.stride as u32;
+            let offset = data.offset as isize;
+
+            let is_bgra = matches!(
+                data.format,
+                wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888
+            );
+            if !is_bgra { return; }
+
+            let expected = (stride * h) as usize;
+            if (offset as usize).saturating_add(expected) > len { return; }
+
+            // SAFETY: the (saturating) bounds check above guarantees
+            // `[offset, offset+expected)` lies within the mapped SHM pool of
+            // `len` bytes, so this read is in-bounds for the borrow's life.
+            let pixels = unsafe {
+                std::slice::from_raw_parts(ptr.offset(offset), expected)
+            };
+            let mut rgba = vec![0u8; (w * h * 4) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    let src = (y * stride + x * 4) as usize;
+                    let dst = (y * w + x) as usize * 4;
+                    rgba[dst]     = pixels[src + 2];
+                    rgba[dst + 1] = pixels[src + 1];
+                    rgba[dst + 2] = pixels[src];
+                    rgba[dst + 3] = if data.format == wl_shm::Format::Xrgb8888 { 255 } else { pixels[src + 3] };
+                }
+            }
+            result = Some((w, h, rgba));
+        });
+
+        if matches!(shm_result, Err(smithay::wayland::shm::BufferAccessError::NotManaged)) {
+            // SHM failed — try dmabuf (GPU clients back surfaces with dmabuf).
+            if let Ok(dmabuf) = get_dmabuf(buffer) {
+                result = Self::read_buffer_rgba_dmabuf(dmabuf, renderer);
+            }
         }
 
         result
@@ -1131,11 +1487,10 @@ impl WaylandWebStreamState {
     /// Reads RGBA pixels from a dmabuf cursor surface.
     /// Tries linear mmap first (fast, works if modifier is LINEAR/Invalid), then falls back
     /// to GL texture import + readback (works for tiled/vendor-modified dmabufs).
-    fn read_cursor_pixels_dmabuf(
+    fn read_buffer_rgba_dmabuf(
         dmabuf: &Dmabuf,
-        hotspot: Point<i32, Logical>,
         renderer: Option<&Rc<RefCell<GlesRenderer>>>,
-    ) -> Option<CursorPending> {
+    ) -> Option<(u32, u32, Vec<u8>)> {
         use smithay::backend::allocator::Buffer as AllocBuffer;
         use smithay::backend::renderer::{ExportMem, ImportDma};
         use smithay::utils::Rectangle;
@@ -1148,7 +1503,7 @@ impl WaylandWebStreamState {
         let is_argb = fourcc == Fourcc::Argb8888;
         let is_xrgb = fourcc == Fourcc::Xrgb8888;
         if !is_argb && !is_xrgb {
-            debug!("read_cursor_pixels_dmabuf: unsupported format {fourcc:?}");
+            debug!("read_buffer_rgba_dmabuf: unsupported format {fourcc:?}");
             return None;
         }
 
@@ -1179,28 +1534,24 @@ impl WaylandWebStreamState {
                                 rgba[dst + 3] = if is_xrgb { 255 } else { pixels[src + 3] };
                             }
                         }
-                        return Some(CursorPending::Surface {
-                            width: w, height: h,
-                            hotspot_x: hotspot.x, hotspot_y: hotspot.y,
-                            rgba,
-                        });
+                        return Some((w, h, rgba));
                     }
                 }
-                debug!("read_cursor_pixels_dmabuf: linear mmap failed, trying GL readback");
+                debug!("read_buffer_rgba_dmabuf: linear mmap failed, trying GL readback");
             }
         }
 
         // GL readback path: import the dmabuf as an EGL image → GL texture → readback.
         // Works for tiled modifiers that can't be stride-mmap'd.
         let Some(renderer) = renderer else {
-            debug!("read_cursor_pixels_dmabuf: no GL renderer available for tiled dmabuf");
+            debug!("read_buffer_rgba_dmabuf: no GL renderer available for tiled dmabuf");
             return None;
         };
 
         let mut rend = match renderer.try_borrow_mut() {
             Ok(r) => r,
             Err(_) => {
-                debug!("read_cursor_pixels_dmabuf: renderer already borrowed");
+                debug!("read_buffer_rgba_dmabuf: renderer already borrowed");
                 return None;
             }
         };
@@ -1208,7 +1559,7 @@ impl WaylandWebStreamState {
         let texture = match rend.import_dmabuf(dmabuf, None) {
             Ok(t) => t,
             Err(e) => {
-                debug!("read_cursor_pixels_dmabuf: import_dmabuf failed: {e:?}");
+                debug!("read_buffer_rgba_dmabuf: import_dmabuf failed: {e:?}");
                 return None;
             }
         };
@@ -1217,7 +1568,7 @@ impl WaylandWebStreamState {
         // (external GL textures from OES_EGL_image_external cannot).
         match rend.can_read_texture(&texture) {
             Ok(false) | Err(_) => {
-                debug!("read_cursor_pixels_dmabuf: texture not readable (likely external OES texture)");
+                debug!("read_buffer_rgba_dmabuf: texture not readable (likely external OES texture)");
                 return None;
             }
             Ok(true) => {}
@@ -1228,7 +1579,7 @@ impl WaylandWebStreamState {
         let mapping = match rend.copy_texture(&texture, region, Fourcc::Abgr8888) {
             Ok(m) => m,
             Err(e) => {
-                debug!("read_cursor_pixels_dmabuf: copy_texture failed: {e:?}");
+                debug!("read_buffer_rgba_dmabuf: copy_texture failed: {e:?}");
                 return None;
             }
         };
@@ -1236,7 +1587,7 @@ impl WaylandWebStreamState {
         let raw = match rend.map_texture(&mapping) {
             Ok(b) => b,
             Err(e) => {
-                debug!("read_cursor_pixels_dmabuf: map_texture failed: {e:?}");
+                debug!("read_buffer_rgba_dmabuf: map_texture failed: {e:?}");
                 return None;
             }
         };
@@ -1247,11 +1598,7 @@ impl WaylandWebStreamState {
         // top-down — no flip needed.
         let rgba = raw.to_vec();
 
-        Some(CursorPending::Surface {
-            width: w, height: h,
-            hotspot_x: hotspot.x, hotspot_y: hotspot.y,
-            rgba,
-        })
+        Some((w, h, rgba))
     }
 
     pub fn send_frames(&mut self) {
@@ -1286,6 +1633,8 @@ delegate_seat!(WaylandWebStreamState);
 delegate_output!(WaylandWebStreamState);
 delegate_dmabuf!(WaylandWebStreamState);
 delegate_pointer_constraints!(WaylandWebStreamState);
+delegate_relative_pointer!(WaylandWebStreamState);
+delegate_fractional_scale!(WaylandWebStreamState);
 delegate_keyboard_shortcuts_inhibit!(WaylandWebStreamState);
 delegate_xdg_toplevel_icon!(WaylandWebStreamState);
 delegate_cursor_shape!(WaylandWebStreamState);
@@ -1340,6 +1689,16 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
         debug!("Window unmapped from space. Total windows: {}", self.space.elements().count());
     }
     
+    fn title_changed(&mut self, _surface: ToplevelSurface) {
+        // `refresh_app_meta` only reads the topmost window, so a title change on
+        // a background window is a no-op; no need to filter on `_surface` here.
+        self.refresh_app_meta();
+    }
+
+    fn app_id_changed(&mut self, _surface: ToplevelSurface) {
+        self.refresh_app_meta();
+    }
+
     fn grab(&mut self, _surface: smithay::wayland::shell::xdg::PopupSurface, _seat: wl_seat::WlSeat, _serial: smithay::utils::Serial) {
         // Handle popup grabs
     }
@@ -1375,6 +1734,13 @@ impl smithay::wayland::compositor::CompositorHandler for WaylandWebStreamState {
         if is_cursor_surface {
             debug!("commit: retrying cursor extraction for cursor surface");
             self.try_extract_cursor();
+        }
+
+        // A toplevel that set an `xdg_toplevel_icon` commits the icon with its
+        // surface; extract the new favicon now that the cached state is current.
+        if self.icon_dirty_surface.as_ref() == Some(surface) {
+            self.icon_dirty_surface = None;
+            self.extract_toplevel_icon(surface);
         }
 
         // `Window::bbox()` is a cache that only `Window::on_commit()` refreshes;
@@ -1530,13 +1896,50 @@ impl smithay::input::SeatHandler for WaylandWebStreamState {
 }
 
 impl PointerConstraintsHandler for WaylandWebStreamState {
-    fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &smithay::input::pointer::PointerHandle<Self>) {}
+    fn new_constraint(
+        &mut self,
+        surface: &WlSurface,
+        pointer: &smithay::input::pointer::PointerHandle<Self>,
+    ) {
+        // This compositor only ever has one fullscreen window, so a constraint
+        // on the focused surface is always granted. Activate it immediately if
+        // it's the focused surface; the per-tick `take_pointer_lock_pending`
+        // poll then tells the browser to enter Pointer Lock.
+        let focused = self
+            .space
+            .elements()
+            .last()
+            .and_then(|w| w.wl_surface())
+            .map(|s| &*s == surface)
+            .unwrap_or(false);
+        if focused {
+            with_pointer_constraint(surface, pointer, |c| {
+                if let Some(c) = c {
+                    c.activate();
+                }
+            });
+        }
+    }
+
     fn cursor_position_hint(
         &mut self,
         _surface: &WlSurface,
         _pointer: &smithay::input::pointer::PointerHandle<Self>,
         _location: smithay::utils::Point<f64, smithay::utils::Logical>,
-    ) {}
+    ) {
+        // The locked client renders its own cursor at this hint, but the visible
+        // cursor here is the browser's, which the Pointer Lock API restores to
+        // its pre-lock position on exit -- so there's nothing for us to warp.
+    }
+}
+
+impl FractionalScaleHandler for WaylandWebStreamState {
+    fn new_fractional_scale(&mut self, surface: WlSurface) {
+        let scale = self.effective_scale();
+        with_states(&surface, |states| {
+            with_fractional_scale(states, |fs| fs.set_preferred_scale(scale));
+        });
+    }
 }
 
 impl KeyboardShortcutsInhibitHandler for WaylandWebStreamState {
@@ -1549,7 +1952,13 @@ impl KeyboardShortcutsInhibitHandler for WaylandWebStreamState {
     }
 }
 
-impl XdgToplevelIconHandler for WaylandWebStreamState {}
+impl XdgToplevelIconHandler for WaylandWebStreamState {
+    fn set_icon(&mut self, _toplevel: xdg_toplevel::XdgToplevel, wl_surface: WlSurface) {
+        // The icon is now pending but is committed with the toplevel's next
+        // commit (double-buffered); flag the surface so `commit()` reads it.
+        self.icon_dirty_surface = Some(wl_surface);
+    }
+}
 
 impl TabletSeatHandler for WaylandWebStreamState {}
 
@@ -1754,7 +2163,7 @@ mod cursor_tests {
 
     /// Builds a `Dmabuf` backed by a temp file (no real GPU needed).
     /// Filled with `bgra_pixels` in row-major order. `Modifier::Linear`
-    /// ensures `read_cursor_pixels_dmabuf` uses the mmap fast path.
+    /// ensures `read_buffer_rgba_dmabuf` uses the mmap fast path.
     fn make_linear_dmabuf(w: u32, h: u32, fourcc: Fourcc, bgra_pixels: &[[u8; 4]]) -> Dmabuf {
         assert_eq!(bgra_pixels.len(), (w * h) as usize);
         let stride = w * 4;
@@ -1779,17 +2188,11 @@ mod cursor_tests {
             [255, 255,   0, 128], // cyan+alpha  → RGBA [  0,255,255,128]
         ];
         let dmabuf = make_linear_dmabuf(2, 2, Fourcc::Argb8888, &bgra);
-        let hotspot: Point<i32, Logical> = (3, 7).into();
 
-        let result = WaylandWebStreamState::read_cursor_pixels_dmabuf(&dmabuf, hotspot, None)
-            .expect("expected Some(CursorPending::Surface)");
-
-        let CursorPending::Surface { width, height, hotspot_x, hotspot_y, rgba } = result else {
-            panic!("expected CursorPending::Surface, got {result:?}");
-        };
+        let (width, height, rgba) = WaylandWebStreamState::read_buffer_rgba_dmabuf(&dmabuf, None)
+            .expect("expected Some((w, h, rgba))");
 
         assert_eq!((width, height), (2, 2));
-        assert_eq!((hotspot_x, hotspot_y), (3, 7));
         assert_eq!(rgba.len(), 16);
         assert_eq!(&rgba[0..4],   &[  0,   0, 255, 255], "pixel 0: blue   BGRA→RGBA");
         assert_eq!(&rgba[4..8],   &[  0, 255,   0, 255], "pixel 1: green  BGRA→RGBA");
@@ -1803,11 +2206,8 @@ mod cursor_tests {
         let bgra: [[u8; 4]; 1] = [[100, 150, 200, 42]]; // A=42 in buffer
         let dmabuf = make_linear_dmabuf(1, 1, Fourcc::Xrgb8888, &bgra);
 
-        let result = WaylandWebStreamState::read_cursor_pixels_dmabuf(
-            &dmabuf, (0, 0).into(), None,
-        ).expect("Some");
-
-        let CursorPending::Surface { rgba, .. } = result else { panic!("not Surface") };
+        let (_, _, rgba) = WaylandWebStreamState::read_buffer_rgba_dmabuf(&dmabuf, None)
+            .expect("Some");
         assert_eq!(rgba[3], 255, "Xrgb8888 must produce alpha=255 regardless of buffer byte");
     }
 
@@ -1823,7 +2223,7 @@ mod cursor_tests {
 
     /// GL readback test: allocates a GBM dmabuf (driver picks the modifier, which on
     /// real GPU hardware is tiled), fills it with solid red via a GL clear, then calls
-    /// `read_cursor_pixels_dmabuf` to verify the GL texture-import + readback path.
+    /// `read_buffer_rgba_dmabuf` to verify the GL texture-import + readback path.
     ///
     /// Skipped gracefully when no DRM render node or EGL/GL init fails.
     /// A `None` result is also accepted: some drivers return an OES external texture
@@ -1907,15 +2307,14 @@ mod cursor_tests {
             let _ = frame.finish().expect("finish");
         }
 
-        // ── read pixels back via read_cursor_pixels_dmabuf ─────────────────
-        let result = WaylandWebStreamState::read_cursor_pixels_dmabuf(
+        // ── read pixels back via read_buffer_rgba_dmabuf ───────────────────
+        let result = WaylandWebStreamState::read_buffer_rgba_dmabuf(
             &dmabuf,
-            (0i32, 0i32).into(),
             Some(&renderer_rc),
         );
 
         match result {
-            Some(CursorPending::Surface { width, height, rgba, .. }) => {
+            Some((width, height, rgba)) => {
                 assert_eq!((width, height), (w, h));
                 assert_eq!(rgba.len(), (w * h * 4) as usize);
                 // GL clear to red should yield RGBA ≈ [255, 0, 0, 255] per pixel.
@@ -1932,7 +2331,6 @@ mod cursor_tests {
                 // The function returning None is the correct graceful fallback.
                 eprintln!("hw_cursor_gl_readback: returned None (OES external texture or unsupported format — expected on some drivers)");
             }
-            _ => panic!("expected CursorPending::Surface or None"),
         }
     }
 }

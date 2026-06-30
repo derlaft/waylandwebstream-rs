@@ -52,7 +52,7 @@ function makeCanvas(width = 1920, height = 1080): HTMLCanvasElement {
 
 function collectMessages(canvas: HTMLCanvasElement): { messages: ClientMessage[]; detach: () => void } {
   const messages: ClientMessage[] = [];
-  const detach = attachInput(canvas, (msg) => messages.push(msg));
+  const { detach } = attachInput(canvas, (msg) => messages.push(msg));
   return { messages, detach };
 }
 

@@ -49,6 +49,12 @@ pub enum MouseEvent {
         #[serde(rename = "deltaY")]
         delta_y: f64,
     },
+    /// Relative pointer motion from the browser's Pointer Lock API, sent only
+    /// while a client holds a pointer lock. `dx`/`dy` are already in
+    /// compositor/output-pixel units (the browser pre-scales `movementX/Y` by
+    /// the canvas-to-output ratio), so they're injected 1:1.
+    #[serde(rename = "pointerrelative")]
+    Relative { dx: f64, dy: f64 },
 }
 
 fn default_pointer_type() -> String {
@@ -143,6 +149,10 @@ impl MouseHandler {
                 state.pointer_motion(cx, cy);
                 state.pointer_axis(delta_x, delta_y);
                 state.pointer_frame();
+            }
+            MouseEvent::Relative { dx, dy } => {
+                // pointer_relative_motion sends its own frame.
+                state.pointer_relative_motion(dx, dy);
             }
         }
     }

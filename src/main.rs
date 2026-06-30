@@ -250,7 +250,7 @@ async fn main() -> Result<()> {
     let (encoder, buffer_return_rx, encoder_join_handle) = spawn_encoder(encoder_config, codec_tx)?;
 
     // Create channels for the server
-    let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32)>(4);
+    let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32, f64)>(4);
     let (touch_tx, mut touch_rx) = mpsc::channel(32); // Higher capacity for touch events
     let (mouse_tx, mut mouse_rx) = mpsc::channel(64); // Higher capacity for pointer moves
     let (key_tx, mut key_rx) = mpsc::channel(64); // Higher capacity for key repeat bursts
@@ -413,6 +413,14 @@ async fn main() -> Result<()> {
     // clients always see the latest cursor, not a backlog of stale ones.
     let (cursor_tx, cursor_rx) = tokio::sync::watch::channel(CursorUpdate::Default);
 
+    // App metadata (topmost window title/app_id): compositor → WebSocket
+    // clients, for the browser tab title. Watch channel, same as cursor.
+    let (app_meta_tx, app_meta_rx) = tokio::sync::watch::channel(server::AppMeta::default());
+
+    // Pointer-lock state (a client engaged zwp_locked_pointer): compositor →
+    // clients, so the browser enters/leaves Pointer Lock (relative motion).
+    let (pointer_lock_tx, pointer_lock_rx) = tokio::sync::watch::channel(false);
+
     // Clipboard bridge channels (see src/clipboard.rs):
     //  - in:  browser device clipboard → nested compositor selection (mpsc;
     //    the bridge drains it, dropping if the bridge never started).
@@ -467,6 +475,8 @@ async fn main() -> Result<()> {
         session.clone(),
         audio_tx,
         cursor_rx,
+        app_meta_rx,
+        pointer_lock_rx,
         clipboard_in_tx,
         clipboard_out_rx,
     );
@@ -605,7 +615,7 @@ async fn main() -> Result<()> {
         let loop_start = std::time::Instant::now();
 
         // Check for resize requests (non-blocking)
-        if let Ok((req_width, req_height)) = resize_rx.try_recv() {
+        if let Ok((req_width, req_height, scale)) = resize_rx.try_recv() {
             // Clamp to --max-resolution, round to even, and reject sub-16×16.
             // The request comes off the untrusted /client socket and drives
             // encoder/framebuffer allocation, so the server caps it here.
@@ -617,9 +627,14 @@ async fn main() -> Result<()> {
             };
 
             info!("Processing resize request: {}x{}", new_width, new_height);
-            
+
             // Resize compositor output
             state.resize_output(new_width, new_height);
+
+            // Advertise the browser's fractional scale to clients (no-op on the
+            // SW backend, which can't downscale a larger buffer -- see
+            // set_preferred_scale).
+            state.set_preferred_scale(scale);
             
             // Update touch and pointer handler dimensions
             touch_handler.set_dimensions(new_width, new_height);
@@ -673,6 +688,24 @@ async fn main() -> Result<()> {
             // Fire-and-forget broadcast (see video_tx above): no subscribers
             // when no client is connected; the next update supersedes a drop.
             let _ = cursor_tx.send(cursor_pending_to_update(pending));
+        }
+
+        // Forward any title/app_id/favicon change for the topmost window. The
+        // favicon arrives as raw RGBA; base64-encode it for the JSON wire, same
+        // as cursor surfaces.
+        if let Some((title, app_id, favicon)) = state.take_app_meta_pending() {
+            let favicon = favicon.map(|(width, height, rgba)| server::Favicon {
+                width,
+                height,
+                rgba: BASE64_STANDARD.encode(rgba),
+            });
+            let _ = app_meta_tx.send(server::AppMeta { title, app_id, favicon });
+        }
+
+        // Forward any pointer-lock state change (also activates pending
+        // constraints on the focused surface as a side effect).
+        if let Some(locked) = state.take_pointer_lock_pending() {
+            let _ = pointer_lock_tx.send(locked);
         }
 
         // Render and send a frame. Two triggers: the periodic deadline

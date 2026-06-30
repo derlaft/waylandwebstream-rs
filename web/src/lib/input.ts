@@ -7,10 +7,18 @@
 import type { ClientMessage, PointerPoint, TouchPoint } from './protocol';
 import { observeRect } from './rectCache';
 
+export interface InputHandle {
+  /// Tear down all listeners.
+  detach: () => void;
+  /// Arm/disarm browser Pointer Lock (relative motion), driven by the server's
+  /// `pointer_lock` message. Disarming also exits an active lock.
+  setPointerLockWanted: (wanted: boolean) => void;
+}
+
 export function attachInput(
   canvas: HTMLCanvasElement,
   sendControl: (msg: ClientMessage) => void,
-): () => void {
+): InputHandle {
   const rectCache = observeRect(canvas);
   // Converts a TouchList to normalized [0,1] coordinates.
   //
@@ -98,6 +106,12 @@ export function attachInput(
   // "touch"), but those are already handled above via the dedicated touch
   // listeners, so they're ignored here to avoid injecting the same
   // physical contact twice.
+  // Set true while a remote client holds a pointer lock (see setPointerLockWanted,
+  // driven by the server's `pointer_lock` message). Pointer Lock can only be
+  // requested from within a user-gesture handler, so we arm it here and request
+  // it on the next pointerdown.
+  let pointerLockWanted = false;
+
   const onPointerDown = (e: PointerEvent): void => {
     if (e.pointerType === 'touch') return;
     e.preventDefault();
@@ -106,10 +120,31 @@ export function attachInput(
     // a separate click target -- requires the canvas to be focusable (see
     // the `tabindex` on the <canvas> in Stage.svelte).
     canvas.focus();
+    // A client wants the pointer captured (e.g. an FPS game): use this gesture
+    // to enter Pointer Lock. The button event still goes through below so the
+    // click reaches the app.
+    if (pointerLockWanted && document.pointerLockElement !== canvas) {
+      canvas.requestPointerLock?.();
+    }
     sendControl({ type: 'pointer', eventType: 'pointerdown', pointer: normalizedPointer(e) });
   };
   const onPointerMove = (e: PointerEvent): void => {
     if (e.pointerType === 'touch') return;
+    // While locked the browser reports no absolute position, only deltas. Send
+    // them as relative motion, pre-scaled from CSS px to compositor/output px
+    // (canvas.width is the decoded frame = output resolution).
+    if (document.pointerLockElement === canvas) {
+      const rect = rectCache.get();
+      const scaleX = rect.width > 0 ? canvas.width / rect.width : 1;
+      const scaleY = rect.height > 0 ? canvas.height / rect.height : 1;
+      sendControl({
+        type: 'pointer',
+        eventType: 'pointerrelative',
+        dx: e.movementX * scaleX,
+        dy: e.movementY * scaleY,
+      });
+      return;
+    }
     sendControl({ type: 'pointer', eventType: 'pointermove', pointer: normalizedPointer(e) });
   };
   const onPointerUp = (e: PointerEvent): void => {
@@ -206,7 +241,15 @@ export function attachInput(
   };
   document.addEventListener('visibilitychange', onVisibilityChange);
 
-  return () => {
+  const setPointerLockWanted = (wanted: boolean): void => {
+    pointerLockWanted = wanted;
+    // Server says the lock was released -> exit if the browser still holds it.
+    if (!wanted && document.pointerLockElement === canvas) {
+      document.exitPointerLock?.();
+    }
+  };
+
+  const detach = (): void => {
     canvas.removeEventListener('touchstart', onTouchStart);
     canvas.removeEventListener('touchmove', onTouchMove);
     canvas.removeEventListener('touchend', onTouchEnd);
@@ -222,6 +265,9 @@ export function attachInput(
     canvas.removeEventListener('blur', releaseAllKeys);
     window.removeEventListener('blur', releaseAllKeys);
     document.removeEventListener('visibilitychange', onVisibilityChange);
+    if (document.pointerLockElement === canvas) document.exitPointerLock?.();
     rectCache.dispose();
   };
+
+  return { detach, setPointerLockWanted };
 }
