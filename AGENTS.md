@@ -277,11 +277,21 @@ GL compositor specifics:
   latency and *keyframe requests*/arrival-bursts as congestion — never raw RTT.
 
 ### Adaptive bitrate (`src/adaptive_bitrate.rs`)
-- TCP-Reno AIMD. Primary congestion signal is the client's **keyframe-resync
-  request** (decoder actually backed up) — a loss-equivalent signal, *not* a
-  routine new-client connect (that path forces a keyframe directly, bypassing
-  this). Secondary `ArrivalStall` catches network bufferbloat the decode-queue
-  signal can't see. Decode latency can only *hold off growth*, never cut.
+- TCP-Reno AIMD. The **authoritative** congestion signal is server-side send
+  backpressure (`SendBacklog`: the per-client broadcast `Lagged`-skips because
+  the socket drained slower than the encoder produced) — loss-equivalent,
+  measured at the real bottleneck. A client **keyframe-resync request is *not* a
+  congestion signal** (it's dominated by transient client-side decode/render
+  stalls — the native client never requests one); it only forces an IDR.
+  `ArrivalStall` (client `burst_count`) is a **strict corroborator**: it cuts
+  *only* within `ARRIVAL_STALL_CORROBORATION_WINDOW` of a real `SendBacklog`,
+  never on its own — a burst is usually the browser's own frame-delivery
+  clustering (Chromium's decode-worker `postMessage` delivery clusters ~20% of
+  arrivals sub-3ms vs Firefox ~1%), which measured as 41 false `ArrivalStall`
+  vs 0 `SendBacklog` and pinned the shared encoder at the floor on Chromium
+  before the gate. Decode latency can only *hold off growth*, never cut. Every
+  cut rebuilds the encoder + emits an IDR (see Encoder), so a false cut is
+  doubly expensive.
 - All decisions live in pure `BitrateAlgorithm` (synthetic `Instant`s, no
   channels) so they're deterministically testable. Keep new logic there, not in
   the async `Controller`.

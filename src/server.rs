@@ -1042,13 +1042,17 @@ async fn dispatch_signaling_message(signal: SignalingMessage, state: &SignalingS
             {
                 let _ = bitrate_event_tx.send(BitrateEvent::Latency(ms)).await;
             }
-            // Bursty arrival is network-level congestion: a batch of
-            // frames queued up in the path and released at once. This is
-            // the signal the controller actually cuts on. See
-            // `BitrateEvent::ArrivalStall`.
+            // Bursty arrival *may* be network-level congestion (a batch of
+            // frames queued in the path and released at once) -- but in the
+            // browser it's usually the client's own delivery clustering, so the
+            // controller treats it only as a corroborator of a recent
+            // server-side `SendBacklog`, never an independent cut (see
+            // `ARRIVAL_STALL_CORROBORATION_WINDOW` in adaptive_bitrate.rs). We
+            // still forward every burst; the algorithm decides whether it lands
+            // near a real backlog.
             if burst_count >= ARRIVAL_STALL_BURST_THRESHOLD {
-                warn!(
-                    "Client reported {} bursty frame arrivals (>= {}) with no decode backlog -- treating as network congestion",
+                debug!(
+                    "Client reported {} bursty frame arrivals (>= {}); forwarding as a congestion corroborator",
                     burst_count, ARRIVAL_STALL_BURST_THRESHOLD
                 );
                 if let Some(ref bitrate_event_tx) = state.bitrate_event_tx {

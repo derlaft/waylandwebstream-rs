@@ -16,7 +16,11 @@
 //! (`BitrateEvent::ArrivalStall`, derived from `burst_count` in
 //! `SignalingMessage::Latency`) is a secondary, client-side corroborator of
 //! the same condition for paths where the server's own writes don't visibly
-//! stall. Both cut the rate identically.
+//! stall. It is treated *strictly* as a corroborator: a burst cuts only when a
+//! `SendBacklog` also fired recently (see `ARRIVAL_STALL_CORROBORATION_WINDOW`),
+//! never on its own -- in the browser a burst is dominated by the client's own
+//! frame-delivery clustering (notably Chromium's decode-worker delivery), which
+//! is not congestion and otherwise pinned the shared rate at the floor.
 //!
 //! A client's keyframe-request (`SignalingMessage::RequestKeyframe`) is
 //! deliberately *not* a congestion signal. It fires whenever the client's
@@ -78,6 +82,21 @@ fn should_actuate(target: usize, last_applied: usize, max_bitrate: usize) -> boo
     let threshold = ((last_applied as f64) * APPLY_THRESHOLD_FRACTION) as usize;
     target - last_applied >= threshold.max(1)
 }
+
+/// How recently a server-side `SendBacklog` must have fired for a client's
+/// `ArrivalStall` (bursty arrival) to be honored as a congestion cut rather
+/// than ignored. `ArrivalStall` is a *secondary corroborator*, not independent
+/// evidence: in the browser a "burst" is dominated by the client's own
+/// frame-delivery clustering, not the link. Measured 2026-06-30: Chromium's
+/// decode-worker `postMessage` delivery clusters frames (~20% sub-3ms arrival
+/// gaps vs Firefox ~1%), so the client's burst-count heuristic tripped
+/// constantly with no real congestion -- 41 `ArrivalStall` events against 0
+/// `SendBacklog` in one session -- and, since each cut also rebuilds the
+/// encoder + emits an IDR, pinned the shared encoder at the floor on Chromium
+/// while Firefox climbed to the ceiling. Honoring a burst only when the
+/// authoritative server-side signal also fired recently keeps the corroborator
+/// role the module doc describes without letting it cut on its own.
+const ARRIVAL_STALL_CORROBORATION_WINDOW: Duration = Duration::from_secs(5);
 
 /// Signal fed into the controller from the server's signaling handlers.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -163,6 +182,10 @@ pub struct BitrateAlgorithm {
     phase: Phase,
     last_decrease: Option<Instant>,
     last_latency_ms: Option<f64>,
+    /// When a server-side `SendBacklog` was last seen. A client's
+    /// `ArrivalStall` only counts as congestion if it lands within
+    /// `ARRIVAL_STALL_CORROBORATION_WINDOW` of one -- see `on_arrival_stall`.
+    last_backlog: Option<Instant>,
 }
 
 impl BitrateAlgorithm {
@@ -176,6 +199,7 @@ impl BitrateAlgorithm {
             phase: Phase::SlowStart,
             last_decrease: None,
             last_latency_ms: None,
+            last_backlog: None,
         }
     }
 
@@ -188,11 +212,38 @@ impl BitrateAlgorithm {
             .is_some_and(|last| now.duration_since(last) < self.config.decrease_cooldown)
     }
 
-    /// Apply a congestion signal (bursty arrival -- see
-    /// `BitrateEvent::ArrivalStall`). Returns the new target bitrate if it
-    /// changed, or `None` if this was coalesced into an already-active
+    /// Server-side send backpressure (`BitrateEvent::SendBacklog`): the
+    /// authoritative, loss-equivalent congestion signal. Cuts immediately and
+    /// records the time so a following `ArrivalStall` can corroborate it.
+    /// Returns the new target bitrate, or `None` if coalesced into an active
+    /// cooldown or already at the floor.
+    pub fn on_send_backlog(&mut self, now: Instant) -> Option<usize> {
+        self.last_backlog = Some(now);
+        self.cut(now)
+    }
+
+    /// Client-reported bursty arrival (`BitrateEvent::ArrivalStall`). Only a
+    /// *secondary corroborator* of `SendBacklog`, never independent evidence
+    /// (see `ARRIVAL_STALL_CORROBORATION_WINDOW`): a burst with no recent
+    /// server-side backlog is the client's own delivery clustering, not the
+    /// link, so it's ignored. When the authoritative signal did fire recently,
+    /// a burst cuts identically -- reinforcing a sustained stall past the
+    /// cooldown.
+    pub fn on_arrival_stall(&mut self, now: Instant) -> Option<usize> {
+        let corroborated = self
+            .last_backlog
+            .is_some_and(|t| now.duration_since(t) < ARRIVAL_STALL_CORROBORATION_WINDOW);
+        if corroborated {
+            self.cut(now)
+        } else {
+            None
+        }
+    }
+
+    /// Multiplicative congestion cut shared by both signals. Returns the new
+    /// target bitrate if it changed, or `None` if coalesced into an active
     /// cooldown or the rate was already at the floor.
-    pub fn on_congestion(&mut self, now: Instant) -> Option<usize> {
+    fn cut(&mut self, now: Instant) -> Option<usize> {
         if self.in_cooldown(now) {
             return None;
         }
@@ -300,8 +351,13 @@ impl AdaptiveBitrateController {
             tokio::select! {
                 event = self.event_rx.recv() => {
                     match event {
-                        Some(BitrateEvent::SendBacklog) | Some(BitrateEvent::ArrivalStall) => {
-                            if let Some(new_rate) = self.algo.on_congestion(Instant::now()) {
+                        Some(BitrateEvent::SendBacklog) => {
+                            if let Some(new_rate) = self.algo.on_send_backlog(Instant::now()) {
+                                self.maybe_apply(new_rate).await;
+                            }
+                        }
+                        Some(BitrateEvent::ArrivalStall) => {
+                            if let Some(new_rate) = self.algo.on_arrival_stall(Instant::now()) {
                                 self.maybe_apply(new_rate).await;
                             }
                         }
@@ -387,5 +443,62 @@ mod tests {
         // Target at the cap but only a hair above applied: still actuate so
         // the encoder actually reaches max instead of stalling below it.
         assert!(should_actuate(MAX, 11_900_000, MAX));
+    }
+
+    use super::{AdaptiveBitrateConfig, BitrateAlgorithm, ARRIVAL_STALL_CORROBORATION_WINDOW};
+    use std::time::{Duration, Instant};
+
+    fn algo() -> BitrateAlgorithm {
+        BitrateAlgorithm::new(AdaptiveBitrateConfig::default())
+    }
+
+    #[test]
+    fn arrival_stall_without_backlog_never_cuts() {
+        // The Chromium false-positive: bursts with no server-side backlog must
+        // not touch the rate, no matter how many arrive.
+        let mut a = algo();
+        let t = Instant::now();
+        let start = a.current_bitrate();
+        assert_eq!(a.on_arrival_stall(t), None);
+        assert_eq!(a.on_arrival_stall(t + Duration::from_secs(1)), None);
+        assert_eq!(a.current_bitrate(), start);
+    }
+
+    #[test]
+    fn send_backlog_cuts_then_a_burst_corroborates_past_the_cooldown() {
+        let cfg = AdaptiveBitrateConfig::default();
+        let mut a = algo();
+        let t = Instant::now();
+        let start = a.current_bitrate();
+
+        // Authoritative signal cuts immediately.
+        let cut1 = a.on_send_backlog(t).expect("backlog should cut");
+        assert!(cut1 < start);
+
+        // A burst inside the cooldown is coalesced (no second cut)...
+        assert_eq!(a.on_arrival_stall(t + Duration::from_millis(50)), None);
+
+        // ...but once the cooldown clears, a burst still within the
+        // corroboration window reinforces the sustained stall and cuts again.
+        let after_cooldown = t + cfg.decrease_cooldown + Duration::from_millis(1);
+        assert!(after_cooldown.duration_since(t) < ARRIVAL_STALL_CORROBORATION_WINDOW);
+        let cut2 = a
+            .on_arrival_stall(after_cooldown)
+            .expect("corroborated burst should cut");
+        assert!(cut2 < cut1);
+    }
+
+    #[test]
+    fn burst_after_the_corroboration_window_is_ignored() {
+        let mut a = algo();
+        let t = Instant::now();
+        a.on_send_backlog(t);
+        let rate_after_backlog = a.current_bitrate();
+
+        // Well past the window (and the cooldown): with no fresh backlog the
+        // burst is treated as a client-side artifact, not congestion.
+        let late = t + ARRIVAL_STALL_CORROBORATION_WINDOW + Duration::from_secs(1);
+        assert_eq!(a.on_arrival_stall(late), None);
+        assert_eq!(a.current_bitrate(), rate_after_backlog);
     }
 }
