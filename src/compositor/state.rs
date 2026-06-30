@@ -231,6 +231,20 @@ fn accumulate_damage(
     }
 }
 
+/// Copies only the rows covered by `rects` from `src` into `dst` (both
+/// `width`-wide BGRA buffers of equal length). The damage-proportional encoder
+/// handoff: the encoder converts only these same rows, so the rest of `dst`
+/// (stale pooled content) is never read. `rects`' vertical spans are within the
+/// buffer and even-aligned by construction (see `render`).
+fn copy_damaged_rows(dst: &mut [u8], src: &[u8], rects: &[DamageRect], width: u32) {
+    let stride = (width * 4) as usize;
+    for r in rects {
+        let y0 = r.y as usize * stride;
+        let y1 = (r.y + r.height) as usize * stride;
+        dst[y0..y1].copy_from_slice(&src[y0..y1]);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Clip {
     x0: u32,
@@ -666,7 +680,8 @@ impl WaylandWebStreamState {
         // canvas was just (re)sized or no damage was recorded. Each is
         // composited independently so disjoint damage doesn't repaint the
         // bounding box between the regions.
-        let clips: Vec<Clip> = if size_changed || self.repaint_region.is_empty() {
+        let full_repaint = size_changed || self.repaint_region.is_empty();
+        let clips: Vec<Clip> = if full_repaint {
             self.repaint_region.clear();
             vec![Clip::full(self.width, self.height)]
         } else {
@@ -677,12 +692,19 @@ impl WaylandWebStreamState {
                 .collect()
         };
 
-        // Hand these exact regions to the encoder so it converts only these
-        // rows BGRA->YUV. Captured here, after the full-repaint fallback, so
-        // they always match what's actually composited below.
+        // Hand these exact regions to the encoder so it converts only these rows
+        // BGRA->YUV, and so the partial handoff copy below moves only these
+        // rows. The vertical span is snapped to even rows up front so the
+        // handoff and the encoder's YUV420 chroma-aligned bands agree exactly
+        // (no stale row read at a band edge); the x-extent is irrelevant to both
+        // (they work by whole rows).
         self.last_repaint_rects = clips
             .iter()
-            .map(|c| DamageRect { x: c.x0, y: c.y0, width: c.x1 - c.x0, height: c.y1 - c.y0 })
+            .map(|c| {
+                let y0 = c.y0 & !1;
+                let y1 = ((c.y1 + 1) & !1).min(self.height);
+                DamageRect { x: c.x0, y: y0, width: c.x1 - c.x0, height: y1.saturating_sub(y0) }
+            })
             .collect();
 
         let window_count = self.space.elements().count();
@@ -784,11 +806,22 @@ impl WaylandWebStreamState {
         }
         } // end `for clip in clips`
 
-        // Hand the encoder a full copy of the canvas, reusing the recycled
-        // buffer's allocation, and keep the canvas for next frame's update.
+        // Hand the canvas to the encoder, reusing the recycled buffer's
+        // allocation, and keep the canvas for next frame's update.
         let mut output = reuse_buffer.unwrap_or_default();
-        output.clear();
-        output.extend_from_slice(&canvas);
+        if full_repaint || output.len() != buffer_size {
+            // Full repaint, or the recycled buffer is missing / the wrong size
+            // (its rows can't be trusted): copy the whole frame -- the encoder
+            // converts it in full too.
+            output.clear();
+            output.extend_from_slice(&canvas);
+        } else {
+            // Partial: copy only the damaged row bands. The encoder reads only
+            // these same rows (damage-aware swscale), so the rest -- stale
+            // content from when this pooled buffer last held a frame -- is never
+            // read. Saves the full width*height*4 memcpy on a small-damage frame.
+            copy_damaged_rows(&mut output, &canvas, &self.last_repaint_rects, self.width);
+        }
         self.canvas = canvas;
         Some(output)
     }
@@ -1701,6 +1734,23 @@ mod render_tests {
         // Further adds are no-ops while fully damaged.
         accumulate_damage(&mut set, rect(5, 5, 5, 5), full);
         assert_eq!(set, vec![full]);
+    }
+
+    #[test]
+    fn copy_damaged_rows_copies_only_the_listed_rows() {
+        let (w, h) = (4u32, 6u32);
+        let stride = (w * 4) as usize;
+        let mut dst = vec![0xAAu8; stride * h as usize];
+        let src = vec![0xBBu8; stride * h as usize];
+        copy_damaged_rows(&mut dst, &src, &[DamageRect { x: 0, y: 2, width: w, height: 2 }], w);
+        for row in 0..h as usize {
+            let line = &dst[row * stride..(row + 1) * stride];
+            if (2..4).contains(&row) {
+                assert!(line.iter().all(|&b| b == 0xBB), "row {row} should be copied from src");
+            } else {
+                assert!(line.iter().all(|&b| b == 0xAA), "row {row} should keep dst's prior bytes");
+            }
+        }
     }
 
     #[test]

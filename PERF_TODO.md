@@ -68,15 +68,13 @@ buffers), as the resize path already does.
   drain tests) pass, streams firefox cleanly.
 
 ## 4. Kill the three whole-frame copies on the hot path  `[MEDIUM]`
-- [ ] Capture handoff (`compositor/state.rs:697-703`): full ~8MB memcpy to the
-      encoder even for tiny damage. Pass damage rect / copy only damaged rows.
-      **DEFERRED** (2026-06-30): not a localized change. Encoder-input buffers
-      are pooled/recycled (not the immediately-previous frame), and x264/VAAPI
-      need a full-frame YUV buffer regardless, so copy-only-damaged-rows would
-      show stale pixels in undamaged regions without per-buffer damage history
-      or double-buffered canvases. The win is only the ~8MB memcpy (~1–3ms), not
-      the encode — too much architectural risk for an autonomous push. Revisit
-      deliberately, likely together with #11 (per-rect damage).
+- [x] Capture handoff: **done** as Stage C of the damage-proportional pipeline
+      (see item #11). The earlier worry (pooled buffers don't hold the previous
+      frame, so copy-only-damaged would show stale pixels) dissolved once the
+      encoder became damage-aware (Stage B): it reads *only* the damaged rows,
+      so the untouched rows of the pooled buffer are never read — no
+      double-buffering / per-buffer damage history needed. `copy_damaged_rows`
+      moves only the (even-snapped) damaged bands; full copy on a full repaint.
 - [x] Broadcast clone (`server.rs`): **done** — broadcast now carries
       `Arc<EncodedPacket>`, so `recv()` is a refcount bump not a full-frame deep
       copy; the wire builder uses `extend_from_slice` (the one unavoidable
@@ -181,6 +179,15 @@ only the real regions.
   `skip_to_newest_frame` unions skipped frames' damage so the persistent YUV
   never misses a region. Hermetic band-conversion test + 31 lib + 68 bin tests;
   live firefox render artifact-free.
+- [x] **Stage C done** (2026-06-30): the SW handoff now copies only the damaged
+  row bands into the (pooled) encoder buffer instead of the whole frame
+  (`copy_damaged_rows`); full copy only on a full repaint or wrong-size buffer.
+  No double-buffering needed — since Stage B's encoder reads *only* the damaged
+  rows, the untouched rows (stale pooled content) are never read. The damage
+  rects' vertical span is even-snapped at creation so the handoff and the
+  encoder's chroma-aligned bands cover identical rows (no stale read at a band
+  edge). Unit test + 32 lib + 69 bin tests; live render artifact-free. The full
+  damage-proportional SW pipeline (compositing + handoff + swscale) is complete.
 
 ---
 
