@@ -1,0 +1,23 @@
+Architectures: amd64
+Codename: trixie
+Components: main
+Date: Wed, 01 Jul 2026 20:40:47 +0000
+Label: waylandwebstream
+Origin: waylandwebstream
+Suite: trixie
+MD5Sum:
+ e6c9981776e6069da62eb3082ccd94c9              156 Release
+ 3bf3bce1d841d711400e5b446c646beb             1248 main/binary-amd64/Packages
+ ba2a161a0af20e181683497f1e806e11              726 main/binary-amd64/Packages.gz
+SHA1:
+ 538b413b91c6c4cfcf4f91b0635d33c9d8490a38              156 Release
+ 1c91310ea5c607c14f46a98c48e63da1bd2431fb             1248 main/binary-amd64/Packages
+ dc4ddc21ffb5d90d987f1402f40f59a053c00d81              726 main/binary-amd64/Packages.gz
+SHA256:
+ 3f83136dc27639cb55b2425a215b8c4b20394aaa3f4bae4e75ae770df3e7c437              156 Release
+ 93575d0c6392d4e0a45719c659b884aac88077100d37923c3296a3ffa4760aeb             1248 main/binary-amd64/Packages
+ ffaddbf54d3baff7380db7caafc99d1217b995b2ee34fe8b998da87cb78c401a              726 main/binary-amd64/Packages.gz
+SHA512:
+ 2fa8b0330da9f38bd07ea4015e9d531b88794bc3c35583bf271fe3bdecd98966fca7c8161583bfdaafa63bff62affad6eb26986b5c76d241d5e7e99a930a7ccc              156 Release
+ f046f986cca94b42aef415ad3674c94d3ebb2c9125082c4b428a4145eb194032168137f7a3be30df43620f85baae6459c5b968d85320ff60312225f30dbe5335             1248 main/binary-amd64/Packages
+ 27194af1d6e1d3c95870a302de76819bc2293e654795e3f46d06b5f6a126454b0af0fb5aa5b2d4bf0c059cc1e9c55747c090034727dc6f74655a45574c0636fd              726 main/binary-amd64/Packages.gz
