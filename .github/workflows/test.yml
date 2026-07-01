@@ -3,6 +3,11 @@ name: test
 # CI test gate + packaging smoke build. The whole pipeline lives in the
 # multi-stage Dockerfile (Debian trixie / FFmpeg 7.1); this workflow just drives
 # `docker build` against its stages. See TESTING.md for the test tiers.
+#
+# The lint + tiered tests run on every push/PR. The packaging smoke build and
+# artifact upload are the expensive part, so they run on `workflow_dispatch`
+# only (trigger the workflow manually to get a CI .deb) to conserve Actions
+# minutes -- releases build the real .deb via release.yml anyway.
 
 on:
   push:
@@ -35,7 +40,9 @@ jobs:
           cache-to: type=gha,mode=max
 
       # The `artifact` stage builds the release binary and packages the .deb.
+      # Manual-only (workflow_dispatch) to save Actions minutes on push/PR.
       - name: Smoke-build the .deb (Dockerfile `artifact` stage)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: .
@@ -46,6 +53,7 @@ jobs:
           cache-from: type=gha
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         with:
           name: waylandwebstream-deb-ci
           path: dist/*.deb
