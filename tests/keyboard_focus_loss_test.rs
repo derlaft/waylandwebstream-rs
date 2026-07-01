@@ -59,8 +59,14 @@ fn test_keyboard_releases_held_keys_on_focus_loss() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     print!("{stdout}");
 
-    assert!(output.status.success(), "Keyboard focus-loss capture failed");
-    assert!(stdout.lines().any(|line| line == "RESULT ok"), "Capture script did not report success");
+    assert!(
+        output.status.success(),
+        "Keyboard focus-loss capture failed"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "RESULT ok"),
+        "Capture script did not report success"
+    );
 
     println!("Test passed!");
 }

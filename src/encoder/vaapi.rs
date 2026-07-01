@@ -95,7 +95,10 @@ pub struct VaapiEncoder {
 }
 
 impl VaapiEncoder {
-    pub fn new(config: EncoderConfig, buffer_return_tx: std::sync::mpsc::Sender<Vec<u8>>) -> Result<Self> {
+    pub fn new(
+        config: EncoderConfig,
+        buffer_return_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<Self> {
         let device_ref = create_device(&config.vaapi_device)?;
         let pipeline = build_pipeline_for(&config, device_ref)?;
         Ok(Self {
@@ -155,14 +158,32 @@ impl VaapiEncoder {
             .add(bgra_frame)
             .context("failed to feed frame into vaapi filtergraph")?;
 
-        drain_filtergraph(graph, encoder, next_frame_id, force_keyframe, capture_to_encode_ms)
+        drain_filtergraph(
+            graph,
+            encoder,
+            next_frame_id,
+            force_keyframe,
+            capture_to_encode_ms,
+        )
     }
 }
 
 impl VideoEncoder for VaapiEncoder {
-    fn submit(&mut self, frame: CapturedFrame, capture_to_encode_ms: f64, force_keyframe: bool) -> Result<Vec<EncodedPacket>> {
+    fn submit(
+        &mut self,
+        frame: CapturedFrame,
+        capture_to_encode_ms: f64,
+        force_keyframe: bool,
+    ) -> Result<Vec<EncodedPacket>> {
         match (&mut self.pipeline, frame) {
-            (VaapiPipeline::Cpu { graph, encoder, bgra_frame }, CapturedFrame::Cpu(raw_frame)) => {
+            (
+                VaapiPipeline::Cpu {
+                    graph,
+                    encoder,
+                    bgra_frame,
+                },
+                CapturedFrame::Cpu(raw_frame),
+            ) => {
                 let result = Self::encode_cpu_frame(
                     graph,
                     encoder,
@@ -180,7 +201,19 @@ impl VideoEncoder for VaapiEncoder {
                 self.frame_count += 1;
                 Ok(packets)
             }
-            (VaapiPipeline::Gpu { frames_ref, graph, encoder }, CapturedFrame::Gpu { dmabuf, width, height, .. }) => {
+            (
+                VaapiPipeline::Gpu {
+                    frames_ref,
+                    graph,
+                    encoder,
+                },
+                CapturedFrame::Gpu {
+                    dmabuf,
+                    width,
+                    height,
+                    ..
+                },
+            ) => {
                 let packets = encode_gpu_frame(
                     *frames_ref,
                     graph,
@@ -232,7 +265,10 @@ impl VideoEncoder for VaapiEncoder {
             warn!("Ignoring bitrate change request: VAAPI encoder is in constant-quality mode");
             return false;
         }
-        info!("Changing VAAPI bitrate from {:?} to {} bps", self.config.rate_control, bitrate);
+        info!(
+            "Changing VAAPI bitrate from {:?} to {} bps",
+            self.config.rate_control, bitrate
+        );
         self.config.rate_control = RateControl::Bitrate(bitrate);
 
         match build_pipeline_for(&self.config, self.device_ref) {
@@ -248,7 +284,10 @@ impl VideoEncoder for VaapiEncoder {
                 true
             }
             Err(e) => {
-                error!("Failed to reinitialize VAAPI encoder with new bitrate: {}", e);
+                error!(
+                    "Failed to reinitialize VAAPI encoder with new bitrate: {}",
+                    e
+                );
                 false
             }
         }
@@ -284,14 +323,25 @@ impl Drop for VaapiEncoder {
 /// one actually needed (rather than both) matters beyond avoiding wasted
 /// setup: each pipeline opens its own `h264_vaapi` hardware encode session,
 /// and some VAAPI drivers cap how many of those can run concurrently.
-fn build_pipeline_for(config: &EncoderConfig, device_ref: *mut ffi::AVBufferRef) -> Result<VaapiPipeline> {
+fn build_pipeline_for(
+    config: &EncoderConfig,
+    device_ref: *mut ffi::AVBufferRef,
+) -> Result<VaapiPipeline> {
     if config.gpu_frames {
         let (frames_ref, graph, encoder) = build_gpu_pipeline(config, device_ref)?;
-        Ok(VaapiPipeline::Gpu { frames_ref, graph, encoder })
+        Ok(VaapiPipeline::Gpu {
+            frames_ref,
+            graph,
+            encoder,
+        })
     } else {
         let (graph, encoder) = build_pipeline(config, device_ref)?;
         let bgra_frame = create_input_frame(config.width, config.height);
-        Ok(VaapiPipeline::Cpu { graph, encoder, bgra_frame })
+        Ok(VaapiPipeline::Cpu {
+            graph,
+            encoder,
+            bgra_frame,
+        })
     }
 }
 
@@ -329,9 +379,15 @@ fn drain_filtergraph(
                     ffmpeg::picture::Type::None
                 });
                 encoder.send_frame(&hw_frame)?;
-                packets.extend(super::drain_packets(encoder, next_frame_id, capture_to_encode_ms)?);
+                packets.extend(super::drain_packets(
+                    encoder,
+                    next_frame_id,
+                    capture_to_encode_ms,
+                )?);
             }
-            Err(ffmpeg::Error::Other { errno: ffmpeg::error::EAGAIN }) => break,
+            Err(ffmpeg::Error::Other {
+                errno: ffmpeg::error::EAGAIN,
+            }) => break,
             Err(e) => return Err(e.into()),
         }
     }
@@ -386,7 +442,10 @@ fn encode_gpu_frame(
         // SAFETY: `mapped` is the owned frame allocated above; av_hwframe_map
         // failed, so freeing it here (exactly once) is the right cleanup.
         unsafe { ffi::av_frame_free(&mut mapped) };
-        anyhow::bail!("av_hwframe_map(DRM_PRIME -> VAAPI) failed: {}", ffmpeg::Error::from(map_ret));
+        anyhow::bail!(
+            "av_hwframe_map(DRM_PRIME -> VAAPI) failed: {}",
+            ffmpeg::Error::from(map_ret)
+        );
     }
     // Safe wrapper takes ownership of `mapped` (frees it via Drop) -- same
     // type the Cpu path's `hw_frame` uses, so it can go through the
@@ -407,7 +466,13 @@ fn encode_gpu_frame(
         .add(&mapped_frame)
         .context("failed to feed mapped VAAPI frame into vaapi gpu filtergraph")?;
 
-    drain_filtergraph(graph, encoder, next_frame_id, force_keyframe, capture_to_encode_ms)
+    drain_filtergraph(
+        graph,
+        encoder,
+        next_frame_id,
+        force_keyframe,
+        capture_to_encode_ms,
+    )
 }
 
 /// Owns everything a `AV_PIX_FMT_DRM_PRIME` source `AVFrame` needs to stay
@@ -433,7 +498,11 @@ unsafe extern "C" fn free_drm_frame_owner(opaque: *mut std::ffi::c_void, _data: 
 /// pixel copy, just metadata (fd, stride, offset, modifier) wrapped the way
 /// `av_hwframe_map` expects to find it. Single-plane only (every dmabuf
 /// `GlCompositor` produces is Argb8888, never subsampled/multi-plane).
-fn drm_prime_frame_from_dmabuf(dmabuf: &Dmabuf, width: u32, height: u32) -> Result<ffmpeg::frame::Video> {
+fn drm_prime_frame_from_dmabuf(
+    dmabuf: &Dmabuf,
+    width: u32,
+    height: u32,
+) -> Result<ffmpeg::frame::Video> {
     if dmabuf.num_planes() != 1 {
         anyhow::bail!(
             "expected a single-plane dmabuf, got {} planes -- GlCompositor should only ever \
@@ -443,8 +512,14 @@ fn drm_prime_frame_from_dmabuf(dmabuf: &Dmabuf, width: u32, height: u32) -> Resu
     }
     let format = dmabuf.format();
     let fd = dmabuf.handles().next().context("dmabuf has no plane fds")?;
-    let offset = dmabuf.offsets().next().context("dmabuf has no plane offsets")?;
-    let stride = dmabuf.strides().next().context("dmabuf has no plane strides")?;
+    let offset = dmabuf
+        .offsets()
+        .next()
+        .context("dmabuf has no plane offsets")?;
+    let stride = dmabuf
+        .strides()
+        .next()
+        .context("dmabuf has no plane strides")?;
     // dma_buf fds report their real backing size via fstat (the kernel sets
     // the file's size at creation) -- dup the fd (we don't own the original,
     // `dmabuf` does) just to query it without touching the dmabuf's actual
@@ -570,7 +645,8 @@ fn drm_prime_frame_from_dmabuf(dmabuf: &Dmabuf, width: u32, height: u32) -> Resu
 /// `VaapiEncoder`; every `graph`/`encoder` rebuild takes a fresh
 /// `av_buffer_ref` of it rather than reopening the device.
 fn create_device(path: &str) -> Result<*mut ffi::AVBufferRef> {
-    let device_path = std::ffi::CString::new(path).with_context(|| format!("invalid VAAPI device path {path:?}"))?;
+    let device_path = std::ffi::CString::new(path)
+        .with_context(|| format!("invalid VAAPI device path {path:?}"))?;
     let mut device_ref: *mut ffi::AVBufferRef = std::ptr::null_mut();
     // SAFETY: `&mut device_ref` and the null-terminated `device_path` C string
     // are valid for the call; av_hwdevice_ctx_create writes the owned device
@@ -585,7 +661,11 @@ fn create_device(path: &str) -> Result<*mut ffi::AVBufferRef> {
         )
     };
     if ret < 0 {
-        anyhow::bail!("av_hwdevice_ctx_create({}) failed: {}", path, ffmpeg::Error::from(ret));
+        anyhow::bail!(
+            "av_hwdevice_ctx_create({}) failed: {}",
+            path,
+            ffmpeg::Error::from(ret)
+        );
     }
     Ok(device_ref)
 }
@@ -598,13 +678,20 @@ fn create_device(path: &str) -> Result<*mut ffi::AVBufferRef> {
 /// `av_buffersink_get_hw_frames_ctx` below. Rebuilt wholesale on every resize
 /// and bitrate change, same as `X264Encoder::reinitialize`/`change_bitrate`
 /// rebuild `encoder`/`scaler`.
-fn build_pipeline(config: &EncoderConfig, device_ref: *mut ffi::AVBufferRef) -> Result<(ffmpeg::filter::Graph, ffmpeg::encoder::Video)> {
+fn build_pipeline(
+    config: &EncoderConfig,
+    device_ref: *mut ffi::AVBufferRef,
+) -> Result<(ffmpeg::filter::Graph, ffmpeg::encoder::Video)> {
     let mut graph = ffmpeg::filter::Graph::new();
 
-    let buffer_filter = ffmpeg::filter::find("buffer").context("\"buffer\" filter not registered")?;
-    let hwupload_filter = ffmpeg::filter::find("hwupload").context("\"hwupload\" filter not registered")?;
-    let scale_vaapi_filter = ffmpeg::filter::find("scale_vaapi").context("\"scale_vaapi\" filter not registered")?;
-    let buffersink_filter = ffmpeg::filter::find("buffersink").context("\"buffersink\" filter not registered")?;
+    let buffer_filter =
+        ffmpeg::filter::find("buffer").context("\"buffer\" filter not registered")?;
+    let hwupload_filter =
+        ffmpeg::filter::find("hwupload").context("\"hwupload\" filter not registered")?;
+    let scale_vaapi_filter =
+        ffmpeg::filter::find("scale_vaapi").context("\"scale_vaapi\" filter not registered")?;
+    let buffersink_filter =
+        ffmpeg::filter::find("buffersink").context("\"buffersink\" filter not registered")?;
 
     let args = format!(
         "video_size={}x{}:pix_fmt=bgra:time_base=1/{}:pixel_aspect=1/1",
@@ -625,10 +712,17 @@ fn build_pipeline(config: &EncoderConfig, device_ref: *mut ffi::AVBufferRef) -> 
     // immediately on return, which is too late. Per
     // avfilter_graph_create_filter's own doc comment, the fix is to split
     // alloc and init by hand -- see `alloc_hw_filter`.
-    let mut hwupload_ctx = alloc_hw_filter(&mut graph, &hwupload_filter, "hwupload", device_ref, None)
-        .context("failed to initialize hwupload filter")?;
-    let mut scale_ctx = alloc_hw_filter(&mut graph, &scale_vaapi_filter, "scale_vaapi", device_ref, Some(("format", "nv12")))
-        .context("failed to initialize scale_vaapi filter")?;
+    let mut hwupload_ctx =
+        alloc_hw_filter(&mut graph, &hwupload_filter, "hwupload", device_ref, None)
+            .context("failed to initialize hwupload filter")?;
+    let mut scale_ctx = alloc_hw_filter(
+        &mut graph,
+        &scale_vaapi_filter,
+        "scale_vaapi",
+        device_ref,
+        Some(("format", "nv12")),
+    )
+    .context("failed to initialize scale_vaapi filter")?;
 
     in_ctx.link(0, &mut hwupload_ctx, 0);
     hwupload_ctx.link(0, &mut scale_ctx, 0);
@@ -683,7 +777,11 @@ fn finalize_vaapi_graph(
 fn build_gpu_pipeline(
     config: &EncoderConfig,
     device_ref: *mut ffi::AVBufferRef,
-) -> Result<(*mut ffi::AVBufferRef, ffmpeg::filter::Graph, ffmpeg::encoder::Video)> {
+) -> Result<(
+    *mut ffi::AVBufferRef,
+    ffmpeg::filter::Graph,
+    ffmpeg::encoder::Video,
+)> {
     // Describes the *shape* every per-frame zero-copy mapped surface
     // conforms to -- not a pool. `av_hwframe_map` creates one real VA
     // surface per dmabuf import (see `encode_gpu_frame`); every mapped
@@ -714,13 +812,19 @@ fn build_gpu_pipeline(
         // SAFETY: `input_frames_ref` is the owned ref allocated above; init
         // failed, so free it exactly once here before bailing.
         unsafe { ffi::av_buffer_unref(&mut input_frames_ref) };
-        anyhow::bail!("av_hwframe_ctx_init failed: {}", ffmpeg::Error::from(init_ret));
+        anyhow::bail!(
+            "av_hwframe_ctx_init failed: {}",
+            ffmpeg::Error::from(init_ret)
+        );
     }
 
     let mut graph = ffmpeg::filter::Graph::new();
-    let buffer_filter = ffmpeg::filter::find("buffer").context("\"buffer\" filter not registered")?;
-    let scale_vaapi_filter = ffmpeg::filter::find("scale_vaapi").context("\"scale_vaapi\" filter not registered")?;
-    let buffersink_filter = ffmpeg::filter::find("buffersink").context("\"buffersink\" filter not registered")?;
+    let buffer_filter =
+        ffmpeg::filter::find("buffer").context("\"buffer\" filter not registered")?;
+    let scale_vaapi_filter =
+        ffmpeg::filter::find("scale_vaapi").context("\"scale_vaapi\" filter not registered")?;
+    let buffersink_filter =
+        ffmpeg::filter::find("buffersink").context("\"buffersink\" filter not registered")?;
 
     // **Real bug found on hardware, not just theoretical**: `buffer`'s own
     // init() callback checks `hw_frames_ctx` immediately when `pix_fmt` is a
@@ -740,7 +844,9 @@ fn build_gpu_pipeline(
     // SAFETY: `graph.as_mut_ptr()` and `buffer_filter.as_ptr()` are live, and
     // `cname` is a valid null-terminated C string outliving the call; returns
     // a filter context owned by the graph, or null (checked below).
-    let in_ctx_ptr = unsafe { ffi::avfilter_graph_alloc_filter(graph.as_mut_ptr(), buffer_filter.as_ptr(), cname.as_ptr()) };
+    let in_ctx_ptr = unsafe {
+        ffi::avfilter_graph_alloc_filter(graph.as_mut_ptr(), buffer_filter.as_ptr(), cname.as_ptr())
+    };
     if in_ctx_ptr.is_null() {
         anyhow::bail!("avfilter_graph_alloc_filter(\"in_gpu\") failed");
     }
@@ -758,7 +864,10 @@ fn build_gpu_pipeline(
         (*params).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
         (*params).width = config.width as i32;
         (*params).height = config.height as i32;
-        (*params).time_base = ffi::AVRational { num: 1, den: config.framerate as i32 };
+        (*params).time_base = ffi::AVRational {
+            num: 1,
+            den: config.framerate as i32,
+        };
         (*params).hw_frames_ctx = input_frames_ref;
     }
     // SAFETY: `in_ctx_ptr` is the live, not-yet-initialized buffer filter
@@ -768,14 +877,20 @@ fn build_gpu_pipeline(
     // longer needed after the set call copied what it needs; freed once here.
     unsafe { ffi::av_free(params as *mut std::ffi::c_void) };
     if params_ret < 0 {
-        anyhow::bail!("av_buffersrc_parameters_set failed: {}", ffmpeg::Error::from(params_ret));
+        anyhow::bail!(
+            "av_buffersrc_parameters_set failed: {}",
+            ffmpeg::Error::from(params_ret)
+        );
     }
 
     // SAFETY: `in_ctx_ptr` is the live filter context, configured via params
     // above; initializing it with no options dict is valid here.
     let init_ret = unsafe { ffi::avfilter_init_dict(in_ctx_ptr, std::ptr::null_mut()) };
     if init_ret < 0 {
-        anyhow::bail!("avfilter_init_dict(\"in_gpu\") failed: {}", ffmpeg::Error::from(init_ret));
+        anyhow::bail!(
+            "avfilter_init_dict(\"in_gpu\") failed: {}",
+            ffmpeg::Error::from(init_ret)
+        );
     }
     // SAFETY: `in_ctx_ptr` is a live, now-initialized filter context owned by
     // `graph`; wrapping borrows it for the graph's lifetime.
@@ -786,8 +901,14 @@ fn build_gpu_pipeline(
         .context("failed to add buffersink to vaapi gpu filtergraph")?;
     // scale_vaapi still needs hw_device_ctx set before its own init() --
     // same requirement and same split-alloc/init fix as build_pipeline.
-    let mut scale_ctx = alloc_hw_filter(&mut graph, &scale_vaapi_filter, "scale_vaapi", device_ref, Some(("format", "nv12")))
-        .context("failed to initialize scale_vaapi filter")?;
+    let mut scale_ctx = alloc_hw_filter(
+        &mut graph,
+        &scale_vaapi_filter,
+        "scale_vaapi",
+        device_ref,
+        Some(("format", "nv12")),
+    )
+    .context("failed to initialize scale_vaapi filter")?;
 
     in_ctx.link(0, &mut scale_ctx, 0);
     scale_ctx.link(0, &mut out_ctx, 0);
@@ -813,7 +934,9 @@ fn alloc_hw_filter(
     // SAFETY: `graph.as_mut_ptr()` and `filter.as_ptr()` are live, and `cname`
     // is a valid null-terminated C string outliving the call; returns a filter
     // context owned by the graph, or null (checked below).
-    let ctx_ptr = unsafe { ffi::avfilter_graph_alloc_filter(graph.as_mut_ptr(), filter.as_ptr(), cname.as_ptr()) };
+    let ctx_ptr = unsafe {
+        ffi::avfilter_graph_alloc_filter(graph.as_mut_ptr(), filter.as_ptr(), cname.as_ptr())
+    };
     if ctx_ptr.is_null() {
         anyhow::bail!("avfilter_graph_alloc_filter({name:?}) failed");
     }
@@ -847,7 +970,10 @@ fn alloc_hw_filter(
         }
     };
     if ret < 0 {
-        anyhow::bail!("avfilter_init_dict({name:?}) failed: {}", ffmpeg::Error::from(ret));
+        anyhow::bail!(
+            "avfilter_init_dict({name:?}) failed: {}",
+            ffmpeg::Error::from(ret)
+        );
     }
 
     // SAFETY: `ctx_ptr` is a live, now-initialized filter context owned by
@@ -859,9 +985,15 @@ fn alloc_hw_filter(
 /// filtergraph's derived NV12 hardware frames context -- see `build_pipeline`
 /// for why it must be that exact context and not a separately allocated
 /// one).
-fn create_vaapi_encoder(config: &EncoderConfig, frames_ref: *mut ffi::AVBufferRef) -> Result<ffmpeg::encoder::Video> {
-    let codec = ffmpeg::encoder::find_by_name("h264_vaapi").context("h264_vaapi encoder not found")?;
-    let mut encoder = ffmpeg::codec::context::Context::new_with_codec(codec).encoder().video()?;
+fn create_vaapi_encoder(
+    config: &EncoderConfig,
+    frames_ref: *mut ffi::AVBufferRef,
+) -> Result<ffmpeg::encoder::Video> {
+    let codec =
+        ffmpeg::encoder::find_by_name("h264_vaapi").context("h264_vaapi encoder not found")?;
+    let mut encoder = ffmpeg::codec::context::Context::new_with_codec(codec)
+        .encoder()
+        .video()?;
 
     encoder.set_width(config.width);
     encoder.set_height(config.height);
@@ -891,7 +1023,14 @@ fn create_vaapi_encoder(config: &EncoderConfig, frames_ref: *mut ffi::AVBufferRe
 
     let mut opts = ffmpeg::Dictionary::new();
     opts.set("profile", "constrained_baseline");
-    opts.set("level", &h264_level_option(select_h264_level(config.width, config.height, config.framerate)));
+    opts.set(
+        "level",
+        &h264_level_option(select_h264_level(
+            config.width,
+            config.height,
+            config.framerate,
+        )),
+    );
     opts.set("async_depth", "1");
 
     match config.rate_control {
@@ -1045,7 +1184,10 @@ mod tests {
             .expect("submit failed")
     }
 
-    fn make_gpu_encoder(tx: std::sync::mpsc::Sender<Vec<u8>>, keyframe_interval: u32) -> VaapiEncoder {
+    fn make_gpu_encoder(
+        tx: std::sync::mpsc::Sender<Vec<u8>>,
+        keyframe_interval: u32,
+    ) -> VaapiEncoder {
         let config = EncoderConfig {
             width: TEST_SIZE,
             height: TEST_SIZE,
@@ -1078,10 +1220,16 @@ mod tests {
         let buffer = allocator
             .create_buffer(width, height, Fourcc::Argb8888, &[Modifier::Invalid])
             .expect("failed to allocate a GBM buffer");
-        buffer.export().expect("failed to export GBM buffer as a dmabuf")
+        buffer
+            .export()
+            .expect("failed to export GBM buffer as a dmabuf")
     }
 
-    fn submit_gpu(encoder: &mut VaapiEncoder, dmabuf: Dmabuf, force_keyframe: bool) -> Vec<EncodedPacket> {
+    fn submit_gpu(
+        encoder: &mut VaapiEncoder,
+        dmabuf: Dmabuf,
+        force_keyframe: bool,
+    ) -> Vec<EncodedPacket> {
         encoder
             .submit(
                 CapturedFrame::Gpu {
@@ -1096,9 +1244,18 @@ mod tests {
             .expect("submit failed")
     }
 
-    fn submit_sized(encoder: &mut VaapiEncoder, width: u32, height: u32, force_keyframe: bool) -> Vec<EncodedPacket> {
+    fn submit_sized(
+        encoder: &mut VaapiEncoder,
+        width: u32,
+        height: u32,
+        force_keyframe: bool,
+    ) -> Vec<EncodedPacket> {
         encoder
-            .submit(CapturedFrame::Cpu(make_raw_frame_sized(width, height)), 0.0, force_keyframe)
+            .submit(
+                CapturedFrame::Cpu(make_raw_frame_sized(width, height)),
+                0.0,
+                force_keyframe,
+            )
             .expect("submit failed")
     }
 
@@ -1196,12 +1353,17 @@ mod tests {
         let mut encoder = make_encoder(tx, 1000);
 
         let packets = submit(&mut encoder, false);
-        assert!(packets.iter().any(|p| p.is_keyframe), "first frame of a GOP should be a keyframe");
+        assert!(
+            packets.iter().any(|p| p.is_keyframe),
+            "first frame of a GOP should be a keyframe"
+        );
 
         // Different aspect ratio too, not just a different area -- mirrors
         // the x264 test's 1280x720 -> 800x592 resize.
         let (new_width, new_height) = (TEST_SIZE * 2, TEST_SIZE / 2);
-        encoder.reinitialize(new_width, new_height).expect("reinitialize failed");
+        encoder
+            .reinitialize(new_width, new_height)
+            .expect("reinitialize failed");
         assert_eq!(encoder.width(), new_width);
         assert_eq!(encoder.height(), new_height);
 
@@ -1255,8 +1417,14 @@ mod tests {
         let buffer = allocator
             .create_buffer(TEST_SIZE, TEST_SIZE, Fourcc::Argb8888, &[Modifier::Invalid])
             .expect("failed to allocate a GBM buffer");
-        let dmabuf = buffer.export().expect("failed to export GBM buffer as a dmabuf");
-        assert_eq!(dmabuf.num_planes(), 1, "single-plane Argb8888 should have exactly one plane");
+        let dmabuf = buffer
+            .export()
+            .expect("failed to export GBM buffer as a dmabuf");
+        assert_eq!(
+            dmabuf.num_planes(),
+            1,
+            "single-plane Argb8888 should have exactly one plane"
+        );
 
         let mut device_ref = create_device(device_path).expect("failed to create VAAPI device");
 
@@ -1377,7 +1545,10 @@ mod tests {
         // SAFETY: `device_ref` is a live owned device ref; returns a new owned
         // frames ctx ref or null, asserted below.
         let mut vaapi_frames_ref = unsafe { ffi::av_hwframe_ctx_alloc(device_ref) };
-        assert!(!vaapi_frames_ref.is_null(), "av_hwframe_ctx_alloc returned null");
+        assert!(
+            !vaapi_frames_ref.is_null(),
+            "av_hwframe_ctx_alloc returned null"
+        );
         // SAFETY: `vaapi_frames_ref` was just asserted non-null; its `data`
         // points at a fresh, not-yet-initialized AVHWFramesContext, so these
         // pre-init writes are in-bounds and exclusive.
@@ -1518,10 +1689,15 @@ mod tests {
         let mut encoder = make_gpu_encoder(tx, 1000);
 
         let packets = submit_gpu(&mut encoder, make_gpu_dmabuf(TEST_SIZE, TEST_SIZE), false);
-        assert!(packets.iter().any(|p| p.is_keyframe), "first frame of a GOP should be a keyframe");
+        assert!(
+            packets.iter().any(|p| p.is_keyframe),
+            "first frame of a GOP should be a keyframe"
+        );
 
         let (new_width, new_height) = (TEST_SIZE * 2, TEST_SIZE / 2);
-        encoder.reinitialize(new_width, new_height).expect("reinitialize failed");
+        encoder
+            .reinitialize(new_width, new_height)
+            .expect("reinitialize failed");
         assert_eq!(encoder.width(), new_width);
         assert_eq!(encoder.height(), new_height);
 

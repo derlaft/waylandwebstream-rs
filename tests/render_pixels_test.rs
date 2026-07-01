@@ -104,8 +104,14 @@ fn render_composites_client_content_across_two_frames() {
 
     // First render: a full repaint (the canvas starts empty). Must show the
     // client's content, not a black screen.
-    let frame1 = state.render(None).expect("render() returned no framebuffer");
-    assert_eq!(frame1.len(), (WIDTH * HEIGHT * 4) as usize, "frame1 wrong size");
+    let frame1 = state
+        .render(None)
+        .expect("render() returned no framebuffer");
+    assert_eq!(
+        frame1.len(),
+        (WIDTH * HEIGHT * 4) as usize,
+        "frame1 wrong size"
+    );
     let frame1_nonblack = nonblack_pixels(&frame1);
     assert!(
         frame1_nonblack > 0,
@@ -127,7 +133,9 @@ fn render_composites_client_content_across_two_frames() {
         display.flush_clients().expect("failed to flush clients");
     }
     let _ = state.take_dirty(); // stash this frame's damage for render()
-    let frame2 = state.render(None).expect("render() returned no framebuffer");
+    let frame2 = state
+        .render(None)
+        .expect("render() returned no framebuffer");
     let frame2_nonblack = nonblack_pixels(&frame2);
     assert!(
         frame2_nonblack > 0,

@@ -10,18 +10,19 @@ use smithay::{
         input::{Axis, AxisSource, ButtonState, KeyState, TouchSlot},
         renderer::{gles::GlesRenderer, utils::with_renderer_surface_state, ImportDma},
     },
-    delegate_compositor, delegate_cursor_shape, delegate_dmabuf,
-    delegate_fractional_scale,
-    delegate_keyboard_shortcuts_inhibit, delegate_output,
-    delegate_pointer_constraints, delegate_relative_pointer, delegate_seat, delegate_shm,
-    delegate_single_pixel_buffer, delegate_viewporter, delegate_xdg_shell,
-    delegate_xdg_toplevel_icon,
+    delegate_compositor, delegate_cursor_shape, delegate_dmabuf, delegate_fractional_scale,
+    delegate_keyboard_shortcuts_inhibit, delegate_output, delegate_pointer_constraints,
+    delegate_relative_pointer, delegate_seat, delegate_shm, delegate_single_pixel_buffer,
+    delegate_viewporter, delegate_xdg_shell, delegate_xdg_toplevel_icon,
     desktop::{Space, Window},
     input::{
-        Seat, SeatState,
         keyboard::FilterResult,
-        pointer::{AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, MotionEvent as PointerMotionEvent, RelativeMotionEvent},
+        pointer::{
+            AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData,
+            MotionEvent as PointerMotionEvent, RelativeMotionEvent,
+        },
         touch::{DownEvent, MotionEvent, UpEvent},
+        Seat, SeatState,
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
@@ -37,33 +38,36 @@ use smithay::{
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            CompositorClientState, CompositorState as SmithayCompositorState, send_surface_state,
-            with_states, RectangleKind, RegionAttributes,
+            send_surface_state, with_states, CompositorClientState,
+            CompositorState as SmithayCompositorState, RectangleKind, RegionAttributes,
+        },
+        cursor_shape::CursorShapeManagerState,
+        dmabuf::{
+            get_dmabuf, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState,
+            ImportNotifier,
         },
         fractional_scale::{
             with_fractional_scale, FractionalScaleHandler, FractionalScaleManagerState,
         },
-        dmabuf::{get_dmabuf, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
-        output::{OutputManagerState, OutputHandler},
-        shell::xdg::{
-            XdgShellState, ToplevelSurface, XdgToplevelSurfaceData,
+        keyboard_shortcuts_inhibit::{
+            KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState,
+            KeyboardShortcutsInhibitor,
         },
-        shm::{ShmState, ShmHandler, with_buffer_contents},
-        single_pixel_buffer::SinglePixelBufferState,
-        viewporter::ViewporterState,
-        seat::WaylandFocus,
+        output::{OutputHandler, OutputManagerState},
         pointer_constraints::{
             with_pointer_constraint, PointerConstraint, PointerConstraintsHandler,
             PointerConstraintsState,
         },
         relative_pointer::RelativePointerManagerState,
-        cursor_shape::CursorShapeManagerState,
-        keyboard_shortcuts_inhibit::{
-            KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState,
-            KeyboardShortcutsInhibitor,
-        },
+        seat::WaylandFocus,
+        shell::xdg::{ToplevelSurface, XdgShellState, XdgToplevelSurfaceData},
+        shm::{with_buffer_contents, ShmHandler, ShmState},
+        single_pixel_buffer::SinglePixelBufferState,
         tablet_manager::TabletSeatHandler,
-        xdg_toplevel_icon::{XdgToplevelIconHandler, XdgToplevelIconManager, ToplevelIconCachedState},
+        viewporter::ViewporterState,
+        xdg_toplevel_icon::{
+            ToplevelIconCachedState, XdgToplevelIconHandler, XdgToplevelIconManager,
+        },
     },
 };
 use std::cell::RefCell;
@@ -72,6 +76,12 @@ use std::rc::Rc;
 use tracing::{debug, info, trace, warn};
 
 use crate::encoder::DamageRect;
+
+/// Raw top-down RGBA favicon image: `(width, height, bytes)`.
+type Favicon = (u32, u32, Vec<u8>);
+
+/// Snapshot of the topmost window's app metadata: `(title, app_id, favicon)`.
+type AppMeta = (String, String, Option<Favicon>);
 
 /// Name reported for the single headless `wl_output` we expose.
 const OUTPUT_NAME: &str = "HEADLESS-1";
@@ -141,7 +151,7 @@ pub struct WaylandWebStreamState {
     pub output: Output,
     pub width: u32,
     pub height: u32,
-    
+
     // Clock for timing
     pub clock: Clock<Monotonic>,
 
@@ -287,7 +297,12 @@ struct Clip {
 impl Clip {
     /// The whole `width × height` output.
     fn full(width: u32, height: u32) -> Self {
-        Self { x0: 0, y0: 0, x1: width, y1: height }
+        Self {
+            x0: 0,
+            y0: 0,
+            x1: width,
+            y1: height,
+        }
     }
 
     /// Converts a logical-space damage rectangle to a pixel clip, clamped to
@@ -415,10 +430,7 @@ fn render_root_weave(dst: &mut [u8], width: u32, height: u32, clip: Clip) {
 /// constraint region's additive rectangles. Best-effort: non-rectangular
 /// regions (those using subtract rects) are approximated by the additive
 /// bounding box, which is sufficient for the common single-rect confine.
-fn clamp_point_to_region(
-    p: Point<f64, Logical>,
-    region: &RegionAttributes,
-) -> Point<f64, Logical> {
+fn clamp_point_to_region(p: Point<f64, Logical>, region: &RegionAttributes) -> Point<f64, Logical> {
     let mut bbox: Option<Rectangle<i32, Logical>> = None;
     for (kind, rect) in &region.rects {
         if matches!(kind, RectangleKind::Add) {
@@ -441,10 +453,13 @@ impl WaylandWebStreamState {
         width: u32,
         height: u32,
     ) -> Self {
-        info!("Initializing full compositor with resolution {}x{}", width, height);
+        info!(
+            "Initializing full compositor with resolution {}x{}",
+            width, height
+        );
 
         let dh = display.handle();
-        
+
         // Initialize all Wayland protocol states.
         // Hyprland's Aquamarine backend requires wl_compositor >= 6; new() only
         // advertises version 5, which makes it reject the bind and abort.
@@ -484,10 +499,7 @@ impl WaylandWebStreamState {
             model: "Virtual".into(),
         };
 
-        let output = Output::new(
-            OUTPUT_NAME.to_string(),
-            physical_properties,
-        );
+        let output = Output::new(OUTPUT_NAME.to_string(), physical_properties);
 
         output.change_current_state(Some(mode), None, None, Some((0, 0).into()));
         output.set_preferred(mode);
@@ -495,8 +507,12 @@ impl WaylandWebStreamState {
 
         // Create seat (input device manager)
         let mut seat = seat_state.new_wl_seat(&dh, "seat-0");
-        seat.add_keyboard(Default::default(), KEYBOARD_REPEAT_DELAY_MS, KEYBOARD_REPEAT_RATE_HZ)
-            .unwrap();
+        seat.add_keyboard(
+            Default::default(),
+            KEYBOARD_REPEAT_DELAY_MS,
+            KEYBOARD_REPEAT_RATE_HZ,
+        )
+        .unwrap();
         seat.add_pointer();
         seat.add_touch();
 
@@ -523,7 +539,10 @@ impl WaylandWebStreamState {
             width,
             height,
             clock: Clock::new(),
-            damage: vec![Rectangle::new((0, 0).into(), (width as i32, height as i32).into())],
+            damage: vec![Rectangle::new(
+                (0, 0).into(),
+                (width as i32, height as i32).into(),
+            )],
             repaint_region: Vec::new(),
             last_repaint_rects: Vec::new(),
             canvas: Vec::new(),
@@ -614,7 +633,10 @@ impl WaylandWebStreamState {
         for r in rects {
             // Row bands are full-width (the encoder is row-based); re-mark the
             // whole rows so the next render re-composites and re-converts them.
-            self.add_damage(Rectangle::new((0, r.y as i32).into(), (width, r.height as i32).into()));
+            self.add_damage(Rectangle::new(
+                (0, r.y as i32).into(),
+                (width, r.height as i32).into(),
+            ));
         }
     }
 
@@ -643,7 +665,10 @@ impl WaylandWebStreamState {
 
     /// Returns the rectangle covering the entire output, in logical space.
     fn full_output_damage(&self) -> Rectangle<i32, Logical> {
-        Rectangle::new((0, 0).into(), (self.width as i32, self.height as i32).into())
+        Rectangle::new(
+            (0, 0).into(),
+            (self.width as i32, self.height as i32).into(),
+        )
     }
 
     /// Computes the logical-space rectangle damaged by `surface`'s most
@@ -664,10 +689,16 @@ impl WaylandWebStreamState {
         use std::cell::Cell;
 
         with_states(surface, |states| {
-            let rstate = states.data_map.get::<RendererSurfaceStateUserData>()?.lock().unwrap();
+            let rstate = states
+                .data_map
+                .get::<RendererSurfaceStateUserData>()?
+                .lock()
+                .unwrap();
             let buffer_size = rstate.buffer_size()?;
 
-            let counter_cell = states.data_map.get_or_insert(Cell::<CommitCounter>::default);
+            let counter_cell = states
+                .data_map
+                .get_or_insert(Cell::<CommitCounter>::default);
             let last_seen = counter_cell.get();
             let buffer_damage = rstate.damage_since(Some(last_seen));
             counter_cell.set(rstate.current_commit());
@@ -698,7 +729,8 @@ impl WaylandWebStreamState {
             refresh: 60_000,
         };
 
-        self.output.change_current_state(Some(mode), None, None, None);
+        self.output
+            .change_current_state(Some(mode), None, None, None);
         self.output.set_preferred(mode);
         self.width = width;
         self.height = height;
@@ -775,7 +807,10 @@ impl WaylandWebStreamState {
         // there on why a partial copy is unsafe under frame skipping.)
         self.last_repaint_rects = clips
             .iter()
-            .map(|c| DamageRect { y: c.y0, height: c.y1 - c.y0 })
+            .map(|c| DamageRect {
+                y: c.y0,
+                height: c.y1 - c.y0,
+            })
             .collect();
 
         let window_count = self.space.elements().count();
@@ -791,90 +826,104 @@ impl WaylandWebStreamState {
         // Alpha is irrelevant here -- the buffer only ever feeds the BGRA->
         // YUV420P conversion in the encoder, which doesn't read it.
         for &clip in &clips {
-        clear_region(&mut canvas, self.width, clip);
+            clear_region(&mut canvas, self.width, clip);
 
-        // Render each window
-        for window in self.space.elements() {
-            let location = self.space.element_location(window).unwrap_or((0, 0).into());
-            let window_pos_x = location.x.max(0) as u32;
-            let window_pos_y = location.y.max(0) as u32;
-            
-            // Get the window's surface
-            if let Some(surface) = window.wl_surface() {
-                // Access the surface buffer using renderer surface state
-                // on_commit_buffer_handler stores buffers in RendererSurfaceState, not SurfaceAttributes
-                with_renderer_surface_state(&surface, |state| {
-                    if let Some(buffer) = state.buffer() {
-                        // Buffer derefs to WlBuffer, so we can use it directly with with_buffer_contents
-                        // Access SHM buffer contents
-                        let shm_result = smithay::wayland::shm::with_buffer_contents(
-                            buffer,
-                        |ptr, len, buffer_data| {
-                            let buffer_width = buffer_data.width as u32;
-                            let buffer_height = buffer_data.height as u32;
-                            let buffer_stride = buffer_data.stride as u32;
-                            let buffer_offset = buffer_data.offset as isize;
-                            
-                            if frame_counter.is_multiple_of(120) {
-                                trace!("Rendering buffer: {}x{}", buffer_width, buffer_height);
-                            }
+            // Render each window
+            for window in self.space.elements() {
+                let location = self.space.element_location(window).unwrap_or((0, 0).into());
+                let window_pos_x = location.x.max(0) as u32;
+                let window_pos_y = location.y.max(0) as u32;
 
-                            // Access pixel data safely
-                            let expected_len = (buffer_stride * buffer_height) as usize;
-                            if buffer_offset as usize + expected_len <= len {
-                                // SAFETY: the bounds check above guarantees
-                                // `[offset, offset+expected_len)` lies within the
-                                // mapped SHM pool of `len` bytes, so `ptr+offset`
-                                // is valid for `expected_len` reads for the life
-                                // of this borrow (the pool stays mapped).
-                                let pixel_data = unsafe {
-                                    std::slice::from_raw_parts(ptr.offset(buffer_offset), expected_len)
-                                };
+                // Get the window's surface
+                if let Some(surface) = window.wl_surface() {
+                    // Access the surface buffer using renderer surface state
+                    // on_commit_buffer_handler stores buffers in RendererSurfaceState, not SurfaceAttributes
+                    with_renderer_surface_state(&surface, |state| {
+                        if let Some(buffer) = state.buffer() {
+                            // Buffer derefs to WlBuffer, so we can use it directly with with_buffer_contents
+                            // Access SHM buffer contents
+                            let shm_result = smithay::wayland::shm::with_buffer_contents(
+                                buffer,
+                                |ptr, len, buffer_data| {
+                                    let buffer_width = buffer_data.width as u32;
+                                    let buffer_height = buffer_data.height as u32;
+                                    let buffer_stride = buffer_data.stride as u32;
+                                    let buffer_offset = buffer_data.offset as isize;
 
-                                // Copy the buffer into the output at 1:1 scale (see
-                                // `blit_bgra`). Both SW and GL renderers blit at 1:1 so
-                                // `surface_at` can share one coordinate formula; the
-                                // zero-cleared canvas leaves uncovered pixels black.
-                                blit_bgra(
-                                    &mut canvas,
-                                    self.width,
-                                    self.height,
-                                    window_pos_x,
-                                    window_pos_y,
-                                    pixel_data,
-                                    buffer_width,
-                                    buffer_height,
-                                    buffer_stride,
-                                    clip,
-                                );
+                                    if frame_counter.is_multiple_of(120) {
+                                        trace!(
+                                            "Rendering buffer: {}x{}",
+                                            buffer_width,
+                                            buffer_height
+                                        );
+                                    }
+
+                                    // Access pixel data safely
+                                    let expected_len = (buffer_stride * buffer_height) as usize;
+                                    if buffer_offset as usize + expected_len <= len {
+                                        // SAFETY: the bounds check above guarantees
+                                        // `[offset, offset+expected_len)` lies within the
+                                        // mapped SHM pool of `len` bytes, so `ptr+offset`
+                                        // is valid for `expected_len` reads for the life
+                                        // of this borrow (the pool stays mapped).
+                                        let pixel_data = unsafe {
+                                            std::slice::from_raw_parts(
+                                                ptr.offset(buffer_offset),
+                                                expected_len,
+                                            )
+                                        };
+
+                                        // Copy the buffer into the output at 1:1 scale (see
+                                        // `blit_bgra`). Both SW and GL renderers blit at 1:1 so
+                                        // `surface_at` can share one coordinate formula; the
+                                        // zero-cleared canvas leaves uncovered pixels black.
+                                        blit_bgra(
+                                            &mut canvas,
+                                            self.width,
+                                            self.height,
+                                            window_pos_x,
+                                            window_pos_y,
+                                            pixel_data,
+                                            buffer_width,
+                                            buffer_height,
+                                            buffer_stride,
+                                            clip,
+                                        );
+                                    }
+                                },
+                            );
+
+                            if matches!(
+                                shm_result,
+                                Err(smithay::wayland::shm::BufferAccessError::NotManaged)
+                            ) {
+                                if let Ok(spb) =
+                                    smithay::wayland::single_pixel_buffer::get_single_pixel_buffer(
+                                        buffer,
+                                    )
+                                {
+                                    fill_solid(
+                                        &mut canvas,
+                                        self.width,
+                                        self.height,
+                                        window_pos_x,
+                                        window_pos_y,
+                                        spb.rgba8888(),
+                                        clip,
+                                    );
+                                }
                             }
                         }
-                    );
-
-                        if matches!(shm_result, Err(smithay::wayland::shm::BufferAccessError::NotManaged)) {
-                            if let Ok(spb) = smithay::wayland::single_pixel_buffer::get_single_pixel_buffer(buffer) {
-                                fill_solid(
-                                    &mut canvas,
-                                    self.width,
-                                    self.height,
-                                    window_pos_x,
-                                    window_pos_y,
-                                    spb.rgba8888(),
-                                    clip,
-                                );
-                            }
-                        }
-                    }
-                });
+                    });
+                }
             }
-        }
 
-        // If no windows, show the classic Xorg "root weave" stipple: a 4x4
-        // basket-weave bitmap (X11's default root window pattern before any
-        // window manager or client connects), rendered in black and white.
-        if window_count == 0 {
-            render_root_weave(&mut canvas, self.width, self.height, clip);
-        }
+            // If no windows, show the classic Xorg "root weave" stipple: a 4x4
+            // basket-weave bitmap (X11's default root window pattern before any
+            // window manager or client connects), rendered in black and white.
+            if window_count == 0 {
+                render_root_weave(&mut canvas, self.width, self.height, clip);
+            }
         } // end `for clip in clips`
 
         // Hand the canvas to the encoder, reusing the recycled buffer's
@@ -904,7 +953,10 @@ impl WaylandWebStreamState {
     /// against the literal, possibly-stale buffer bbox, which would make
     /// most of a touch test client's window untouchable, so for hit testing
     /// any point within the output belongs to the topmost window.
-    fn surface_at(&self, location: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+    fn surface_at(
+        &self,
+        location: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
         if location.x < 0.0
             || location.y < 0.0
             || location.x >= self.width as f64
@@ -936,7 +988,9 @@ impl WaylandWebStreamState {
 
     /// Inject a new touch point at the given output-pixel coordinates.
     pub fn touch_down(&mut self, slot: i32, x: f64, y: f64) {
-        let Some(touch) = self.seat.get_touch() else { return };
+        let Some(touch) = self.seat.get_touch() else {
+            return;
+        };
         let location = Point::<f64, Logical>::from((x, y));
         let target = self.surface_at(location);
         tracing::debug!(
@@ -951,7 +1005,9 @@ impl WaylandWebStreamState {
         // pass a zero origin and let `event.location` be the final,
         // already-surface-local coordinate.
         let (focus, event_location) = match target {
-            Some((surface, surface_local)) => (Some((surface, Point::from((0.0, 0.0)))), surface_local),
+            Some((surface, surface_local)) => {
+                (Some((surface, Point::from((0.0, 0.0)))), surface_local)
+            }
             None => (None, location),
         };
         touch.down(
@@ -968,12 +1024,16 @@ impl WaylandWebStreamState {
 
     /// Update the position of an in-progress touch point.
     pub fn touch_motion(&mut self, slot: i32, x: f64, y: f64) {
-        let Some(touch) = self.seat.get_touch() else { return };
+        let Some(touch) = self.seat.get_touch() else {
+            return;
+        };
         let location = Point::<f64, Logical>::from((x, y));
         let target = self.surface_at(location);
         let time = self.clock.now().as_millis();
         let (focus, event_location) = match target {
-            Some((surface, surface_local)) => (Some((surface, Point::from((0.0, 0.0)))), surface_local),
+            Some((surface, surface_local)) => {
+                (Some((surface, Point::from((0.0, 0.0)))), surface_local)
+            }
             None => (None, location),
         };
         touch.motion(
@@ -989,7 +1049,9 @@ impl WaylandWebStreamState {
 
     /// End a touch point (finger lifted).
     pub fn touch_up(&mut self, slot: i32) {
-        let Some(touch) = self.seat.get_touch() else { return };
+        let Some(touch) = self.seat.get_touch() else {
+            return;
+        };
         let time = self.clock.now().as_millis();
         touch.up(
             self,
@@ -1020,7 +1082,9 @@ impl WaylandWebStreamState {
 
     /// Move the pointer to the given output-pixel coordinates.
     pub fn pointer_motion(&mut self, x: f64, y: f64) {
-        let Some(pointer) = self.seat.get_pointer() else { return };
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
         let mut location = Point::<f64, Logical>::from((x, y));
 
         // Honor an active pointer constraint on the focused (topmost) surface: a
@@ -1060,10 +1124,15 @@ impl WaylandWebStreamState {
         }
 
         let target = self.surface_at(location);
-        tracing::debug!("pointer_motion ({x:.1},{y:.1}): surface={}", target.is_some());
+        tracing::debug!(
+            "pointer_motion ({x:.1},{y:.1}): surface={}",
+            target.is_some()
+        );
         let time = self.clock.now().as_millis();
         let (focus, event_location) = match target {
-            Some((surface, surface_local)) => (Some((surface, Point::from((0.0, 0.0)))), surface_local),
+            Some((surface, surface_local)) => {
+                (Some((surface, Point::from((0.0, 0.0)))), surface_local)
+            }
             None => (None, location),
         };
         pointer.motion(
@@ -1079,7 +1148,9 @@ impl WaylandWebStreamState {
 
     /// Press or release a pointer button (Linux button code, e.g. `BTN_LEFT`).
     pub fn pointer_button(&mut self, button: u32, pressed: bool) {
-        let Some(pointer) = self.seat.get_pointer() else { return };
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
         let time = self.clock.now().as_millis();
         pointer.button(
             self,
@@ -1087,14 +1158,20 @@ impl WaylandWebStreamState {
                 serial: SERIAL_COUNTER.next_serial(),
                 time,
                 button,
-                state: if pressed { ButtonState::Pressed } else { ButtonState::Released },
+                state: if pressed {
+                    ButtonState::Pressed
+                } else {
+                    ButtonState::Released
+                },
             },
         );
     }
 
     /// Scroll by the given amount (wheel or trackpad delta, in surface-local pixels).
     pub fn pointer_axis(&mut self, delta_x: f64, delta_y: f64) {
-        let Some(pointer) = self.seat.get_pointer() else { return };
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
         let time = self.clock.now().as_millis();
         // `Continuous` rather than `Wheel`: the browser can't tell us whether
         // the delta came from a touchpad or a notched wheel, and tagging it
@@ -1127,7 +1204,9 @@ impl WaylandWebStreamState {
     /// lock is on -- so focus is already established by the absolute motion that
     /// preceded the lock.
     pub fn pointer_relative_motion(&mut self, dx: f64, dy: f64) {
-        let Some(pointer) = self.seat.get_pointer() else { return };
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
         let utime = self.clock.now().as_micros();
         let focus = self
             .space
@@ -1166,7 +1245,9 @@ impl WaylandWebStreamState {
     }
 
     fn refresh_pointer_lock(&mut self) -> bool {
-        let Some(pointer) = self.seat.get_pointer() else { return false };
+        let Some(pointer) = self.seat.get_pointer() else {
+            return false;
+        };
         let Some(surface) = self
             .space
             .elements()
@@ -1229,13 +1310,19 @@ impl WaylandWebStreamState {
 
     /// Press or release a key (Linux evdev keycode, e.g. `KEY_A`).
     pub fn key(&mut self, keycode: u32, pressed: bool) {
-        let Some(keyboard) = self.seat.get_keyboard() else { return };
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
         let time = self.clock.now().as_millis();
         // xkbcommon's `Keycode` uses XKB/X11 numbering, which is evdev + 8.
         keyboard.input::<(), _>(
             self,
             smithay::input::keyboard::Keycode::new(keycode + 8),
-            if pressed { KeyState::Pressed } else { KeyState::Released },
+            if pressed {
+                KeyState::Pressed
+            } else {
+                KeyState::Released
+            },
             SERIAL_COUNTER.next_serial(),
             time,
             |_, _, _| FilterResult::Forward,
@@ -1248,8 +1335,15 @@ impl WaylandWebStreamState {
     /// window at a time, so there's no separate focus-follows-click policy
     /// to track.
     fn update_keyboard_focus(&mut self) {
-        let Some(keyboard) = self.seat.get_keyboard() else { return };
-        let surface = self.space.elements().last().and_then(|w| w.wl_surface()).map(|s| s.into_owned());
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        let surface = self
+            .space
+            .elements()
+            .last()
+            .and_then(|w| w.wl_surface())
+            .map(|s| s.into_owned());
         let serial = SERIAL_COUNTER.next_serial();
         keyboard.set_focus(self, surface, serial);
         // Focus moved to a different topmost window -> its title/app_id is now
@@ -1294,9 +1388,7 @@ impl WaylandWebStreamState {
     /// any changed since the last call (`favicon` is raw top-down RGBA
     /// `(w, h, bytes)`). `None` when unchanged. The main loop pushes the result
     /// onto the app-metadata watch channel (see `ServerMessage::Title`/`Favicon`).
-    pub fn take_app_meta_pending(
-        &mut self,
-    ) -> Option<(String, String, Option<(u32, u32, Vec<u8>)>)> {
+    pub fn take_app_meta_pending(&mut self) -> Option<AppMeta> {
         if self.app_meta_dirty {
             self.app_meta_dirty = false;
             Some((
@@ -1449,32 +1541,41 @@ impl WaylandWebStreamState {
                 data.format,
                 wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888
             );
-            if !is_bgra { return; }
+            if !is_bgra {
+                return;
+            }
 
             let expected = (stride * h) as usize;
-            if (offset as usize).saturating_add(expected) > len { return; }
+            if (offset as usize).saturating_add(expected) > len {
+                return;
+            }
 
             // SAFETY: the (saturating) bounds check above guarantees
             // `[offset, offset+expected)` lies within the mapped SHM pool of
             // `len` bytes, so this read is in-bounds for the borrow's life.
-            let pixels = unsafe {
-                std::slice::from_raw_parts(ptr.offset(offset), expected)
-            };
+            let pixels = unsafe { std::slice::from_raw_parts(ptr.offset(offset), expected) };
             let mut rgba = vec![0u8; (w * h * 4) as usize];
             for y in 0..h {
                 for x in 0..w {
                     let src = (y * stride + x * 4) as usize;
                     let dst = (y * w + x) as usize * 4;
-                    rgba[dst]     = pixels[src + 2];
+                    rgba[dst] = pixels[src + 2];
                     rgba[dst + 1] = pixels[src + 1];
                     rgba[dst + 2] = pixels[src];
-                    rgba[dst + 3] = if data.format == wl_shm::Format::Xrgb8888 { 255 } else { pixels[src + 3] };
+                    rgba[dst + 3] = if data.format == wl_shm::Format::Xrgb8888 {
+                        255
+                    } else {
+                        pixels[src + 3]
+                    };
                 }
             }
             result = Some((w, h, rgba));
         });
 
-        if matches!(shm_result, Err(smithay::wayland::shm::BufferAccessError::NotManaged)) {
+        if matches!(
+            shm_result,
+            Err(smithay::wayland::shm::BufferAccessError::NotManaged)
+        ) {
             // SHM failed — try dmabuf (GPU clients back surfaces with dmabuf).
             if let Ok(dmabuf) = get_dmabuf(buffer) {
                 result = Self::read_buffer_rgba_dmabuf(dmabuf, renderer);
@@ -1528,7 +1629,7 @@ impl WaylandWebStreamState {
                             for x in 0..w {
                                 let src = (y * stride + x * 4) as usize;
                                 let dst = (y * w + x) as usize * 4;
-                                rgba[dst]     = pixels[src + 2];
+                                rgba[dst] = pixels[src + 2];
                                 rgba[dst + 1] = pixels[src + 1];
                                 rgba[dst + 2] = pixels[src];
                                 rgba[dst + 3] = if is_xrgb { 255 } else { pixels[src + 3] };
@@ -1568,7 +1669,9 @@ impl WaylandWebStreamState {
         // (external GL textures from OES_EGL_image_external cannot).
         match rend.can_read_texture(&texture) {
             Ok(false) | Err(_) => {
-                debug!("read_buffer_rgba_dmabuf: texture not readable (likely external OES texture)");
+                debug!(
+                    "read_buffer_rgba_dmabuf: texture not readable (likely external OES texture)"
+                );
                 return None;
             }
             Ok(true) => {}
@@ -1618,7 +1721,12 @@ impl WaylandWebStreamState {
         let time = self.clock.now();
 
         for window in self.space.elements() {
-            window.send_frame(&self.output, time, Some(std::time::Duration::ZERO), |_, _| None);
+            window.send_frame(
+                &self.output,
+                time,
+                Some(std::time::Duration::ZERO),
+                |_, _| None,
+            );
         }
     }
 }
@@ -1644,7 +1752,7 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
     }
-    
+
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         debug!("New toplevel surface created");
 
@@ -1665,17 +1773,26 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
         self.add_damage(full_damage);
         self.update_keyboard_focus();
 
-        debug!("Window mapped to space. Total windows: {}", self.space.elements().count());
+        debug!(
+            "Window mapped to space. Total windows: {}",
+            self.space.elements().count()
+        );
     }
-    
-    fn new_popup(&mut self, _surface: smithay::wayland::shell::xdg::PopupSurface, _positioner: smithay::wayland::shell::xdg::PositionerState) {
+
+    fn new_popup(
+        &mut self,
+        _surface: smithay::wayland::shell::xdg::PopupSurface,
+        _positioner: smithay::wayland::shell::xdg::PositionerState,
+    ) {
         debug!("New popup surface created");
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         self.kicked_toplevels.remove(&surface.wl_surface().id());
 
-        let window = self.space.elements()
+        let window = self
+            .space
+            .elements()
             .find(|w| w.toplevel() == Some(&surface))
             .cloned();
 
@@ -1686,9 +1803,12 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
             self.update_keyboard_focus();
         }
 
-        debug!("Window unmapped from space. Total windows: {}", self.space.elements().count());
+        debug!(
+            "Window unmapped from space. Total windows: {}",
+            self.space.elements().count()
+        );
     }
-    
+
     fn title_changed(&mut self, _surface: ToplevelSurface) {
         // `refresh_app_meta` only reads the topmost window, so a title change on
         // a background window is a no-op; no need to filter on `_surface` here.
@@ -1699,11 +1819,21 @@ impl smithay::wayland::shell::xdg::XdgShellHandler for WaylandWebStreamState {
         self.refresh_app_meta();
     }
 
-    fn grab(&mut self, _surface: smithay::wayland::shell::xdg::PopupSurface, _seat: wl_seat::WlSeat, _serial: smithay::utils::Serial) {
+    fn grab(
+        &mut self,
+        _surface: smithay::wayland::shell::xdg::PopupSurface,
+        _seat: wl_seat::WlSeat,
+        _serial: smithay::utils::Serial,
+    ) {
         // Handle popup grabs
     }
-    
-    fn reposition_request(&mut self, _surface: smithay::wayland::shell::xdg::PopupSurface, _positioner: smithay::wayland::shell::xdg::PositionerState, _token: u32) {
+
+    fn reposition_request(
+        &mut self,
+        _surface: smithay::wayland::shell::xdg::PopupSurface,
+        _positioner: smithay::wayland::shell::xdg::PositionerState,
+        _token: u32,
+    ) {
         // Handle reposition requests
     }
 }
@@ -1713,11 +1843,14 @@ impl smithay::wayland::compositor::CompositorHandler for WaylandWebStreamState {
     fn compositor_state(&mut self) -> &mut SmithayCompositorState {
         &mut self.compositor_state
     }
-    
-    fn client_compositor_state<'a>(&self, client: &'a smithay::reexports::wayland_server::Client) -> &'a CompositorClientState {
+
+    fn client_compositor_state<'a>(
+        &self,
+        client: &'a smithay::reexports::wayland_server::Client,
+    ) -> &'a CompositorClientState {
         client.get_data::<ClientState>().unwrap().compositor_state()
     }
-    
+
     fn commit(&mut self, surface: &WlSurface) {
         // Handle surface commits - apply pending state
         use smithay::backend::renderer::utils::on_commit_buffer_handler;
@@ -1813,7 +1946,10 @@ impl ShmHandler for WaylandWebStreamState {
 
 // Buffer handler
 impl BufferHandler for WaylandWebStreamState {
-    fn buffer_destroyed(&mut self, _buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer) {
+    fn buffer_destroyed(
+        &mut self,
+        _buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
+    ) {
         // Handle buffer destruction
     }
 }
@@ -1827,10 +1963,17 @@ impl OutputHandler for WaylandWebStreamState {}
 // when `dmabuf_renderer` is actually `Some`.
 impl DmabufHandler for WaylandWebStreamState {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
-        self.dmabuf_state.as_mut().expect("dmabuf_imported fired without a registered global")
+        self.dmabuf_state
+            .as_mut()
+            .expect("dmabuf_imported fired without a registered global")
     }
 
-    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        dmabuf: Dmabuf,
+        notifier: ImportNotifier,
+    ) {
         debug!(
             "dmabuf_imported called: format={:?} num_planes={} size={:?}",
             dmabuf.format(),
@@ -1859,15 +2002,15 @@ impl smithay::input::SeatHandler for WaylandWebStreamState {
     type KeyboardFocus = WlSurface;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
-    
+
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seat_state
     }
-    
+
     fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {
         // Handle focus changes
     }
-    
+
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         debug!("cursor_image: {:?}", image);
         match image {
@@ -1877,7 +2020,8 @@ impl smithay::input::SeatHandler for WaylandWebStreamState {
             }
             CursorImageStatus::Named(icon) => {
                 self.cursor_surface = None;
-                self.cursor_pending = Some(CursorPending::Named(cursor_icon_to_css(icon).to_owned()));
+                self.cursor_pending =
+                    Some(CursorPending::Named(cursor_icon_to_css(icon).to_owned()));
             }
             CursorImageStatus::Surface(wl_surface) => {
                 let hotspot = with_states(&wl_surface, |states| {
@@ -2054,7 +2198,12 @@ mod render_tests {
         // pixel (2,2). Only that pixel should change; the rest stays zero.
         let mut dst = vec![0u8; 4 * 4 * 4];
         let src = vec![0xCCu8; 4 * 4 * 4];
-        let clip = Clip { x0: 2, y0: 2, x1: 3, y1: 3 };
+        let clip = Clip {
+            x0: 2,
+            y0: 2,
+            x1: 3,
+            y1: 3,
+        };
         blit_bgra(&mut dst, 4, 4, 0, 0, &src, 4, 4, 16, clip);
         let inside = ((2 * 4) + 2) * 4; // pixel (2,2)
         assert_eq!(&dst[inside..inside + 4], &[0xCC, 0xCC, 0xCC, 0xCC]);
@@ -2068,7 +2217,16 @@ mod render_tests {
     #[test]
     fn clear_region_zeroes_only_the_clip() {
         let mut dst = vec![0xFFu8; 4 * 4 * 4];
-        clear_region(&mut dst, 4, Clip { x0: 1, y0: 1, x1: 3, y1: 3 });
+        clear_region(
+            &mut dst,
+            4,
+            Clip {
+                x0: 1,
+                y0: 1,
+                x1: 3,
+                y1: 3,
+            },
+        );
         // 2x2 cleared region = 4 pixels = 16 bytes zeroed.
         assert_eq!(dst.iter().filter(|&&b| b == 0).count(), 16);
         let inside = (4 + 1) * 4; // pixel (1,1) in a 4-wide buffer: (1*4 + 1)*4
@@ -2118,7 +2276,11 @@ mod render_tests {
         let mut set = Vec::new();
         accumulate_damage(&mut set, a, full);
         accumulate_damage(&mut set, a, full);
-        assert_eq!(set, vec![a], "an identical rect should not be tracked twice");
+        assert_eq!(
+            set,
+            vec![a],
+            "an identical rect should not be tracked twice"
+        );
     }
 
     #[test]
@@ -2127,7 +2289,11 @@ mod render_tests {
         let mut set = Vec::new();
         accumulate_damage(&mut set, rect(10, 10, 20, 20), full);
         accumulate_damage(&mut set, full, full);
-        assert_eq!(set, vec![full], "a full-output rect collapses the set to itself");
+        assert_eq!(
+            set,
+            vec![full],
+            "a full-output rect collapses the set to itself"
+        );
         // Further adds are no-ops while fully damaged.
         accumulate_damage(&mut set, rect(5, 5, 5, 5), full);
         assert_eq!(set, vec![full]);
@@ -2153,10 +2319,7 @@ mod render_tests {
 #[cfg(test)]
 mod cursor_tests {
     use super::*;
-    use smithay::backend::allocator::{
-        dmabuf::DmabufFlags,
-        Modifier,
-    };
+    use smithay::backend::allocator::{dmabuf::DmabufFlags, Modifier};
     use smithay::utils::{Buffer as BufSpace, Physical, Size};
     use std::io::Write;
     use std::os::unix::io::OwnedFd;
@@ -2182,10 +2345,10 @@ mod cursor_tests {
     fn sw_cursor_bgra_to_rgba_conversion() {
         // 2×2 ARGB8888 LE in memory = [B, G, R, A] per pixel.
         let bgra: [[u8; 4]; 4] = [
-            [255,   0,   0, 255], // blue pixel  → RGBA [  0,  0,255,255]
-            [  0, 255,   0, 255], // green pixel → RGBA [  0,255,  0,255]
-            [  0,   0, 255, 255], // red pixel   → RGBA [255,  0,  0,255]
-            [255, 255,   0, 128], // cyan+alpha  → RGBA [  0,255,255,128]
+            [255, 0, 0, 255],   // blue pixel  → RGBA [  0,  0,255,255]
+            [0, 255, 0, 255],   // green pixel → RGBA [  0,255,  0,255]
+            [0, 0, 255, 255],   // red pixel   → RGBA [255,  0,  0,255]
+            [255, 255, 0, 128], // cyan+alpha  → RGBA [  0,255,255,128]
         ];
         let dmabuf = make_linear_dmabuf(2, 2, Fourcc::Argb8888, &bgra);
 
@@ -2194,10 +2357,14 @@ mod cursor_tests {
 
         assert_eq!((width, height), (2, 2));
         assert_eq!(rgba.len(), 16);
-        assert_eq!(&rgba[0..4],   &[  0,   0, 255, 255], "pixel 0: blue   BGRA→RGBA");
-        assert_eq!(&rgba[4..8],   &[  0, 255,   0, 255], "pixel 1: green  BGRA→RGBA");
-        assert_eq!(&rgba[8..12],  &[255,   0,   0, 255], "pixel 2: red    BGRA→RGBA");
-        assert_eq!(&rgba[12..16], &[  0, 255, 255, 128], "pixel 3: cyan   BGRA→RGBA");
+        assert_eq!(&rgba[0..4], &[0, 0, 255, 255], "pixel 0: blue   BGRA→RGBA");
+        assert_eq!(&rgba[4..8], &[0, 255, 0, 255], "pixel 1: green  BGRA→RGBA");
+        assert_eq!(&rgba[8..12], &[255, 0, 0, 255], "pixel 2: red    BGRA→RGBA");
+        assert_eq!(
+            &rgba[12..16],
+            &[0, 255, 255, 128],
+            "pixel 3: cyan   BGRA→RGBA"
+        );
     }
 
     #[test]
@@ -2206,14 +2373,21 @@ mod cursor_tests {
         let bgra: [[u8; 4]; 1] = [[100, 150, 200, 42]]; // A=42 in buffer
         let dmabuf = make_linear_dmabuf(1, 1, Fourcc::Xrgb8888, &bgra);
 
-        let (_, _, rgba) = WaylandWebStreamState::read_buffer_rgba_dmabuf(&dmabuf, None)
-            .expect("Some");
-        assert_eq!(rgba[3], 255, "Xrgb8888 must produce alpha=255 regardless of buffer byte");
+        let (_, _, rgba) =
+            WaylandWebStreamState::read_buffer_rgba_dmabuf(&dmabuf, None).expect("Some");
+        assert_eq!(
+            rgba[3], 255,
+            "Xrgb8888 must produce alpha=255 regardless of buffer byte"
+        );
     }
 
     /// Opens the first available DRM render node or returns `None`.
     fn open_drm_render_node() -> Option<std::fs::File> {
-        for path in ["/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/renderD130"] {
+        for path in [
+            "/dev/dri/renderD128",
+            "/dev/dri/renderD129",
+            "/dev/dri/renderD130",
+        ] {
             if let Ok(f) = std::fs::File::options().read(true).write(true).open(path) {
                 return Some(f);
             }
@@ -2240,7 +2414,10 @@ mod cursor_tests {
 
         macro_rules! skip {
             ($msg:literal, $e:expr) => {{
-                eprintln!(concat!("hw_cursor_gl_readback: ", $msg, " ({e}), skipping"), e = $e);
+                eprintln!(
+                    concat!("hw_cursor_gl_readback: ", $msg, " ({e}), skipping"),
+                    e = $e
+                );
                 return;
             }};
             ($msg:literal) => {{
@@ -2252,29 +2429,39 @@ mod cursor_tests {
         // ── prerequisites ──────────────────────────────────────────────────
         let drm_file = match open_drm_render_node() {
             Some(f) => f,
-            None => { skip!("no DRM render node found") }
+            None => {
+                skip!("no DRM render node found")
+            }
         };
         let drm_for_egl = drm_file.try_clone().unwrap();
         let gbm = match GbmDevice::new(drm_file) {
             Ok(d) => d,
-            Err(e) => { skip!("GBM init failed", e) }
+            Err(e) => {
+                skip!("GBM init failed", e)
+            }
         };
         let egl_gbm = GbmDevice::new(drm_for_egl).unwrap();
         // SAFETY: `egl_gbm` is a fresh GBM device owned exclusively by this test;
         // smithay tracks EGLDisplays by native-display identity internally.
         let display = match unsafe { EGLDisplay::new(egl_gbm) } {
             Ok(d) => d,
-            Err(e) => { skip!("EGL display failed", e) }
+            Err(e) => {
+                skip!("EGL display failed", e)
+            }
         };
         let ctx = match EGLContext::new(&display) {
             Ok(c) => c,
-            Err(e) => { skip!("EGL context failed", e) }
+            Err(e) => {
+                skip!("EGL context failed", e)
+            }
         };
         // SAFETY: `ctx` was just created above and is not current on any other
         // thread, which is what GlesRenderer::new requires.
         let renderer = match unsafe { GlesRenderer::new(ctx) } {
             Ok(r) => r,
-            Err(e) => { skip!("GlesRenderer init failed", e) }
+            Err(e) => {
+                skip!("GlesRenderer init failed", e)
+            }
         };
 
         // ── allocate a cursor-sized dmabuf (driver picks modifier) ─────────
@@ -2282,11 +2469,15 @@ mod cursor_tests {
         let mut gbm_alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
         let gbm_buf = match gbm_alloc.create_buffer(w, h, Fourcc::Argb8888, &[Modifier::Invalid]) {
             Ok(b) => b,
-            Err(e) => { skip!("GBM alloc failed", e) }
+            Err(e) => {
+                skip!("GBM alloc failed", e)
+            }
         };
         let mut dmabuf = match gbm_buf.export() {
             Ok(d) => d,
-            Err(e) => { skip!("dmabuf export failed", e) }
+            Err(e) => {
+                skip!("dmabuf export failed", e)
+            }
         };
 
         // ── fill the dmabuf with solid red via GL clear ────────────────────
@@ -2295,23 +2486,25 @@ mod cursor_tests {
             let mut rend = renderer_rc.borrow_mut();
             let mut target = match rend.bind(&mut dmabuf) {
                 Ok(t) => t,
-                Err(e) => { skip!("bind failed", e) }
+                Err(e) => {
+                    skip!("bind failed", e)
+                }
             };
             let output_size = Size::<i32, Physical>::from((w as i32, h as i32));
-            let mut frame = rend.render(&mut target, output_size, Transform::Normal)
+            let mut frame = rend
+                .render(&mut target, output_size, Transform::Normal)
                 .expect("render");
-            frame.clear(
-                Color32F::new(1.0, 0.0, 0.0, 1.0),
-                &[Rectangle::from_size(output_size)],
-            ).expect("clear");
+            frame
+                .clear(
+                    Color32F::new(1.0, 0.0, 0.0, 1.0),
+                    &[Rectangle::from_size(output_size)],
+                )
+                .expect("clear");
             let _ = frame.finish().expect("finish");
         }
 
         // ── read pixels back via read_buffer_rgba_dmabuf ───────────────────
-        let result = WaylandWebStreamState::read_buffer_rgba_dmabuf(
-            &dmabuf,
-            Some(&renderer_rc),
-        );
+        let result = WaylandWebStreamState::read_buffer_rgba_dmabuf(&dmabuf, Some(&renderer_rc));
 
         match result {
             Some((width, height, rgba)) => {
@@ -2320,8 +2513,8 @@ mod cursor_tests {
                 // GL clear to red should yield RGBA ≈ [255, 0, 0, 255] per pixel.
                 for (i, pixel) in rgba.chunks_exact(4).enumerate() {
                     assert!(pixel[0] > 200, "pixel {i}: R={} expected ≈255", pixel[0]);
-                    assert!(pixel[1] < 50,  "pixel {i}: G={} expected ≈0",   pixel[1]);
-                    assert!(pixel[2] < 50,  "pixel {i}: B={} expected ≈0",   pixel[2]);
+                    assert!(pixel[1] < 50, "pixel {i}: G={} expected ≈0", pixel[1]);
+                    assert!(pixel[2] < 50, "pixel {i}: B={} expected ≈0", pixel[2]);
                     assert!(pixel[3] > 200, "pixel {i}: A={} expected ≈255", pixel[3]);
                 }
                 eprintln!("hw_cursor_gl_readback: GL readback succeeded on {w}×{h} dmabuf");

@@ -185,7 +185,11 @@ mod tests {
     use smithay::reexports::calloop::EventLoop;
     use smithay::reexports::wayland_server::Display;
 
-    fn test_compositor_state() -> (EventLoop<'static, CompositorState>, Display<CompositorState>, CompositorState) {
+    fn test_compositor_state() -> (
+        EventLoop<'static, CompositorState>,
+        Display<CompositorState>,
+        CompositorState,
+    ) {
         let mut event_loop: EventLoop<CompositorState> =
             EventLoop::try_new().expect("failed to create event loop");
         let mut display: Display<CompositorState> =
@@ -213,13 +217,28 @@ mod tests {
     #[test]
     fn test_down_and_up() {
         let (_event_loop, _display, mut comp_state) = test_compositor_state();
-        handle_event(KeyboardEvent::Down { code: "KeyA".into() }, &mut comp_state);
-        handle_event(KeyboardEvent::Up { code: "KeyA".into() }, &mut comp_state);
+        handle_event(
+            KeyboardEvent::Down {
+                code: "KeyA".into(),
+            },
+            &mut comp_state,
+        );
+        handle_event(
+            KeyboardEvent::Up {
+                code: "KeyA".into(),
+            },
+            &mut comp_state,
+        );
     }
 
     #[test]
     fn test_unknown_code_does_not_panic() {
         let (_event_loop, _display, mut comp_state) = test_compositor_state();
-        handle_event(KeyboardEvent::Down { code: "NotARealKey".into() }, &mut comp_state);
+        handle_event(
+            KeyboardEvent::Down {
+                code: "NotARealKey".into(),
+            },
+            &mut comp_state,
+        );
     }
 }

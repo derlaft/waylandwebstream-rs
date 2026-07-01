@@ -115,7 +115,10 @@ impl MouseHandler {
         match event {
             MouseEvent::Down { pointer } => {
                 let (x, y) = self.to_compositor_coords(pointer.x, pointer.y);
-                debug!("Pointer down at ({:.1}, {:.1}) button={}", x, y, pointer.button);
+                debug!(
+                    "Pointer down at ({:.1}, {:.1}) button={}",
+                    x, y, pointer.button
+                );
                 state.pointer_motion(x, y);
                 match linux_button_code(pointer.button) {
                     Some(button) => state.pointer_button(button, true),
@@ -130,7 +133,10 @@ impl MouseHandler {
             }
             MouseEvent::Up { pointer } => {
                 let (x, y) = self.to_compositor_coords(pointer.x, pointer.y);
-                debug!("Pointer up at ({:.1}, {:.1}) button={}", x, y, pointer.button);
+                debug!(
+                    "Pointer up at ({:.1}, {:.1}) button={}",
+                    x, y, pointer.button
+                );
                 state.pointer_motion(x, y);
                 match linux_button_code(pointer.button) {
                     Some(button) => state.pointer_button(button, false),
@@ -144,7 +150,12 @@ impl MouseHandler {
                 // client never sends this while a button is held (see
                 // client.html), so there's nothing to reconcile here.
             }
-            MouseEvent::Wheel { x, y, delta_x, delta_y } => {
+            MouseEvent::Wheel {
+                x,
+                y,
+                delta_x,
+                delta_y,
+            } => {
                 let (cx, cy) = self.to_compositor_coords(x, y);
                 state.pointer_motion(cx, cy);
                 state.pointer_axis(delta_x, delta_y);
@@ -164,7 +175,11 @@ mod tests {
     use smithay::reexports::calloop::EventLoop;
     use smithay::reexports::wayland_server::Display;
 
-    fn test_compositor_state() -> (EventLoop<'static, CompositorState>, Display<CompositorState>, CompositorState) {
+    fn test_compositor_state() -> (
+        EventLoop<'static, CompositorState>,
+        Display<CompositorState>,
+        CompositorState,
+    ) {
         let mut event_loop: EventLoop<CompositorState> =
             EventLoop::try_new().expect("failed to create event loop");
         let mut display: Display<CompositorState> =
@@ -214,19 +229,37 @@ mod tests {
 
         handler.handle_event(
             MouseEvent::Down {
-                pointer: PointerPoint { x: 0.5, y: 0.5, button: 0, pointer_type: "mouse".into(), pressure: 0.5 },
+                pointer: PointerPoint {
+                    x: 0.5,
+                    y: 0.5,
+                    button: 0,
+                    pointer_type: "mouse".into(),
+                    pressure: 0.5,
+                },
             },
             &mut comp_state,
         );
         handler.handle_event(
             MouseEvent::Move {
-                pointer: PointerPoint { x: 0.6, y: 0.5, button: 0, pointer_type: "mouse".into(), pressure: 0.5 },
+                pointer: PointerPoint {
+                    x: 0.6,
+                    y: 0.5,
+                    button: 0,
+                    pointer_type: "mouse".into(),
+                    pressure: 0.5,
+                },
             },
             &mut comp_state,
         );
         handler.handle_event(
             MouseEvent::Up {
-                pointer: PointerPoint { x: 0.6, y: 0.5, button: 0, pointer_type: "mouse".into(), pressure: 0.5 },
+                pointer: PointerPoint {
+                    x: 0.6,
+                    y: 0.5,
+                    button: 0,
+                    pointer_type: "mouse".into(),
+                    pressure: 0.5,
+                },
             },
             &mut comp_state,
         );
@@ -238,7 +271,12 @@ mod tests {
         let mut handler = MouseHandler::new(1920, 1080);
 
         handler.handle_event(
-            MouseEvent::Wheel { x: 0.5, y: 0.5, delta_x: 0.0, delta_y: 12.0 },
+            MouseEvent::Wheel {
+                x: 0.5,
+                y: 0.5,
+                delta_x: 0.0,
+                delta_y: 12.0,
+            },
             &mut comp_state,
         );
     }

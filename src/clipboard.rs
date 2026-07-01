@@ -230,7 +230,9 @@ fn socket_path(display: &str) -> anyhow::Result<PathBuf> {
     // hardcoded /run/user/1000 was wrong for any other UID), so fail loudly
     // rather than probe a guessed path. run()'s caller logs the error as a warn.
     let dir = std::env::var("XDG_RUNTIME_DIR").map_err(|_| {
-        anyhow::anyhow!("XDG_RUNTIME_DIR not set; cannot locate nested compositor socket '{display}'")
+        anyhow::anyhow!(
+            "XDG_RUNTIME_DIR not set; cannot locate nested compositor socket '{display}'"
+        )
     })?;
     Ok(PathBuf::from(dir).join(display))
 }
@@ -332,7 +334,10 @@ impl ClipState {
             ClipboardData::Image { mime, bytes } => (bytes, vec![mime]),
         };
         if bytes.len() > MAX_CLIPBOARD_BYTES {
-            warn!("clipboard: device payload too large ({} bytes), dropping", bytes.len());
+            warn!(
+                "clipboard: device payload too large ({} bytes), dropping",
+                bytes.len()
+            );
             return;
         }
         if self.last_value.as_deref() == Some(bytes.as_slice()) {
@@ -349,7 +354,10 @@ impl ClipState {
         self.owning = true;
         self.last_value = Some(bytes);
         let _ = self.conn.flush();
-        debug!("clipboard: set nested selection ({} bytes)", self.serve_bytes.len());
+        debug!(
+            "clipboard: set nested selection ({} bytes)",
+            self.serve_bytes.len()
+        );
     }
 
     /// remote -> device: read the offered selection (image preferred, else
@@ -384,13 +392,18 @@ impl ClipState {
             return;
         }
         if buf.len() > MAX_CLIPBOARD_BYTES {
-            warn!("clipboard: nested selection too large (> {MAX_CLIPBOARD_BYTES} bytes), dropping");
+            warn!(
+                "clipboard: nested selection too large (> {MAX_CLIPBOARD_BYTES} bytes), dropping"
+            );
             return;
         }
         if self.last_value.as_deref() == Some(buf.as_slice()) {
             return; // unchanged / our own value coming back
         }
-        debug!("clipboard: nested selection -> device ({} bytes, {mime})", buf.len());
+        debug!(
+            "clipboard: nested selection -> device ({} bytes, {mime})",
+            buf.len()
+        );
         self.last_value = Some(buf.clone());
         let data = if is_image {
             ClipboardData::Image { mime, bytes: buf }
@@ -451,7 +464,15 @@ impl Dispatch<WlRegistry, GlobalListContents> for ClipState {
     }
 }
 impl Dispatch<WlSeat, ()> for ClipState {
-    fn event(_: &mut Self, _: &WlSeat, _: <WlSeat as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &WlSeat,
+        _: <WlSeat as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<ExtDataControlManagerV1, ()> for ClipState {
     fn event(

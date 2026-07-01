@@ -51,11 +51,7 @@ RUN cd web && npm ci && npm run build
 FROM base AS build
 COPY . .
 COPY --from=web /src/web/dist web/dist
-# NOTE: --locked is intentionally omitted -- the committed Cargo.lock is stale
-# (a dep was dropped from Cargo.toml without regenerating the lock), so --locked
-# fails. Regenerate Cargo.lock and re-add --locked when tightening for
-# reproducible builds (plan M5).
-RUN cargo build --release -p waylandwebstream
+RUN cargo build --release --locked -p waylandwebstream
 
 ########################## test: lint + tiered tests #######################
 # A separate branch from build; `docker build --target test` fails if any
@@ -69,19 +65,23 @@ COPY --from=web /src/web /src/web
 ENV XDG_RUNTIME_DIR=/tmp/xdg
 RUN mkdir -p /tmp/xdg && chmod 700 /tmp/xdg
 
-# Lints are report-only for now (|| true). TODO: make blocking once the tree is
-# rustfmt-clean and the existing clippy lints are fixed.
-RUN cargo fmt --all -- --check || echo "WARNING: tree is not rustfmt-clean (run 'cargo fmt --all')"
-RUN cargo clippy --workspace --all-targets -- -D warnings || echo "WARNING: clippy reported warnings"
+# Formatting is blocking for the shipped crate (rustfmt-clean); the diagnostic
+# crates are not gated.
+RUN cargo fmt -p waylandwebstream -- --check
+
+# clippy is strict (blocking) for the shipped crate; the diagnostic crates
+# (native-client, wayland-test-client) are linted report-only for now.
+RUN cargo clippy --locked -p waylandwebstream --all-targets -- -D warnings
+RUN cargo clippy --locked --workspace --all-targets -- -D warnings \
+    || echo "WARNING: clippy reported warnings in the diagnostic crates (non-blocking)"
 
 # Web typecheck + unit tests (blocking).
 RUN cd web && npm run check && npm test
 
-# Rust test tiers (blocking). adaptive_bitrate_test is excluded -- it is stale
-# (calls the removed BitrateAlgorithm::on_congestion) and does not compile.
-RUN cargo test --lib --bins
-RUN cargo test --test latency_websocket_test
-RUN cargo test --test render_pixels_test
+# Rust test tiers (blocking).
+RUN cargo test --locked --lib --bins
+RUN cargo test --locked --test adaptive_bitrate_test --test latency_websocket_test
+RUN cargo test --locked --test render_pixels_test
 
 ########################## package: build the .deb #########################
 FROM build AS package

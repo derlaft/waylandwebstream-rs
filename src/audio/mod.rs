@@ -153,8 +153,7 @@ fn run_capture_loop(audio_tx: broadcast::Sender<AudioPacket>) -> Result<()> {
                     }
                     Err(e) => warn!("Opus encode error: {e}"),
                 }
-                state.pts_us +=
-                    (OPUS_FRAME_SAMPLES as u64 * 1_000_000) / SAMPLE_RATE as u64;
+                state.pts_us += (OPUS_FRAME_SAMPLES as u64 * 1_000_000) / SAMPLE_RATE as u64;
             }
         })
         .register()
@@ -168,16 +167,14 @@ fn run_capture_loop(audio_tx: broadcast::Sender<AudioPacket>) -> Result<()> {
 
     let obj = Object {
         type_: SpaTypes::ObjectParamFormat.as_raw(),
-        id:    ParamType::EnumFormat.as_raw(),
+        id: ParamType::EnumFormat.as_raw(),
         properties: audio_info.into(),
     };
-    let values: Vec<u8> = PodSerializer::serialize(
-        std::io::Cursor::new(Vec::new()),
-        &Value::Object(obj),
-    )
-    .context("Failed to serialize audio format pod")?
-    .0
-    .into_inner();
+    let values: Vec<u8> =
+        PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
+            .context("Failed to serialize audio format pod")?
+            .0
+            .into_inner();
 
     let mut params = [Pod::from_bytes(&values).expect("audio format pod is well-formed")];
 

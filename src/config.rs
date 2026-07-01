@@ -173,10 +173,19 @@ mod tests {
     #[test]
     fn sanitize_resolution_clamps_to_max_and_rounds_even() {
         // Oversized request is clamped to max; odd max rounds down to even.
-        assert_eq!(sanitize_resolution((9999, 9999), (1920, 1080)), Some((1920, 1080)));
-        assert_eq!(sanitize_resolution((3841, 2161), (3840, 2160)), Some((3840, 2160)));
+        assert_eq!(
+            sanitize_resolution((9999, 9999), (1920, 1080)),
+            Some((1920, 1080))
+        );
+        assert_eq!(
+            sanitize_resolution((3841, 2161), (3840, 2160)),
+            Some((3840, 2160))
+        );
         // Within bounds but odd → rounded down.
-        assert_eq!(sanitize_resolution((1281, 721), (3840, 2160)), Some((1280, 720)));
+        assert_eq!(
+            sanitize_resolution((1281, 721), (3840, 2160)),
+            Some((1280, 720))
+        );
         // Below the 16×16 floor → rejected.
         assert_eq!(sanitize_resolution((8, 8), (3840, 2160)), None);
         // A tiny max can itself force the result below the floor → rejected.
@@ -186,12 +195,16 @@ mod tests {
     #[test]
     fn trailing_command_with_hyphenated_args_is_captured_verbatim() {
         let config = Config::parse_from([
-            "waylandwebstream", "--port", "9999", "--", "foot", "-e", "--some-flag", "value",
+            "waylandwebstream",
+            "--port",
+            "9999",
+            "--",
+            "foot",
+            "-e",
+            "--some-flag",
+            "value",
         ]);
         assert_eq!(config.port, 9999);
-        assert_eq!(
-            config.command,
-            vec!["foot", "-e", "--some-flag", "value"]
-        );
+        assert_eq!(config.command, vec!["foot", "-e", "--some-flag", "value"]);
     }
 }

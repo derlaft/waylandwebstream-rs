@@ -60,7 +60,9 @@ fn test_cursor_surface_reaches_browser() {
 
     assert!(output.status.success(), "Cursor capture script failed");
     assert!(
-        stdout.lines().any(|l| l.starts_with("RESULT cursor_set=true")),
+        stdout
+            .lines()
+            .any(|l| l.starts_with("RESULT cursor_set=true")),
         "Cursor capture did not print the expected RESULT line",
     );
 

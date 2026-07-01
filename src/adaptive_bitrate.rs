@@ -382,7 +382,11 @@ impl AdaptiveBitrateController {
     /// finer target and a later tick will cross the band. Decreases and the
     /// ceiling always pass through.
     async fn maybe_apply(&mut self, new_rate: usize) {
-        if !should_actuate(new_rate, self.last_applied_bitrate, self.algo.config.max_bitrate) {
+        if !should_actuate(
+            new_rate,
+            self.last_applied_bitrate,
+            self.algo.config.max_bitrate,
+        ) {
             debug!(
                 "Adaptive bitrate: target {} bps within coalescing band of applied {} bps; deferring rebuild",
                 new_rate, self.last_applied_bitrate

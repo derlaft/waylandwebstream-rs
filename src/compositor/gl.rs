@@ -7,9 +7,7 @@ use smithay::{
             Allocator, Fourcc, Modifier,
         },
         egl::{EGLContext, EGLDisplay},
-        renderer::{
-            damage::OutputDamageTracker, gles::GlesRenderer, Bind, Color32F, ExportMem,
-        },
+        renderer::{damage::OutputDamageTracker, gles::GlesRenderer, Bind, Color32F, ExportMem},
     },
     desktop::space::space_render_elements,
     utils::{Buffer as BufferCoord, Rectangle},
@@ -21,8 +19,8 @@ use std::rc::Rc;
 
 use crate::encoder::{CapturedFrame, RawFrame};
 
-use super::Compositor;
 use super::state::WaylandWebStreamState;
+use super::Compositor;
 
 /// GPU compositor (AGENTS.md): renders the
 /// `Space` with smithay's `GlesRenderer` into an offscreen GBM/dmabuf target
@@ -109,10 +107,12 @@ impl GlCompositor {
         // identity internally.
         let display = unsafe { EGLDisplay::new(egl_gbm_device) }
             .context("failed to create EGLDisplay from GBM device")?;
-        let context = EGLContext::new(&display).context("failed to create configless EGLContext")?;
+        let context =
+            EGLContext::new(&display).context("failed to create configless EGLContext")?;
         // SAFETY: this context was just created above and is not current on
         // any other thread.
-        let renderer = unsafe { GlesRenderer::new(context) }.context("failed to create GlesRenderer")?;
+        let renderer =
+            unsafe { GlesRenderer::new(context) }.context("failed to create GlesRenderer")?;
 
         let gbm = GbmAllocator::new(gbm_device, GbmBufferFlags::RENDERING);
 
@@ -157,7 +157,9 @@ impl GlCompositor {
                     .gbm
                     .create_buffer(width, height, Fourcc::Argb8888, &[Modifier::Invalid])
                     .context("failed to allocate GBM render target")?;
-                let dmabuf = buffer.export().context("failed to export GBM buffer as a dmabuf")?;
+                let dmabuf = buffer
+                    .export()
+                    .context("failed to export GBM buffer as a dmabuf")?;
                 targets.push(dmabuf);
             }
             self.sized = Some(SizedState {
@@ -202,7 +204,10 @@ impl GlCompositor {
         let capture_instant = std::time::Instant::now();
 
         self.ensure_sized((width, height))?;
-        let sized = self.sized.as_mut().expect("ensure_sized just initialized this");
+        let sized = self
+            .sized
+            .as_mut()
+            .expect("ensure_sized just initialized this");
         let target_idx = sized.next_target;
         sized.next_target = (sized.next_target + 1) % sized.targets.len();
         let target = &mut sized.targets[target_idx];
@@ -235,7 +240,10 @@ impl GlCompositor {
         // readback serializes naturally), but waiting unconditionally costs
         // nothing extra in this fully-synchronous render loop and removes
         // any doubt for either path.
-        render_result.sync.wait().context("waiting on the GL render fence failed")?;
+        render_result
+            .sync
+            .wait()
+            .context("waiting on the GL render fence failed")?;
 
         if let Some(dmabuf) = dmabuf_for_gpu {
             return Ok(CapturedFrame::Gpu {

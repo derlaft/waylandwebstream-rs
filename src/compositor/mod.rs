@@ -18,7 +18,11 @@ use state::WaylandWebStreamState;
 /// with smithay's `GlesRenderer` instead, reading the result back to the CPU
 /// -- zero-copy GPU encode (no CPU round-trip) is a later stage.
 pub trait Compositor {
-    fn render(&mut self, state: &mut WaylandWebStreamState, reuse: Option<Vec<u8>>) -> Option<CapturedFrame>;
+    fn render(
+        &mut self,
+        state: &mut WaylandWebStreamState,
+        reuse: Option<Vec<u8>>,
+    ) -> Option<CapturedFrame>;
 }
 
 /// Software compositor -- today's only `Compositor` implementation. Wraps
@@ -28,7 +32,11 @@ pub trait Compositor {
 pub struct SwCompositor;
 
 impl Compositor for SwCompositor {
-    fn render(&mut self, state: &mut WaylandWebStreamState, reuse: Option<Vec<u8>>) -> Option<CapturedFrame> {
+    fn render(
+        &mut self,
+        state: &mut WaylandWebStreamState,
+        reuse: Option<Vec<u8>>,
+    ) -> Option<CapturedFrame> {
         let (width, height) = (state.width, state.height);
         state.render(reuse).map(|data| {
             CapturedFrame::Cpu(RawFrame {

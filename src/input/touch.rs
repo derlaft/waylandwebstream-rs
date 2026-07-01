@@ -149,13 +149,15 @@ impl TouchHandler {
                 // dropped some identifiers (e.g., contacts whose coordinates went
                 // off-screen before the cancel fired), so the list can be
                 // incomplete.
-                debug!("Touch cancel: clearing {} active touches", self.active_touches.len());
+                debug!(
+                    "Touch cancel: clearing {} active touches",
+                    self.active_touches.len()
+                );
                 self.active_touches.clear();
                 state.touch_cancel();
             }
         }
     }
-
 }
 
 #[cfg(test)]
@@ -183,7 +185,11 @@ mod tests {
     /// Builds a real `CompositorState` (event loop + display + Smithay
     /// seat/space) so tests can drive `handle_event` exactly as `main.rs`
     /// does, rather than just exercising coordinate math.
-    fn test_compositor_state() -> (EventLoop<'static, CompositorState>, Display<CompositorState>, CompositorState) {
+    fn test_compositor_state() -> (
+        EventLoop<'static, CompositorState>,
+        Display<CompositorState>,
+        CompositorState,
+    ) {
         let mut event_loop: EventLoop<CompositorState> =
             EventLoop::try_new().expect("failed to create event loop");
         let mut display: Display<CompositorState> =
@@ -203,17 +209,17 @@ mod tests {
     #[test]
     fn test_coordinate_mapping() {
         let handler = TouchHandler::new(1920, 1080);
-        
+
         // Test center of screen
         let (x, y) = handler.to_compositor_coords(0.5, 0.5);
         assert_eq!(x, 960.0);
         assert_eq!(y, 540.0);
-        
+
         // Test top-left corner
         let (x, y) = handler.to_compositor_coords(0.0, 0.0);
         assert_eq!(x, 0.0);
         assert_eq!(y, 0.0);
-        
+
         // Test bottom-right corner
         let (x, y) = handler.to_compositor_coords(1.0, 1.0);
         assert_eq!(x, 1920.0);
@@ -323,12 +329,12 @@ mod tests {
     #[test]
     fn test_dimension_update() {
         let mut handler = TouchHandler::new(1920, 1080);
-        
+
         // Update dimensions
         handler.set_dimensions(3840, 2160);
         assert_eq!(handler.width, 3840);
         assert_eq!(handler.height, 2160);
-        
+
         // Test coordinate mapping with new dimensions
         let (x, y) = handler.to_compositor_coords(0.5, 0.5);
         assert_eq!(x, 1920.0);
@@ -348,8 +354,18 @@ mod tests {
         handler.handle_event(
             TouchEvent::Start {
                 touches: vec![
-                    TouchPoint { identifier: 0, x: 0.3, y: 0.3, pressure: 0.5 },
-                    TouchPoint { identifier: 1, x: 0.7, y: 0.7, pressure: 0.5 },
+                    TouchPoint {
+                        identifier: 0,
+                        x: 0.3,
+                        y: 0.3,
+                        pressure: 0.5,
+                    },
+                    TouchPoint {
+                        identifier: 1,
+                        x: 0.7,
+                        y: 0.7,
+                        pressure: 0.5,
+                    },
                 ],
             },
             &mut comp_state,

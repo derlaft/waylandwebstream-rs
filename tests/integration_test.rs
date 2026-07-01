@@ -1,7 +1,7 @@
-use std::process::{Command, Child, Stdio};
-use std::time::Duration;
-use std::thread;
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 mod common;
 
@@ -18,7 +18,7 @@ fn test_compositor_pipeline() {
         .args(["build", "--release", "--workspace"])
         .status()
         .expect("Failed to build compositor");
-    
+
     assert!(build_status.success(), "Compositor build failed");
 
     let display_name = common::unique_display_name("wayland-test");
@@ -50,23 +50,23 @@ fn test_compositor_pipeline() {
         // Connect a stream client and capture a frame
         println!("Connecting stream client...");
         let screenshot_path = capture_stream_frame(port);
-        
+
         // Validate the screenshot
         println!("Validating screenshot...");
         validate_screenshot(&screenshot_path);
-        
+
         // Cleanup client (kill, then reap so it doesn't linger as a zombie)
         let _ = client.kill();
         let _ = client.wait();
 
         println!("Test passed!");
     }));
-    
+
     // Always cleanup compositor
     println!("Cleaning up compositor...");
     let _ = compositor.kill();
     let _ = compositor.wait();
-    
+
     // Re-panic if the test failed
     if let Err(e) = test_result {
         std::panic::resume_unwind(e);
@@ -122,7 +122,9 @@ fn capture_stream_frame(port: u16) -> PathBuf {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .expect("Failed to run stream capture script - ensure Node.js and dependencies are installed");
+        .expect(
+            "Failed to run stream capture script - ensure Node.js and dependencies are installed",
+        );
 
     assert!(status.success(), "Stream capture failed");
     assert!(screenshot_path.exists(), "Screenshot was not created");
@@ -139,7 +141,7 @@ fn validate_screenshot(screenshot_path: &PathBuf) {
         .stderr(Stdio::inherit())
         .status()
         .expect("Failed to run screenshot validation");
-    
+
     assert!(status.success(), "Screenshot validation failed");
 }
 
@@ -165,14 +167,18 @@ fn test_compositor_startup() {
         let socket_path = format!("/run/user/{}/{display_name}", users::get_current_uid());
         let socket_exists = std::path::Path::new(&socket_path).exists();
 
-        assert!(socket_exists, "Wayland socket was not created at {}", socket_path);
+        assert!(
+            socket_exists,
+            "Wayland socket was not created at {}",
+            socket_path
+        );
         println!("Test passed!");
     }));
-    
+
     // Always cleanup
     let _ = compositor.kill();
     let _ = compositor.wait();
-    
+
     // Re-panic if the test failed
     if let Err(e) = test_result {
         std::panic::resume_unwind(e);

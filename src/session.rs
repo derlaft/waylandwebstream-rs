@@ -40,7 +40,11 @@ impl SessionManager {
     /// server's own shutdown signal: if the session command exits on its
     /// own (the user closed the app), there's nothing left to stream, so we
     /// tear the whole server down the same way Ctrl+C/SIGTERM would.
-    pub fn new(command: Vec<String>, display_name: String, shutdown_tx: watch::Sender<bool>) -> Self {
+    pub fn new(
+        command: Vec<String>,
+        display_name: String,
+        shutdown_tx: watch::Sender<bool>,
+    ) -> Self {
         let (nested_display_tx, _) = watch::channel(None);
         Self {
             inner: Arc::new(Inner {
@@ -75,7 +79,10 @@ impl SessionManager {
 
         let program = &self.inner.command[0];
         let args = &self.inner.command[1..];
-        info!("First connection established, starting session command: {} {:?}", program, args);
+        info!(
+            "First connection established, starting session command: {} {:?}",
+            program, args
+        );
 
         // Snapshot the currently *live* wayland sockets so we can spot the new
         // one the session's nested compositor creates (see
@@ -129,7 +136,10 @@ impl SessionManager {
                 });
             }
             Err(e) => {
-                warn!("Failed to start session command {:?}: {}", self.inner.command, e);
+                warn!(
+                    "Failed to start session command {:?}: {}",
+                    self.inner.command, e
+                );
                 self.inner.started.store(false, Ordering::SeqCst);
             }
         }

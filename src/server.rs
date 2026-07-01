@@ -554,7 +554,10 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
         let meta = app_meta_rx.borrow().clone();
         if send_unified_control(
             &mut sender,
-            &ServerMessage::Title { title: meta.title.clone(), app_id: meta.app_id.clone() },
+            &ServerMessage::Title {
+                title: meta.title.clone(),
+                app_id: meta.app_id.clone(),
+            },
         )
         .await
         .is_err()
@@ -563,13 +566,17 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
         }
         // Favicon only when present: a default (no icon) needs no message,
         // keeping the initial control burst minimal.
-        if meta.favicon.is_some() {
-            if send_unified_control(&mut sender, &ServerMessage::Favicon { favicon: meta.favicon.clone() })
-                .await
-                .is_err()
-            {
-                return;
-            }
+        if meta.favicon.is_some()
+            && send_unified_control(
+                &mut sender,
+                &ServerMessage::Favicon {
+                    favicon: meta.favicon.clone(),
+                },
+            )
+            .await
+            .is_err()
+        {
+            return;
         }
         last_app_meta = meta;
     }
@@ -599,7 +606,11 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
     // Force a keyframe so a new client has a decodable frame to start from,
     // rather than waiting for the next damage or GOP-cycle keyframe.
     state.force_render.store(true, Ordering::Relaxed);
-    if let Err(e) = state.encoder_control_tx.send(EncoderControl::ForceKeyframe).await {
+    if let Err(e) = state
+        .encoder_control_tx
+        .send(EncoderControl::ForceKeyframe)
+        .await
+    {
         warn!("Failed to request keyframe for new unified client: {}", e);
     }
 
@@ -686,8 +697,8 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
             changed = app_meta_rx.changed() => {
                 if changed.is_err() { continue; }
                 let meta = app_meta_rx.borrow().clone();
-                if meta.title != last_app_meta.title || meta.app_id != last_app_meta.app_id {
-                    if send_unified_control(
+                if (meta.title != last_app_meta.title || meta.app_id != last_app_meta.app_id)
+                    && send_unified_control(
                         &mut sender,
                         &ServerMessage::Title { title: meta.title.clone(), app_id: meta.app_id.clone() },
                     )
@@ -696,15 +707,13 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
                     {
                         break;
                     }
-                }
-                if meta.favicon != last_app_meta.favicon {
-                    if send_unified_control(&mut sender, &ServerMessage::Favicon { favicon: meta.favicon.clone() })
+                if meta.favicon != last_app_meta.favicon
+                    && send_unified_control(&mut sender, &ServerMessage::Favicon { favicon: meta.favicon.clone() })
                         .await
                         .is_err()
                     {
                         break;
                     }
-                }
                 last_app_meta = meta;
             }
             changed = pointer_lock_rx.changed() => {
@@ -769,7 +778,10 @@ async fn unified_client_handler(socket: WebSocket, state: SignalingState) {
     // phantom active-touch entries from a session that closed mid-gesture.
     // wl_touch.cancel is a global reset -- the empty-list form clears all
     // active contacts, matching what TouchHandler::handle_event(Cancel) does.
-    let _ = state.touch_tx.send(TouchEvent::Cancel { touches: vec![] }).await;
+    let _ = state
+        .touch_tx
+        .send(TouchEvent::Cancel { touches: vec![] })
+        .await;
 }
 
 /// Wire layout for a unified `MSG_VIDEO_FRAME` payload (after the 8-byte
@@ -841,7 +853,9 @@ async fn send_unified_control(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     msg: &ServerMessage,
 ) -> Result<(), axum::Error> {
-    sender.send(Message::Binary(encode_unified_control(msg))).await
+    sender
+        .send(Message::Binary(encode_unified_control(msg)))
+        .await
 }
 
 /// Sends a remote->device clipboard value: text rides the JSON control channel,
@@ -877,7 +891,10 @@ fn parse_client_clipboard_image(data: &[u8]) -> Option<ClipboardData> {
     }
     let payload = data.get(proto::HEADER_LEN..proto::HEADER_LEN + payload_len as usize)?;
     if payload.len() > MAX_CLIPBOARD_BYTES {
-        warn!("Clipboard image (device->remote) too large ({} bytes), dropping", payload.len());
+        warn!(
+            "Clipboard image (device->remote) too large ({} bytes), dropping",
+            payload.len()
+        );
         return None;
     }
     let (mime, bytes) = proto::parse_clipboard_image_payload(payload)?;
@@ -892,9 +909,7 @@ fn parse_client_message(data: &[u8]) -> Result<SignalingMessage, ()> {
     if data.len() < proto::HEADER_LEN {
         return Err(());
     }
-    let header: [u8; proto::HEADER_LEN] = data[..proto::HEADER_LEN]
-        .try_into()
-        .map_err(|_| ())?;
+    let header: [u8; proto::HEADER_LEN] = data[..proto::HEADER_LEN].try_into().map_err(|_| ())?;
     let (msg_type, _flags, payload_len) = proto::decode_header(&header);
     if msg_type != proto::MSG_CLIENT_MSG {
         return Err(());
@@ -928,8 +943,15 @@ async fn dispatch_signaling_message(signal: SignalingMessage, state: &SignalingS
         SignalingMessage::Ready => {
             debug!("Client is ready");
         }
-        SignalingMessage::Resize { width, height, scale } => {
-            info!("Received resize request from client: {}x{} scale={}", width, height, scale);
+        SignalingMessage::Resize {
+            width,
+            height,
+            scale,
+        } => {
+            info!(
+                "Received resize request from client: {}x{} scale={}",
+                width, height, scale
+            );
             let _ = state.resize_tx.send((width, height, scale)).await;
             state.wake_input_loop();
         }
@@ -1037,9 +1059,7 @@ async fn dispatch_signaling_message(signal: SignalingMessage, state: &SignalingS
             // Only decode latency throttles bitrate growth here --
             // network/RTT delays aren't evidence the encoder's
             // rate is too high (see adaptive_bitrate.rs).
-            if let (Some(ref bitrate_event_tx), Some(ms)) =
-                (&state.bitrate_event_tx, decoding_ms)
-            {
+            if let (Some(ref bitrate_event_tx), Some(ms)) = (&state.bitrate_event_tx, decoding_ms) {
                 let _ = bitrate_event_tx.send(BitrateEvent::Latency(ms)).await;
             }
             // Bursty arrival *may* be network-level congestion (a batch of
@@ -1079,9 +1099,9 @@ async fn dispatch_signaling_message(signal: SignalingMessage, state: &SignalingS
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::AudioPacket;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
-    use crate::audio::AudioPacket;
 
     async fn ws_handshake(addr: &str, path: &str) -> TcpStream {
         let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -1105,7 +1125,11 @@ mod tests {
             }
         }
         let headers = String::from_utf8_lossy(&buf);
-        assert!(headers.starts_with("HTTP/1.1 101"), "handshake failed: {}", headers);
+        assert!(
+            headers.starts_with("HTTP/1.1 101"),
+            "handshake failed: {}",
+            headers
+        );
         stream
     }
 
@@ -1204,7 +1228,10 @@ mod tests {
 
         let addr = "127.0.0.1:27348";
         tokio::spawn(async move {
-            server.serve("127.0.0.1", 27348, std::future::pending()).await.unwrap();
+            server
+                .serve("127.0.0.1", 27348, std::future::pending())
+                .await
+                .unwrap();
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1234,7 +1261,10 @@ mod tests {
 
         let addr = "127.0.0.1:27349";
         tokio::spawn(async move {
-            server.serve("127.0.0.1", 27349, std::future::pending()).await.unwrap();
+            server
+                .serve("127.0.0.1", 27349, std::future::pending())
+                .await
+                .unwrap();
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1267,7 +1297,10 @@ mod tests {
 
         let addr = "127.0.0.1:27360";
         tokio::spawn(async move {
-            server.serve("127.0.0.1", 27360, std::future::pending()).await.unwrap();
+            server
+                .serve("127.0.0.1", 27360, std::future::pending())
+                .await
+                .unwrap();
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1333,7 +1366,10 @@ mod tests {
 
         let addr = "127.0.0.1:27350";
         tokio::spawn(async move {
-            server.serve("127.0.0.1", 27350, std::future::pending()).await.unwrap();
+            server
+                .serve("127.0.0.1", 27350, std::future::pending())
+                .await
+                .unwrap();
         });
 
         // Drain the four initial CONTROL frames before sending the
@@ -1350,7 +1386,10 @@ mod tests {
             "connecting to /client should force a render"
         );
         assert!(
-            matches!(encoder_control_rx.try_recv(), Ok(EncoderControl::ForceKeyframe)),
+            matches!(
+                encoder_control_rx.try_recv(),
+                Ok(EncoderControl::ForceKeyframe)
+            ),
             "connecting to /client should request a fresh keyframe"
         );
 
@@ -1366,11 +1405,9 @@ mod tests {
             }
         }
 
-        assert!(
-            video_tx
-                .send(Arc::new(test_packet(vec![0xAA, 0xBB, 0xCC], true, 42)))
-                .is_ok()
-        );
+        assert!(video_tx
+            .send(Arc::new(test_packet(vec![0xAA, 0xBB, 0xCC], true, 42)))
+            .is_ok());
 
         let payload = read_ws_binary_frame(&mut stream).await;
         let (msg_type, flags, payload_len) = parse_unified_header(&payload);
@@ -1519,8 +1556,7 @@ mod tests {
         let (allocs, framed) = alloc_counter::delta_with(|| {
             let framed = encode_unified_video_frame(&packet);
             assert_eq!(framed.len(), proto::HEADER_LEN + 20 + 8192);
-            let header: [u8; proto::HEADER_LEN] =
-                framed[..proto::HEADER_LEN].try_into().unwrap();
+            let header: [u8; proto::HEADER_LEN] = framed[..proto::HEADER_LEN].try_into().unwrap();
             let (msg_type, flags, payload_len) = proto::decode_header(&header);
             assert_eq!(msg_type, proto::MSG_VIDEO_FRAME);
             assert_ne!(flags & proto::FLAG_KEYFRAME, 0);
@@ -1546,8 +1582,7 @@ mod tests {
         let allocs = alloc_counter::delta(|| {
             let framed = encode_unified_audio_frame(packet);
             assert_eq!(framed.len(), proto::HEADER_LEN + 8 + 201);
-            let header: [u8; proto::HEADER_LEN] =
-                framed[..proto::HEADER_LEN].try_into().unwrap();
+            let header: [u8; proto::HEADER_LEN] = framed[..proto::HEADER_LEN].try_into().unwrap();
             let (msg_type, _flags, payload_len) = proto::decode_header(&header);
             assert_eq!(msg_type, proto::MSG_AUDIO_FRAME);
             assert_eq!(payload_len as usize, 8 + 201);
@@ -1598,7 +1633,11 @@ mod tests {
         );
 
         dispatch_signaling_message(
-            SignalingMessage::Resize { width: 800, height: 600, scale: 1.0 },
+            SignalingMessage::Resize {
+                width: 800,
+                height: 600,
+                scale: 1.0,
+            },
             &state,
         )
         .await;
@@ -1687,7 +1726,9 @@ mod tests {
     fn clipboard_messages_round_trip_json() {
         // Client -> server: must carry `"type":"clipboard"` and survive a round
         // trip, including non-ASCII (the whole point over typing emulation).
-        let msg = SignalingMessage::Clipboard { text: "héllo 📋".into() };
+        let msg = SignalingMessage::Clipboard {
+            text: "héllo 📋".into(),
+        };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"clipboard\""), "got {json}");
         match serde_json::from_str::<SignalingMessage>(&json).unwrap() {
@@ -1695,7 +1736,9 @@ mod tests {
             other => panic!("unexpected variant: {other:?}"),
         }
         // Server -> client.
-        let smsg = ServerMessage::Clipboard { text: "back".into() };
+        let smsg = ServerMessage::Clipboard {
+            text: "back".into(),
+        };
         let sjson = serde_json::to_string(&smsg).unwrap();
         assert!(sjson.contains("\"type\":\"clipboard\""), "got {sjson}");
         match serde_json::from_str::<ServerMessage>(&sjson).unwrap() {
@@ -1737,12 +1780,16 @@ mod tests {
         );
 
         dispatch_signaling_message(
-            SignalingMessage::Clipboard { text: "to remote".into() },
+            SignalingMessage::Clipboard {
+                text: "to remote".into(),
+            },
             &state,
         )
         .await;
 
-        let received = clipboard_in_rx.try_recv().expect("clipboard_in_rx should have a value");
+        let received = clipboard_in_rx
+            .try_recv()
+            .expect("clipboard_in_rx should have a value");
         match received {
             ClipboardData::Text(text) => assert_eq!(text, "to remote"),
             ClipboardData::Image { .. } => panic!("expected text"),
@@ -1791,7 +1838,10 @@ mod tests {
 
         let addr = "127.0.0.1:27351";
         tokio::spawn(async move {
-            server.serve("127.0.0.1", 27351, std::future::pending()).await.unwrap();
+            server
+                .serve("127.0.0.1", 27351, std::future::pending())
+                .await
+                .unwrap();
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1804,8 +1854,12 @@ mod tests {
 
         // Build a MSG_CLIENT_MSG binary frame containing a Resize JSON (the
         // same format WsTransport::send() produces).
-        let resize_json =
-            serde_json::to_vec(&SignalingMessage::Resize { width: 1280, height: 720, scale: 2.0 }).unwrap();
+        let resize_json = serde_json::to_vec(&SignalingMessage::Resize {
+            width: 1280,
+            height: 720,
+            scale: 2.0,
+        })
+        .unwrap();
         let frame = proto::encode_msg(proto::MSG_CLIENT_MSG, 0, &resize_json);
 
         // Send a masked WebSocket binary frame (client→server must be masked).
@@ -1825,7 +1879,9 @@ mod tests {
         // Give the server handler a moment to dispatch the message.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let received = resize_rx.try_recv().expect("resize_rx should have received (1280, 720, 2.0)");
+        let received = resize_rx
+            .try_recv()
+            .expect("resize_rx should have received (1280, 720, 2.0)");
         assert_eq!(received, (1280, 720, 2.0));
     }
 }

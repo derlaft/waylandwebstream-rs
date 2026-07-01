@@ -112,7 +112,9 @@ fn start_touch_client(display_name: &str) -> Child {
 /// Parses the `RESULT pressToWhiteMs=<f64> releaseToBlackMs=<f64>` line
 /// `touch_latency_capture.js` prints on success.
 fn parse_result_line(stdout: &str) -> Option<(f64, f64)> {
-    let rest = stdout.lines().find_map(|line| line.strip_prefix("RESULT "))?;
+    let rest = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("RESULT "))?;
 
     let mut press_to_white = None;
     let mut release_to_black = None;

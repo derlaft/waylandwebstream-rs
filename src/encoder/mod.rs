@@ -70,7 +70,9 @@ impl CapturedFrame {
     pub fn capture_instant(&self) -> std::time::Instant {
         match self {
             CapturedFrame::Cpu(frame) => frame.capture_instant,
-            CapturedFrame::Gpu { capture_instant, .. } => *capture_instant,
+            CapturedFrame::Gpu {
+                capture_instant, ..
+            } => *capture_instant,
         }
     }
 }
@@ -162,7 +164,7 @@ impl Default for EncoderConfig {
             height: 720,
             framerate: 30,
             rate_control: RateControl::Bitrate(2_000_000), // 2 Mbps
-            keyframe_interval: 60, // 2 seconds at 30fps
+            keyframe_interval: 60,                         // 2 seconds at 30fps
             encoder_backend: EncoderBackend::X264,
             vaapi_device: "/dev/dri/renderD128".to_string(),
             gpu_frames: false,
@@ -224,7 +226,11 @@ impl EncoderHandle {
 pub fn spawn_encoder(
     config: EncoderConfig,
     codec_tx: watch::Sender<String>,
-) -> Result<(EncoderHandle, BufferReturnReceiver, std::thread::JoinHandle<()>)> {
+) -> Result<(
+    EncoderHandle,
+    BufferReturnReceiver,
+    std::thread::JoinHandle<()>,
+)> {
     // Initialize FFmpeg
     ffmpeg::init().context("Failed to initialize FFmpeg")?;
 
@@ -236,7 +242,15 @@ pub fn spawn_encoder(
 
     // Spawn encoder thread
     let join_handle = std::thread::spawn(move || {
-        if let Err(e) = encoder_thread(config, frame_rx, packet_tx, resize_rx, control_rx, buffer_return_tx, codec_tx) {
+        if let Err(e) = encoder_thread(
+            config,
+            frame_rx,
+            packet_tx,
+            resize_rx,
+            control_rx,
+            buffer_return_tx,
+            codec_tx,
+        ) {
             error!("Encoder thread failed: {}", e);
         }
     });
@@ -313,11 +327,15 @@ struct X264Encoder {
 }
 
 impl X264Encoder {
-    fn new(config: EncoderConfig, buffer_return_tx: std::sync::mpsc::Sender<Vec<u8>>) -> Result<Self> {
+    fn new(
+        config: EncoderConfig,
+        buffer_return_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<Self> {
         let encoder = create_encoder(&config)?;
         let scaler = create_scaler(&config)?;
         let input_frame = create_input_frame(config.width, config.height);
-        let yuv_frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, config.width, config.height);
+        let yuv_frame =
+            ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, config.width, config.height);
         Ok(Self {
             config,
             encoder,
@@ -342,7 +360,9 @@ impl VideoEncoder for X264Encoder {
         let raw_frame = match frame {
             CapturedFrame::Cpu(raw_frame) => raw_frame,
             CapturedFrame::Gpu { .. } => {
-                anyhow::bail!("x264 backend cannot encode a GPU frame; GPU compositing needs --encoder vaapi");
+                anyhow::bail!(
+                    "x264 backend cannot encode a GPU frame; GPU compositing needs --encoder vaapi"
+                );
             }
         };
 
@@ -401,7 +421,10 @@ impl VideoEncoder for X264Encoder {
             warn!("Ignoring bitrate change request: encoder is in constant-quality mode");
             return false;
         }
-        info!("Changing bitrate from {:?} to {} bps", self.config.rate_control, bitrate);
+        info!(
+            "Changing bitrate from {:?} to {} bps",
+            self.config.rate_control, bitrate
+        );
         self.config.rate_control = RateControl::Bitrate(bitrate);
 
         match create_encoder(&self.config) {
@@ -444,8 +467,14 @@ fn build_video_encoder(
     buffer_return_tx: std::sync::mpsc::Sender<Vec<u8>>,
 ) -> Result<Box<dyn VideoEncoder>> {
     match config.encoder_backend {
-        EncoderBackend::X264 => Ok(Box::new(X264Encoder::new(config.clone(), buffer_return_tx)?)),
-        EncoderBackend::Vaapi => Ok(Box::new(vaapi::VaapiEncoder::new(config.clone(), buffer_return_tx)?)),
+        EncoderBackend::X264 => Ok(Box::new(X264Encoder::new(
+            config.clone(),
+            buffer_return_tx,
+        )?)),
+        EncoderBackend::Vaapi => Ok(Box::new(vaapi::VaapiEncoder::new(
+            config.clone(),
+            buffer_return_tx,
+        )?)),
     }
 }
 
@@ -597,7 +626,10 @@ fn encoder_thread(
                 frame_width, frame_height, video_encoder.width(), video_encoder.height()
             );
             if let Err(e) = video_encoder.reinitialize(frame_width, frame_height) {
-                error!("Failed to reinitialize encoder for frame's actual resolution: {}", e);
+                error!(
+                    "Failed to reinitialize encoder for frame's actual resolution: {}",
+                    e
+                );
                 if let CapturedFrame::Cpu(raw_frame) = captured_frame {
                     let _ = buffer_return_tx.send(raw_frame.data);
                 }
@@ -626,10 +658,12 @@ fn encoder_thread(
             force_keyframe = false;
         }
 
-        let capture_to_encode_ms = captured_frame.capture_instant().elapsed().as_secs_f64() * 1000.0;
+        let capture_to_encode_ms =
+            captured_frame.capture_instant().elapsed().as_secs_f64() * 1000.0;
         let encode_start = std::time::Instant::now();
 
-        let encode_result = video_encoder.submit(captured_frame, capture_to_encode_ms, force_this_frame);
+        let encode_result =
+            video_encoder.submit(captured_frame, capture_to_encode_ms, force_this_frame);
 
         let encoding_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
         let encode_complete = std::time::Instant::now();
@@ -717,18 +751,21 @@ pub(crate) fn h264_level_option(level_idc: u8) -> String {
 /// how the level is chosen. Kept in sync with the `profile`/`level` options
 /// `create_encoder` passes to x264.
 pub fn h264_codec_string(width: u32, height: u32, framerate: u32) -> String {
-    format!("avc1.42E0{:02X}", select_h264_level(width, height, framerate))
+    format!(
+        "avc1.42E0{:02X}",
+        select_h264_level(width, height, framerate)
+    )
 }
 
 /// Create FFmpeg encoder context
 fn create_encoder(config: &EncoderConfig) -> Result<ffmpeg::encoder::Video> {
-    let codec = ffmpeg::encoder::find(ffmpeg::codec::Id::H264)
-        .context("H.264 encoder not found")?;
+    let codec =
+        ffmpeg::encoder::find(ffmpeg::codec::Id::H264).context("H.264 encoder not found")?;
 
     let mut encoder = ffmpeg::codec::context::Context::new_with_codec(codec)
         .encoder()
         .video()?;
-    
+
     encoder.set_width(config.width);
     encoder.set_height(config.height);
     encoder.set_format(ffmpeg::format::Pixel::YUV420P);
@@ -740,7 +777,14 @@ fn create_encoder(config: &EncoderConfig) -> Result<ffmpeg::encoder::Video> {
     opts.set("preset", "ultrafast");
     opts.set("tune", "zerolatency");
     opts.set("profile", "baseline");
-    opts.set("level", &h264_level_option(select_h264_level(config.width, config.height, config.framerate)));
+    opts.set(
+        "level",
+        &h264_level_option(select_h264_level(
+            config.width,
+            config.height,
+            config.framerate,
+        )),
+    );
     opts.set("bframes", "0"); // No B-frames for low latency
     opts.set("g", &config.keyframe_interval.to_string()); // GOP size
     opts.set("keyint_min", &config.keyframe_interval.to_string());
@@ -780,8 +824,10 @@ fn create_encoder(config: &EncoderConfig) -> Result<ffmpeg::encoder::Video> {
 
     let encoder = encoder.open_with(opts)?;
 
-    info!("Encoder initialized: {}x{} @ {}fps, {:?}",
-          config.width, config.height, config.framerate, config.rate_control);
+    info!(
+        "Encoder initialized: {}x{} @ {}fps, {:?}",
+        config.width, config.height, config.framerate, config.rate_control
+    );
 
     Ok(encoder)
 }
@@ -879,7 +925,7 @@ fn convert_damaged_rows(
             ];
             ffmpeg::ffi::sws_scale(
                 ctx,
-                src_planes.as_ptr() as *const *const _,
+                src_planes.as_ptr(),
                 src_stride,
                 0,
                 (y1 - y0) as i32,
@@ -943,7 +989,13 @@ fn encode_frame(
     if force_full_convert || force_keyframe || raw_frame.damage.is_empty() {
         scaler.run(input_frame, yuv_frame)?;
     } else {
-        convert_damaged_rows(scaler, input_frame, yuv_frame, &raw_frame.damage, raw_frame.height);
+        convert_damaged_rows(
+            scaler,
+            input_frame,
+            yuv_frame,
+            &raw_frame.damage,
+            raw_frame.height,
+        );
     }
 
     // Set frame properties. Tagging the frame `I` is what actually forces
@@ -1004,7 +1056,9 @@ pub(crate) fn drain_packets(
                     ping_echo_client_ts: None,
                 });
             }
-            Err(ffmpeg::Error::Other { errno: ffmpeg::error::EAGAIN }) => {
+            Err(ffmpeg::Error::Other {
+                errno: ffmpeg::error::EAGAIN,
+            }) => {
                 // No more packets available
                 break;
             }
@@ -1056,7 +1110,11 @@ mod tests {
     fn convert_damaged_rows_only_rewrites_the_damaged_band() {
         ffmpeg::init().unwrap();
         let (w, h) = (64u32, 64u32);
-        let config = EncoderConfig { width: w, height: h, ..Default::default() };
+        let config = EncoderConfig {
+            width: w,
+            height: h,
+            ..Default::default()
+        };
         let mut scaler = create_scaler(&config).unwrap();
         let mut input = create_input_frame(w, h);
         let mut yuv = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, w, h);
@@ -1085,9 +1143,15 @@ mod tests {
             let line = &new_y[off..off + w as usize];
             let base = &baseline_y[off..off + w as usize];
             if (16..32).contains(&row) {
-                assert_ne!(line, base, "damaged row {row} should have been re-converted to blue");
+                assert_ne!(
+                    line, base,
+                    "damaged row {row} should have been re-converted to blue"
+                );
             } else {
-                assert_eq!(line, base, "untouched row {row} must keep the previous frame's YUV");
+                assert_eq!(
+                    line, base,
+                    "untouched row {row} must keep the previous frame's YUV"
+                );
             }
         }
     }
@@ -1129,28 +1193,67 @@ mod tests {
 
         // The first frame of a fresh GOP is always a keyframe -- baseline
         // sanity check, not the thing under test.
-        frame_tx.send(CapturedFrame::Cpu(make_raw_frame(config.width, config.height))).await.unwrap();
+        frame_tx
+            .send(CapturedFrame::Cpu(make_raw_frame(
+                config.width,
+                config.height,
+            )))
+            .await
+            .unwrap();
         let packet = handle.recv_packet().await.expect("expected a packet");
-        assert!(packet.is_keyframe, "first frame of a GOP should be a keyframe");
+        assert!(
+            packet.is_keyframe,
+            "first frame of a GOP should be a keyframe"
+        );
 
         // Ordinary frames with nothing requested should be P-frames.
         for _ in 0..3 {
-            frame_tx.send(CapturedFrame::Cpu(make_raw_frame(config.width, config.height))).await.unwrap();
+            frame_tx
+                .send(CapturedFrame::Cpu(make_raw_frame(
+                    config.width,
+                    config.height,
+                )))
+                .await
+                .unwrap();
             let packet = handle.recv_packet().await.expect("expected a packet");
-            assert!(!packet.is_keyframe, "frame without a keyframe request should not be an IDR");
+            assert!(
+                !packet.is_keyframe,
+                "frame without a keyframe request should not be an IDR"
+            );
         }
 
         // Request a keyframe, then immediately send the next frame with no
         // delay -- exercises the post-`blocking_recv` drain.
-        control_tx.send(EncoderControl::ForceKeyframe).await.unwrap();
-        frame_tx.send(CapturedFrame::Cpu(make_raw_frame(config.width, config.height))).await.unwrap();
+        control_tx
+            .send(EncoderControl::ForceKeyframe)
+            .await
+            .unwrap();
+        frame_tx
+            .send(CapturedFrame::Cpu(make_raw_frame(
+                config.width,
+                config.height,
+            )))
+            .await
+            .unwrap();
         let packet = handle.recv_packet().await.expect("expected a packet");
-        assert!(packet.is_keyframe, "ForceKeyframe should make the next frame an IDR");
+        assert!(
+            packet.is_keyframe,
+            "ForceKeyframe should make the next frame an IDR"
+        );
 
         // The request should not stick beyond that one frame.
-        frame_tx.send(CapturedFrame::Cpu(make_raw_frame(config.width, config.height))).await.unwrap();
+        frame_tx
+            .send(CapturedFrame::Cpu(make_raw_frame(
+                config.width,
+                config.height,
+            )))
+            .await
+            .unwrap();
         let packet = handle.recv_packet().await.expect("expected a packet");
-        assert!(!packet.is_keyframe, "keyframe request should not affect frames after the one it targeted");
+        assert!(
+            !packet.is_keyframe,
+            "keyframe request should not affect frames after the one it targeted"
+        );
     }
 
     /// Regression test for a startup race: a connecting client's viewport
@@ -1184,27 +1287,42 @@ mod tests {
         // Never sent on resize_tx -- the encoder thread only learns about
         // this resolution from the frame's own width/height.
         let (new_width, new_height) = (800, 592);
-        frame_tx.send(CapturedFrame::Cpu(make_raw_frame(new_width, new_height))).await.unwrap();
+        frame_tx
+            .send(CapturedFrame::Cpu(make_raw_frame(new_width, new_height)))
+            .await
+            .unwrap();
 
         let packet = tokio::time::timeout(std::time::Duration::from_secs(5), handle.recv_packet())
             .await
             .expect("encoder should not hang on a mismatched frame size")
             .expect("expected a packet");
-        assert!(packet.is_keyframe, "reinitializing for the new size should reset the GOP");
+        assert!(
+            packet.is_keyframe,
+            "reinitializing for the new size should reset the GOP"
+        );
 
         // codec_tx should reflect the new resolution.
         codec_rx.changed().await.unwrap();
         let codec = codec_rx.borrow().clone();
-        assert!(!codec.is_empty(), "codec string should be updated for the new resolution");
+        assert!(
+            !codec.is_empty(),
+            "codec string should be updated for the new resolution"
+        );
 
         // A second frame at the same (new) size should encode normally, with
         // no further reinitialization needed.
-        frame_tx.send(CapturedFrame::Cpu(make_raw_frame(new_width, new_height))).await.unwrap();
+        frame_tx
+            .send(CapturedFrame::Cpu(make_raw_frame(new_width, new_height)))
+            .await
+            .unwrap();
         let packet = tokio::time::timeout(std::time::Duration::from_secs(5), handle.recv_packet())
             .await
             .expect("follow-up frame at the same size should encode without hanging")
             .expect("expected a packet");
-        assert!(!packet.is_keyframe, "frame after the reinit should not force another IDR");
+        assert!(
+            !packet.is_keyframe,
+            "frame after the reinit should not force another IDR"
+        );
     }
 
     /// Drain-to-newest: when several frames have queued up behind the one the
@@ -1218,7 +1336,8 @@ mod tests {
 
         // Queue three frames, tagged by width so the newest is identifiable.
         for w in [10u32, 20, 30] {
-            tx.try_send(CapturedFrame::Cpu(make_raw_frame(w, 1))).unwrap();
+            tx.try_send(CapturedFrame::Cpu(make_raw_frame(w, 1)))
+                .unwrap();
         }
 
         // The first pull mirrors the encoder loop's blocking_recv.
@@ -1226,7 +1345,11 @@ mod tests {
         let (newest, skipped) = skip_to_newest_frame(first, &mut rx, &ret_tx);
 
         assert_eq!(skipped, 2, "two older frames should be skipped");
-        assert_eq!(newest.dimensions(), (30, 1), "the newest frame should be kept");
+        assert_eq!(
+            newest.dimensions(),
+            (30, 1),
+            "the newest frame should be kept"
+        );
         assert_eq!(
             ret_rx.try_iter().count(),
             2,
@@ -1241,12 +1364,17 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<CapturedFrame>(4);
         let (ret_tx, ret_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
-        tx.try_send(CapturedFrame::Cpu(make_raw_frame(42, 1))).unwrap();
+        tx.try_send(CapturedFrame::Cpu(make_raw_frame(42, 1)))
+            .unwrap();
         let first = rx.try_recv().unwrap();
         let (newest, skipped) = skip_to_newest_frame(first, &mut rx, &ret_tx);
 
         assert_eq!(skipped, 0);
         assert_eq!(newest.dimensions(), (42, 1));
-        assert_eq!(ret_rx.try_iter().count(), 0, "nothing skipped, nothing returned");
+        assert_eq!(
+            ret_rx.try_iter().count(),
+            0,
+            "nothing skipped, nothing returned"
+        );
     }
 }

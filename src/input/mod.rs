@@ -1,6 +1,6 @@
-pub mod touch;
-pub mod mouse;
 pub mod keyboard;
+pub mod mouse;
+pub mod touch;
 
 /// Clamp a normalized browser coordinate into the documented `[0.0, 1.0]`
 /// range. Browser input is untrusted: a buggy or malicious client can send

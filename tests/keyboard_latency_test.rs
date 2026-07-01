@@ -113,7 +113,9 @@ fn start_keyboard_client(display_name: &str) -> Child {
 /// Parses the `RESULT downToWhiteMs=<f64> upToBlackMs=<f64>` line
 /// `keyboard_latency_capture.js` prints on success.
 fn parse_result_line(stdout: &str) -> Option<(f64, f64)> {
-    let rest = stdout.lines().find_map(|line| line.strip_prefix("RESULT "))?;
+    let rest = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("RESULT "))?;
 
     let mut down_to_white = None;
     let mut up_to_black = None;

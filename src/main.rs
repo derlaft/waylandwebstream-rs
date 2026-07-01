@@ -6,14 +6,11 @@
 use anyhow::{Context, Result};
 use base64::prelude::*;
 use clap::Parser;
-use smithay::reexports::{
-    calloop::EventLoop,
-    wayland_server::Display,
-};
+use smithay::reexports::{calloop::EventLoop, wayland_server::Display};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 mod adaptive_bitrate;
@@ -30,10 +27,10 @@ mod session;
 mod web;
 
 use adaptive_bitrate::{AdaptiveBitrateConfig, AdaptiveBitrateController, BitrateEvent};
-use compositor::{Compositor, CompositorState, GlCompositor, SwCompositor};
 use compositor::state::CursorPending;
+use compositor::{Compositor, CompositorState, GlCompositor, SwCompositor};
 use config::{CompositorBackendArg, EncoderBackendArg};
-use encoder::{EncoderBackend, EncoderConfig, EncoderControl, RateControl, spawn_encoder};
+use encoder::{spawn_encoder, EncoderBackend, EncoderConfig, EncoderControl, RateControl};
 use input::mouse::MouseHandler;
 use input::touch::TouchHandler;
 use server::{CursorUpdate, SignalingServer, SignalingState};
@@ -45,15 +42,19 @@ fn cursor_pending_to_update(pending: CursorPending) -> CursorUpdate {
     match pending {
         CursorPending::Hidden => CursorUpdate::Hidden,
         CursorPending::Named(name) => CursorUpdate::Named { name },
-        CursorPending::Surface { width, height, hotspot_x, hotspot_y, rgba } => {
-            CursorUpdate::Surface {
-                width,
-                height,
-                hotspot_x,
-                hotspot_y,
-                rgba: BASE64_STANDARD.encode(rgba),
-            }
-        }
+        CursorPending::Surface {
+            width,
+            height,
+            hotspot_x,
+            hotspot_y,
+            rgba,
+        } => CursorUpdate::Surface {
+            width,
+            height,
+            hotspot_x,
+            hotspot_y,
+            rgba: BASE64_STANDARD.encode(rgba),
+        },
     }
 }
 
@@ -120,41 +121,34 @@ async fn main() -> Result<()> {
         .context("Failed to parse --max-resolution")?;
 
     // Create Wayland display and event loop
-    let mut event_loop: EventLoop<CompositorState> = EventLoop::try_new()
-        .context("Failed to create event loop")?;
+    let mut event_loop: EventLoop<CompositorState> =
+        EventLoop::try_new().context("Failed to create event loop")?;
 
-    let mut display: Display<CompositorState> = Display::new()
-        .context("Failed to create Wayland display")?;
+    let mut display: Display<CompositorState> =
+        Display::new().context("Failed to create Wayland display")?;
 
     // Initialize compositor state
-    let mut state = CompositorState::new(
-        &mut event_loop,
-        &mut display,
-        width,
-        height,
-    );
+    let mut state = CompositorState::new(&mut event_loop, &mut display, width, height);
 
     // Set up Wayland socket using Smithay's helper
-    let socket_source = smithay::wayland::socket::ListeningSocketSource::with_name(&config.display_name)
-        .context("Failed to create Wayland listening socket")?;
+    let socket_source =
+        smithay::wayland::socket::ListeningSocketSource::with_name(&config.display_name)
+            .context("Failed to create Wayland listening socket")?;
 
     let mut display_handle = display.handle();
     event_loop
         .handle()
-        .insert_source(
-            socket_source,
-            move |client_stream, _, _state| {
-                // Accept new clients with proper client state
-                let client_state = compositor::state::ClientState {
-                    compositor_state: smithay::wayland::compositor::CompositorClientState::default(),
-                };
-                if let Err(e) = display_handle.insert_client(client_stream, Arc::new(client_state)) {
-                    warn!("Failed to insert client: {}", e);
-                } else {
-                    info!("New client connected");
-                }
+        .insert_source(socket_source, move |client_stream, _, _state| {
+            // Accept new clients with proper client state
+            let client_state = compositor::state::ClientState {
+                compositor_state: smithay::wayland::compositor::CompositorClientState::default(),
+            };
+            if let Err(e) = display_handle.insert_client(client_stream, Arc::new(client_state)) {
+                warn!("Failed to insert client: {}", e);
+            } else {
+                info!("New client connected");
             }
-        )
+        })
         .context("Failed to insert listening socket into event loop")?;
 
     // A ping the async input/resize handlers fire to wake this synchronous loop
@@ -164,8 +158,8 @@ async fn main() -> Result<()> {
     // can't poll them, so this ping is the bridge. The source callback is empty:
     // its only job is to break `dispatch()` out so the loop's input drain runs
     // now rather than at the next frame deadline.
-    let (input_ping, input_ping_source) = calloop::ping::make_ping()
-        .context("Failed to create input wake ping")?;
+    let (input_ping, input_ping_source) =
+        calloop::ping::make_ping().context("Failed to create input wake ping")?;
     event_loop
         .handle()
         .insert_source(input_ping_source, |_, _, _state| {})
@@ -206,25 +200,29 @@ async fn main() -> Result<()> {
     let mut gpu_frames_enabled = false;
     let mut compositor_backend: Box<dyn Compositor> = match config.compositor {
         CompositorBackendArg::Sw => Box::new(SwCompositor),
-        CompositorBackendArg::Gl => match GlCompositor::new(&config.vaapi_device, gpu_frames_requested) {
-            Ok(c) => {
-                // Advertise `linux-dmabuf` to clients now that there's a
-                // renderer to import them into (see AGENTS.md). `enable_dmabuf`
-                // stores a clone of the same
-                // renderer handle `c` renders with -- not a second renderer.
-                // Failure here only means no dmabuf global gets advertised;
-                // GL rendering and SHM clients are unaffected.
-                if let Err(e) = state.enable_dmabuf(&display.handle(), c.renderer_handle(), c.main_device()) {
-                    warn!("Failed to advertise linux-dmabuf to clients ({e:#}); dmabuf-only clients won't be able to attach buffers, SHM clients are unaffected");
+        CompositorBackendArg::Gl => {
+            match GlCompositor::new(&config.vaapi_device, gpu_frames_requested) {
+                Ok(c) => {
+                    // Advertise `linux-dmabuf` to clients now that there's a
+                    // renderer to import them into (see AGENTS.md). `enable_dmabuf`
+                    // stores a clone of the same
+                    // renderer handle `c` renders with -- not a second renderer.
+                    // Failure here only means no dmabuf global gets advertised;
+                    // GL rendering and SHM clients are unaffected.
+                    if let Err(e) =
+                        state.enable_dmabuf(&display.handle(), c.renderer_handle(), c.main_device())
+                    {
+                        warn!("Failed to advertise linux-dmabuf to clients ({e:#}); dmabuf-only clients won't be able to attach buffers, SHM clients are unaffected");
+                    }
+                    gpu_frames_enabled = gpu_frames_requested;
+                    Box::new(c)
                 }
-                gpu_frames_enabled = gpu_frames_requested;
-                Box::new(c)
+                Err(e) => {
+                    warn!("--compositor gl failed to initialize ({e:#}); falling back to sw");
+                    Box::new(SwCompositor)
+                }
             }
-            Err(e) => {
-                warn!("--compositor gl failed to initialize ({e:#}); falling back to sw");
-                Box::new(SwCompositor)
-            }
-        },
+        }
     };
     let encoder_backend = match config.encoder {
         EncoderBackendArg::X264 => EncoderBackend::X264,
@@ -245,7 +243,8 @@ async fn main() -> Result<()> {
     // Current WebCodecs codec string (profile/level), surfaced to clients
     // over `/client` so a resolution-driven level change reaches the decoder --
     // see `encoder::h264_codec_string`.
-    let (codec_tx, codec_rx) = tokio::sync::watch::channel(encoder::h264_codec_string(width, height, config.framerate));
+    let (codec_tx, codec_rx) =
+        tokio::sync::watch::channel(encoder::h264_codec_string(width, height, config.framerate));
 
     let (encoder, buffer_return_rx, encoder_join_handle) = spawn_encoder(encoder_config, codec_tx)?;
 
@@ -254,8 +253,8 @@ async fn main() -> Result<()> {
     let (touch_tx, mut touch_rx) = mpsc::channel(32); // Higher capacity for touch events
     let (mouse_tx, mut mouse_rx) = mpsc::channel(64); // Higher capacity for pointer moves
     let (key_tx, mut key_rx) = mpsc::channel(64); // Higher capacity for key repeat bursts
-    // Forwards a client's `ping` (control channel) to the packet-forwarding
-    // loop below, which stamps it onto the next outgoing video frame.
+                                                  // Forwards a client's `ping` (control channel) to the packet-forwarding
+                                                  // loop below, which stamps it onto the next outgoing video frame.
     let (pending_ping_tx, mut pending_ping_rx) = mpsc::channel::<f64>(8);
     // Current encoder target bitrate, surfaced to clients over `/client`. CRF
     // (constant-quality) mode has no bitrate target, hence the 0 sentinel.
@@ -279,21 +278,42 @@ async fn main() -> Result<()> {
     info!("║  ✓ Client-to-server latency reporting                       ║");
     info!("╠══════════════════════════════════════════════════════════════╣");
     info!("║  Server Configuration:                                       ║");
-    info!("║  - Resolution: {}x{} @ {}fps                       ║", width, height, config.framerate);
+    info!(
+        "║  - Resolution: {}x{} @ {}fps                       ║",
+        width, height, config.framerate
+    );
     match rate_control {
         RateControl::Bitrate(bps) if adaptive_bitrate_enabled => info!(
             "║  - Bitrate: adaptive, {} bps initial ({}-{} bps)        ║",
             bps, config.min_bitrate, config.max_bitrate
         ),
-        RateControl::Bitrate(bps) => info!("║  - Bitrate: {} bps (fixed)                                  ║", bps),
-        RateControl::Quality(crf) => info!("║  - Quality: CRF {}                                            ║", crf),
+        RateControl::Bitrate(bps) => info!(
+            "║  - Bitrate: {} bps (fixed)                                  ║",
+            bps
+        ),
+        RateControl::Quality(crf) => info!(
+            "║  - Quality: CRF {}                                            ║",
+            crf
+        ),
     }
-    info!("║  - Keyframe interval: {} frames                              ║", keyframe_interval);
-    info!("║  - HTTP listen address: {}:{}                          ║", config.listen_addr, config.port);
-    info!("║  - Wayland display: {}                         ║", config.display_name);
+    info!(
+        "║  - Keyframe interval: {} frames                              ║",
+        keyframe_interval
+    );
+    info!(
+        "║  - HTTP listen address: {}:{}                          ║",
+        config.listen_addr, config.port
+    );
+    info!(
+        "║  - Wayland display: {}                         ║",
+        config.display_name
+    );
     info!("╠══════════════════════════════════════════════════════════════╣");
     info!("║  Connect with browser:                                       ║");
-    info!("║  http://localhost:{}                                      ║", config.port);
+    info!(
+        "║  http://localhost:{}                                      ║",
+        config.port
+    );
     info!("╚══════════════════════════════════════════════════════════════╝\n");
 
     info!("Server starting on port {}...", config.port);
@@ -326,9 +346,9 @@ async fn main() -> Result<()> {
     let latency_tx = {
         use crate::latency::LatencyReport;
         let (latency_tx, mut latency_rx) = mpsc::channel::<LatencyReport>(16);
-        
+
         debug!("Latency reporting pipeline initialized");
-        
+
         // Log a one-line latency summary per report. At debug so the default
         // (info) level stays quiet -- the report arrives every ~5s and also
         // feeds adaptive bitrate (src/server.rs), so its cadence is left alone;
@@ -349,7 +369,7 @@ async fn main() -> Result<()> {
                 );
             }
         });
-        
+
         Some(latency_tx)
     };
 
@@ -374,7 +394,10 @@ async fn main() -> Result<()> {
         tokio::spawn(controller.run());
         Some(bitrate_event_tx)
     } else {
-        info!("Adaptive bitrate disabled, using fixed rate control: {:?}", rate_control);
+        info!(
+            "Adaptive bitrate disabled, using fixed rate control: {:?}",
+            rate_control
+        );
         None
     };
 
@@ -389,7 +412,11 @@ async fn main() -> Result<()> {
     // by `SignalingState`'s connection handlers on the first `/client` or
     // `/client` connection rather than here, so an idle server with nobody
     // watching never runs it.
-    let session = SessionManager::new(config.command.clone(), config.display_name.clone(), session_shutdown_tx);
+    let session = SessionManager::new(
+        config.command.clone(),
+        config.display_name.clone(),
+        session_shutdown_tx,
+    );
 
     // Start audio capture: PipeWire loopback virtual sink + Opus encoding.
     // Runs on a dedicated OS thread; the broadcast sender is consumed by /client WS clients.
@@ -569,14 +596,18 @@ async fn main() -> Result<()> {
         }
     });
 
-    info!("All systems ready. Connect Wayland clients with: WAYLAND_DISPLAY={}", config.display_name);
-    
+    info!(
+        "All systems ready. Connect Wayland clients with: WAYLAND_DISPLAY={}",
+        config.display_name
+    );
+
     // Dispatch initial Wayland events
-    display.dispatch_clients(&mut state)
+    display
+        .dispatch_clients(&mut state)
         .context("Failed to dispatch Wayland clients")?;
-    
+
     info!("Starting compositor render loop");
-    
+
     // Main event loop for Wayland compositor (synchronous)
     let frame_interval = std::time::Duration::from_secs_f64(1.0 / config.framerate as f64);
     // Self-correcting deadline: advanced by exactly `frame_interval` each frame
@@ -622,7 +653,10 @@ async fn main() -> Result<()> {
             let Some((new_width, new_height)) =
                 config::sanitize_resolution((req_width, req_height), (max_width, max_height))
             else {
-                warn!("Ignoring resize request with dimensions too small: {}x{}", req_width, req_height);
+                warn!(
+                    "Ignoring resize request with dimensions too small: {}x{}",
+                    req_width, req_height
+                );
                 continue;
             };
 
@@ -635,11 +669,11 @@ async fn main() -> Result<()> {
             // SW backend, which can't downscale a larger buffer -- see
             // set_preferred_scale).
             state.set_preferred_scale(scale);
-            
+
             // Update touch and pointer handler dimensions
             touch_handler.set_dimensions(new_width, new_height);
             mouse_handler.set_dimensions(new_width, new_height);
-            
+
             // Resize encoder
             if let Err(e) = encoder_resize.send(Some(encoder::ResolutionChange {
                 width: new_width,
@@ -647,7 +681,7 @@ async fn main() -> Result<()> {
             })) {
                 warn!("Failed to send resize to encoder: {}", e);
             }
-            
+
             info!("Resize complete: {}x{}", new_width, new_height);
         }
 
@@ -659,10 +693,12 @@ async fn main() -> Result<()> {
         let dispatch_timeout = next_frame
             .saturating_duration_since(loop_start)
             .min(std::time::Duration::from_millis(16));
-        event_loop.dispatch(dispatch_timeout, &mut state)
+        event_loop
+            .dispatch(dispatch_timeout, &mut state)
             .context("Event loop dispatch failed")?;
 
-        display.dispatch_clients(&mut state)
+        display
+            .dispatch_clients(&mut state)
             .context("Failed to dispatch Wayland clients")?;
 
         // Inject any input that arrived (non-blocking, drain all available so a
@@ -680,7 +716,8 @@ async fn main() -> Result<()> {
             input::keyboard::handle_event(key_event, &mut state);
         }
 
-        display.flush_clients()
+        display
+            .flush_clients()
             .context("Failed to flush Wayland clients")?;
 
         // Forward any cursor update the compositor extracted this tick.
@@ -699,7 +736,11 @@ async fn main() -> Result<()> {
                 height,
                 rgba: BASE64_STANDARD.encode(rgba),
             });
-            let _ = app_meta_tx.send(server::AppMeta { title, app_id, favicon });
+            let _ = app_meta_tx.send(server::AppMeta {
+                title,
+                app_id,
+                favicon,
+            });
         }
 
         // Forward any pointer-lock state change (also activates pending
@@ -752,12 +793,15 @@ async fn main() -> Result<()> {
                     // harmless to send twice. A full/closed control queue means
                     // the keyframe request is lost (client stays corrupt until
                     // the next one), so this control-plane send is worth a warn.
-                    if let Err(e) = encoder_control_for_loop.try_send(EncoderControl::ForceKeyframe) {
+                    if let Err(e) = encoder_control_for_loop.try_send(EncoderControl::ForceKeyframe)
+                    {
                         warn!("Failed to request keyframe from encoder: {e}");
                     }
                     keyframe_pending = false;
                 }
-                if let Some(captured_frame) = compositor_backend.render(&mut state, spare_buffers.pop()) {
+                if let Some(captured_frame) =
+                    compositor_backend.render(&mut state, spare_buffers.pop())
+                {
                     // Send frame to encoder (non-blocking)
                     match frame_sender.try_send(captured_frame) {
                         Ok(()) => {
@@ -772,7 +816,10 @@ async fn main() -> Result<()> {
                             // stale rows for the dropped content (old pixels show
                             // after a big change). Counts toward staleness too --
                             // the encoder didn't actually get a fresh frame.
-                            if let mpsc::error::TrySendError::Full(encoder::CapturedFrame::Cpu(raw)) = &e {
+                            if let mpsc::error::TrySendError::Full(encoder::CapturedFrame::Cpu(
+                                raw,
+                            )) = &e
+                            {
                                 state.readd_damage(&raw.damage);
                             }
                             dropped_frames += 1;
@@ -799,7 +846,8 @@ async fn main() -> Result<()> {
                 next_frame = now + frame_interval;
             }
 
-            display.flush_clients()
+            display
+                .flush_clients()
                 .context("Failed to flush Wayland clients")?;
         }
     }
@@ -827,12 +875,18 @@ async fn main() -> Result<()> {
     // thread's `frame_rx.blocking_recv()` sees every sender gone and exits.
     drop(frame_sender);
 
-    if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, forward_join_handle).await.is_err() {
+    if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, forward_join_handle)
+        .await
+        .is_err()
+    {
         warn!("Timed out waiting for the encoder forwarding task to finish");
     }
 
     let encoder_thread_done = tokio::task::spawn_blocking(move || encoder_join_handle.join());
-    if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, encoder_thread_done).await.is_err() {
+    if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, encoder_thread_done)
+        .await
+        .is_err()
+    {
         warn!("Timed out waiting for the encoder thread to finish");
     }
 
@@ -840,13 +894,19 @@ async fn main() -> Result<()> {
     // against `shutdown_rx` (see src/server.rs), so this resolves once
     // they've all sent a close frame and returned, rather than waiting on
     // clients to disconnect on their own.
-    if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, server_join_handle).await.is_err() {
+    if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, server_join_handle)
+        .await
+        .is_err()
+    {
         warn!("Timed out waiting for the signaling server to finish");
     }
 
     // Session: kill the spawned client app, if one was ever started --
     // otherwise it would outlive the compositor it depends on.
-    if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, session.shutdown()).await.is_err() {
+    if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, session.shutdown())
+        .await
+        .is_err()
+    {
         warn!("Timed out waiting for the session's child process to be killed");
     }
 
