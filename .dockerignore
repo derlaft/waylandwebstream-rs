@@ -1,6 +1,6 @@
-# Keep the Docker build context small. Dockerfile.builder is a toolchain image
-# that mounts the source at runtime; it COPYs nothing, so none of this is needed
-# in the context.
+# Keep the Docker build context small. The Dockerfile rebuilds web/dist and
+# node_modules inside the image, so they (and other local build output) are
+# excluded here.
 .git/
 target/
 dist/

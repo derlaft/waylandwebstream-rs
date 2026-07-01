@@ -1,35 +1,34 @@
-# waylandwebstream packaging / build helpers.
+# waylandwebstream build / package helpers.
 #
-# Native targets (build, web, package, deps) assume a Debian trixie-like
-# environment with the toolchain present (the dev box, or inside the builder
-# image). The `docker-*` wrappers run them inside Dockerfile.builder so they
-# work anywhere Docker does (e.g. GitHub's ubuntu runners).
+# The build/test/package pipeline lives in the multi-stage Dockerfile, so these
+# recipes are thin wrappers over `docker build`. The .deb targets amd64; on a
+# non-amd64 host the default `--platform linux/amd64` emulates it.
 
 # Package version: default from Cargo.toml, override with `WWS_VERSION=... just ...`.
 export WWS_VERSION := env_var_or_default("WWS_VERSION", `grep -m1 '^version' Cargo.toml | cut -d'"' -f2`)
-
-builder_image := "waylandwebstream-builder"
+platform := env_var_or_default("PLATFORM", "linux/amd64")
 
 # List available recipes.
 default:
     @just --list
 
-# Build the embedded web bundle (Svelte/Vite).
-web:
-    cd web && npm ci && npm run build
+# Run the full test tier (lint + tiered tests) in the Dockerfile `test` stage.
+test:
+    docker build --platform {{platform}} --target test .
 
-# Release build of the server binary (depends on the web bundle).
-build: web
-    cargo build --release --locked -p waylandwebstream
-
-# Build the .deb into dist/ (runs `build` first).
-package: build
-    mkdir -p dist
-    nfpm package --packager deb --config nfpm.yaml --target "dist/waylandwebstream_${WWS_VERSION}_amd64.deb"
+# Build the .deb into dist/ via the Dockerfile `artifact` stage.
+package:
+    docker build --platform {{platform}} --target artifact \
+      --build-arg WWS_VERSION="$WWS_VERSION" -o dist .
     @ls -1 dist/*.deb
 
+# Native release build (no Docker) -- requires the toolchain on the host.
+build:
+    cd web && npm ci && npm run build
+    cargo build --release --locked -p waylandwebstream
+
 # Regenerate nfpm's `depends:` from the built binary's direct DT_NEEDED libs.
-# Paste the printed `shlibs:Depends=` value into nfpm.yaml.
+# Run after `just build`; paste the printed `shlibs:Depends=` into nfpm.yaml.
 deps:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -41,20 +40,5 @@ deps:
     ( cd "$tmp" && dpkg-shlibdeps -O ./wws 2>/dev/null )
     rm -rf "$tmp"
 
-# --- Docker wrappers (build inside the pinned trixie builder) ---------------
-
-# Build the builder image.
-builder-image:
-    docker build -f Dockerfile.builder -t {{builder_image}} .
-
-# Run any recipe inside the builder image, e.g. `just in-docker package`.
-in-docker +recipe: builder-image
-    docker run --rm -v "$PWD":/work -w /work \
-        -e WWS_VERSION="$WWS_VERSION" \
-        {{builder_image}} just {{recipe}}
-
-# Convenience: build the .deb inside the builder image.
-docker-package: (in-docker "package")
-
 clean:
-    rm -rf dist target/release/waylandwebstream
+    rm -rf dist

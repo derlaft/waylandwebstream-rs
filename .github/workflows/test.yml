@@ -1,11 +1,8 @@
 name: test
 
-# CI test gate + packaging smoke build. Runs the automated test tiers (see
-# TESTING.md) and confirms the .deb still builds. The heavy browser- and
-# GPU-driven tiers are NOT run here.
-#
-# Everything runs inside Dockerfile.builder (Debian trixie, FFmpeg 7.1) because
-# GitHub's ubuntu runners ship a different FFmpeg than the binary's runtime ABI.
+# CI test gate + packaging smoke build. The whole pipeline lives in the
+# multi-stage Dockerfile (Debian trixie / FFmpeg 7.1); this workflow just drives
+# `docker build` against its stages. See TESTING.md for the test tiers.
 
 on:
   push:
@@ -20,83 +17,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ci:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
 
-      # Build (and cache) the trixie toolchain image. Layer cache lives in the
-      # GitHub Actions cache, so repeat runs skip the apt/rustup/nfpm install.
-      - name: Build builder image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
+      # The `test` stage runs fmt/clippy (report-only) + web checks + the Rust
+      # test tiers; the build fails if any blocking test fails.
+      - name: Lint + tiered tests (Dockerfile `test` stage)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: .
-          file: Dockerfile.builder
-          tags: waylandwebstream-builder:ci
-          load: true
+          target: test
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Persist cargo registry + target across runs.
-      - name: Cache cargo + target
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+      # The `artifact` stage builds the release binary and packages the .deb.
+      - name: Smoke-build the .deb (Dockerfile `artifact` stage)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
-          path: |
-            .cargo-docker
-            target-docker
-          key: cargo-trixie-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-trixie-
+          context: .
+          target: artifact
+          build-args: |
+            WWS_VERSION=0.0.0-ci
+          outputs: type=local,dest=dist
+          cache-from: type=gha
 
-      - name: Lint, build web, run automated test tiers, smoke-build .deb
-        run: |
-          docker run --rm -v "$PWD":/work -w /work \
-            -e CARGO_HOME=/work/.cargo-docker \
-            -e CARGO_TARGET_DIR=/work/target-docker \
-            -e WWS_VERSION=0.0.0-ci \
-            -e XDG_RUNTIME_DIR=/tmp/xdg \
-            waylandwebstream-builder:ci bash -euxc '
-              mkdir -p /tmp/xdg && chmod 700 /tmp/xdg
-              rustup component add rustfmt clippy
-
-              # --- lint (report-only for now; `|| echo` neutralises set -e) ---
-              # TODO: make blocking once the tree is rustfmt-clean (`cargo fmt --all`).
-              cargo fmt --all -- --check \
-                || echo "::warning title=rustfmt::tree is not rustfmt-clean (non-blocking; run cargo fmt --all)"
-
-              # --- web: build bundle, typecheck, unit tests (blocking) ---
-              ( cd web && npm ci && npm run build && npm run check && npm test )
-
-              # --- clippy (report-only; compiles the whole workspace once) ---
-              # TODO: make blocking once the existing clippy lints are fixed.
-              cargo clippy --workspace --all-targets --locked -- -D warnings \
-                || echo "::warning title=clippy::clippy reported warnings (non-blocking)"
-
-              # --- Tier 1: fast Rust tests (blocking) ---
-              # NOTE: adaptive_bitrate_test is excluded -- it is stale (calls the
-              # removed BitrateAlgorithm::on_congestion) and does not compile.
-              # Re-add `--test adaptive_bitrate_test` once it is fixed.
-              cargo test --locked --lib --bins
-              cargo test --locked --test latency_websocket_test
-
-              # --- Tier 2: software graphical (needs weston-simple-shm) ---
-              apt-get update && apt-get install -y --no-install-recommends weston
-              cargo test --locked --test render_pixels_test
-
-              # --- packaging smoke build ---
-              cargo build --release --locked -p waylandwebstream
-              # nfpm.yaml expects the binary at ./target/release/ (the cache uses
-              # a separate CARGO_TARGET_DIR), so stage it there.
-              mkdir -p target/release dist
-              cp target-docker/release/waylandwebstream target/release/waylandwebstream
-              nfpm package --packager deb --config nfpm.yaml --target "dist/waylandwebstream_${WWS_VERSION}_amd64.deb"
-              ls -l dist/
-            '
-
-      - name: Upload .deb (smoke artifact, not a release)
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: waylandwebstream-deb-ci
           path: dist/*.deb

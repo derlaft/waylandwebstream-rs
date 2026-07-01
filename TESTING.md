@@ -67,8 +67,10 @@ cargo test --locked --test cage_rendering_test
 
 ## What CI runs
 
-The `test` workflow (`.github/workflows/test.yml`) runs Tiers 1 and 2 inside the
-`Dockerfile.builder` image (Debian trixie, FFmpeg 7.1) — `cargo fmt --check`,
-`cargo clippy -D warnings`, the Tier 1 + Tier 2 test targets (with `weston`
-installed for Tier 2), and the web `check` + `vitest`. It also smoke-builds the
-`.deb` so packaging breakage is caught early. Tiers 3 and 4 are not run in CI.
+The `test` workflow (`.github/workflows/test.yml`) drives the multi-stage
+`Dockerfile` (Debian trixie, FFmpeg 7.1). Its `test` stage runs `cargo fmt
+--check` and `cargo clippy -D warnings` (report-only for now), the web `check` +
+`vitest`, and the Tier 1 + Tier 2 Rust tests (with `weston` for Tier 2); its
+`artifact` stage smoke-builds the `.deb`. Run the same thing locally with
+`just test` and `just package` (or `docker build --target test .`). Tiers 3 and
+4 are not run in CI.

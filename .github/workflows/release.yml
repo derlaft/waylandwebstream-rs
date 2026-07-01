@@ -1,18 +1,21 @@
 name: release
 
-# Hardened, maintainer-triggered release: build the .deb, assemble the APT
-# archive, sign it with the Secrets-held GPG signing subkey, and publish to the
-# gh-pages branch. See docs/apt-repo.md for the trust model and key setup.
+# Hardened, maintainer-triggered release: build the .deb (via the Dockerfile
+# `artifact` stage), assemble the APT archive, sign it with the Secrets-held GPG
+# signing subkey, and publish to gh-pages. See docs/apt-repo.md.
 #
 # "Final say" = only the maintainer can run this (workflow_dispatch). Signing
 # never happens on push/PR. The signing secret is scoped to the protected
 # `release` environment, so only this job can read it.
 #
-# One-time prerequisites (see docs/apt-repo.md):
-#   - Secret  GPG_SIGNING_SUBKEY  (armored export of the signing SUBKEY only)
-#     set on the protected `release` environment.
+# One-time prerequisites (docs/apt-repo.md):
+#   - Secret  GPG_SIGNING_SUBKEY  (armored signing-SUBKEY export) on the
+#     protected `release` environment.
 #   - File    packaging/KEY.gpg   (armored PUBLIC primary key) committed.
-#   - GitHub Pages configured to serve the `gh-pages` branch.
+#   - GitHub Pages serving the `gh-pages` branch.
+#
+# The build/package pipeline is in the Dockerfile; only signing + publishing
+# (which need the secret and a git push) live here as workflow glue.
 
 on:
   workflow_dispatch:
@@ -21,7 +24,6 @@ on:
         description: "Package version (default: Cargo.toml version)"
         required: false
 
-# Minimal default; the job widens to contents:write only where needed.
 permissions:
   contents: read
 
@@ -32,25 +34,14 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
-    environment: release          # protection rules gate access to the signing secret
+    environment: release
     permissions:
-      contents: write             # push the assembled archive to gh-pages
+      contents: write
     steps:
       - name: Checkout source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
-
-      - name: Build builder image (Debian trixie / FFmpeg 7.1)
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
-        with:
-          context: .
-          file: Dockerfile.builder
-          tags: waylandwebstream-builder:release
-          load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
 
       - name: Determine version
         id: ver
@@ -60,27 +51,22 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "Releasing version: $v"
 
-      - name: Build .deb in the builder container
-        run: |
-          docker run --rm -v "$PWD":/work -w /work \
-            -e WWS_VERSION="${{ steps.ver.outputs.version }}" \
-            -e CARGO_HOME=/work/.cargo-docker \
-            -e CARGO_TARGET_DIR=/work/target-docker \
-            waylandwebstream-builder:release bash -euxc '
-              cd web && npm ci && npm run build && cd ..
-              cargo build --release --locked -p waylandwebstream
-              mkdir -p target/release dist
-              cp target-docker/release/waylandwebstream target/release/waylandwebstream
-              nfpm package --packager deb --config nfpm.yaml --target "dist/waylandwebstream_${WWS_VERSION}_amd64.deb"
-              ls -l dist/
-            '
+      - name: Build .deb (Dockerfile `artifact` stage)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        with:
+          context: .
+          target: artifact
+          build-args: |
+            WWS_VERSION=${{ steps.ver.outputs.version }}
+          outputs: type=local,dest=dist
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       # Pull the existing archive so older packages in pool/ are preserved.
-      # First-ever release: the branch may not exist yet -- bootstrap an empty tree.
+      # First-ever release: the branch may not exist yet -- bootstrap empty.
       - name: Checkout existing gh-pages
-        id: pages
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         continue-on-error: true
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: gh-pages
           path: site
@@ -149,5 +135,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -q -m "release: waylandwebstream ${{ steps.ver.outputs.version }}" || { echo "nothing to commit"; exit 0; }
+          git commit -q -m "release: waylandwebstream ${{ steps.ver.outputs.version }}"
           git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" gh-pages
