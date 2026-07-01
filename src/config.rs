@@ -23,6 +23,7 @@ pub enum EncoderBackendArg {
 
 #[derive(Debug, Parser)]
 #[command(name = "waylandwebstream")]
+#[command(version)] // `--version` reports the crate version (from Cargo.toml)
 #[command(about = "A headless Wayland compositor streaming to browsers over WebSocket/WebCodecs", long_about = None)]
 pub struct Config {
     /// Initial resolution (width x height)
