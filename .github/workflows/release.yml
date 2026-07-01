@@ -1,0 +1,153 @@
+name: release
+
+# Hardened, maintainer-triggered release: build the .deb, assemble the APT
+# archive, sign it with the Secrets-held GPG signing subkey, and publish to the
+# gh-pages branch. See docs/apt-repo.md for the trust model and key setup.
+#
+# "Final say" = only the maintainer can run this (workflow_dispatch). Signing
+# never happens on push/PR. The signing secret is scoped to the protected
+# `release` environment, so only this job can read it.
+#
+# One-time prerequisites (see docs/apt-repo.md):
+#   - Secret  GPG_SIGNING_SUBKEY  (armored export of the signing SUBKEY only)
+#     set on the protected `release` environment.
+#   - File    packaging/KEY.gpg   (armored PUBLIC primary key) committed.
+#   - GitHub Pages configured to serve the `gh-pages` branch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version (default: Cargo.toml version)"
+        required: false
+
+# Minimal default; the job widens to contents:write only where needed.
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: release          # protection rules gate access to the signing secret
+    permissions:
+      contents: write             # push the assembled archive to gh-pages
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+
+      - name: Build builder image (Debian trixie / FFmpeg 7.1)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
+        with:
+          context: .
+          file: Dockerfile.builder
+          tags: waylandwebstream-builder:release
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Determine version
+        id: ver
+        run: |
+          v="${{ github.event.inputs.version }}"
+          [ -z "$v" ] && v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Releasing version: $v"
+
+      - name: Build .deb in the builder container
+        run: |
+          docker run --rm -v "$PWD":/work -w /work \
+            -e WWS_VERSION="${{ steps.ver.outputs.version }}" \
+            -e CARGO_HOME=/work/.cargo-docker \
+            -e CARGO_TARGET_DIR=/work/target-docker \
+            waylandwebstream-builder:release bash -euxc '
+              cd web && npm ci && npm run build && cd ..
+              cargo build --release --locked -p waylandwebstream
+              mkdir -p target/release dist
+              cp target-docker/release/waylandwebstream target/release/waylandwebstream
+              nfpm package --packager deb --config nfpm.yaml --target "dist/waylandwebstream_${WWS_VERSION}_amd64.deb"
+              ls -l dist/
+            '
+
+      # Pull the existing archive so older packages in pool/ are preserved.
+      # First-ever release: the branch may not exist yet -- bootstrap an empty tree.
+      - name: Checkout existing gh-pages
+        id: pages
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        continue-on-error: true
+        with:
+          ref: gh-pages
+          path: site
+          fetch-depth: 0
+
+      - name: Bootstrap site dir if gh-pages is new
+        run: mkdir -p site
+
+      - name: Assemble + sign APT archive
+        env:
+          GPG_SIGNING_SUBKEY: ${{ secrets.GPG_SIGNING_SUBKEY }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dpkg-dev apt-utils gnupg
+
+          VER="${{ steps.ver.outputs.version }}"
+          DEB=$(ls dist/*.deb)
+          SUITE=trixie
+
+          # 1. Drop the new package into the pool.
+          POOL="site/pool/main/w/waylandwebstream"
+          mkdir -p "$POOL"
+          cp "$DEB" "$POOL/"
+
+          # 2. Public signing key for end users.
+          cp packaging/KEY.gpg site/KEY.gpg
+
+          # 3. Generate Packages over the whole pool.
+          ARCHDIR="site/dists/$SUITE/main/binary-amd64"
+          mkdir -p "$ARCHDIR"
+          ( cd site && dpkg-scanpackages --arch amd64 pool /dev/null ) > "$ARCHDIR/Packages"
+          gzip -9c "$ARCHDIR/Packages" > "$ARCHDIR/Packages.gz"
+
+          # 4. Top-level Release over dists/<suite>.
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin=waylandwebstream \
+            -o APT::FTPArchive::Release::Label=waylandwebstream \
+            -o APT::FTPArchive::Release::Suite="$SUITE" \
+            -o APT::FTPArchive::Release::Codename="$SUITE" \
+            -o APT::FTPArchive::Release::Components=main \
+            -o APT::FTPArchive::Release::Architectures=amd64 \
+            release "site/dists/$SUITE" > "site/dists/$SUITE/Release"
+
+          # 5. Import the signing subkey into an ephemeral keyring and sign.
+          export GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$GPG_SIGNING_SUBKEY" | gpg --batch --import
+          KEYID=$(gpg --list-keys --with-colons | awk -F: '/^pub/{print $5; exit}')
+          gpg --batch --yes --local-user "$KEYID" \
+            --clearsign -o "site/dists/$SUITE/InRelease" "site/dists/$SUITE/Release"
+          gpg --batch --yes --local-user "$KEYID" \
+            -abs -o "site/dists/$SUITE/Release.gpg" "site/dists/$SUITE/Release"
+          rm -rf "$GNUPGHOME"
+
+      - name: Publish to gh-pages
+        run: |
+          set -euo pipefail
+          cd site
+          touch .nojekyll
+          # Republish as a single fresh commit. The existing pool/ packages were
+          # checked out into site/ above, so content is preserved even though the
+          # branch history is squashed (fine for a published-artifact branch).
+          rm -rf .git
+          git init -q -b gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "release: waylandwebstream ${{ steps.ver.outputs.version }}" || { echo "nothing to commit"; exit 0; }
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" gh-pages

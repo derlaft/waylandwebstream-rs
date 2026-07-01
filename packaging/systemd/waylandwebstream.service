@@ -1,0 +1,33 @@
+# systemd --user unit for waylandwebstream.
+#
+# Installed to /usr/lib/systemd/user/ by the package. It is NOT enabled at
+# install time (a user service needs a user session); enable it yourself:
+#
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now waylandwebstream
+#
+# The default below serves the web UI on loopback with no session app. To run a
+# compositor/app inside the stream, override ExecStart with a drop-in:
+#
+#     systemctl --user edit waylandwebstream
+#     # [Service]
+#     # ExecStart=
+#     # ExecStart=/usr/bin/waylandwebstream --listen-addr 127.0.0.1 --port 8080 -- labwc -S firefox
+#
+# Audio capture uses PipeWire, which is itself a user-session service -- hence
+# this is a --user unit, not a system one.
+
+[Unit]
+Description=WaylandWebStream headless Wayland compositor + browser stream
+Documentation=https://github.com/derlaft/waylandwebstream-rs
+After=graphical-session.target pipewire.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/waylandwebstream --listen-addr 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
