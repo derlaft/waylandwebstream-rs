@@ -10,7 +10,9 @@ name: test
 # minutes -- releases build the real .deb via release.yml anyway.
 
 on:
-  push:
+  # TEMPORARY: push trigger disabled -- CI runs take >5m and we push frequently.
+  # Re-enable by uncommenting `push:` below.
+  # push:
   pull_request:
   workflow_dispatch:
 
