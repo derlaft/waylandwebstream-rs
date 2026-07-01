@@ -6,6 +6,8 @@
 
 # Package version: default from Cargo.toml, override with `WWS_VERSION=... just ...`.
 export WWS_VERSION := env_var_or_default("WWS_VERSION", `grep -m1 '^version' Cargo.toml | cut -d'"' -f2`)
+# amd64 by default (mirrors CI, and one encoder unit test is arch-sensitive so
+# native arm64 gives a false failure). Opt into arm64 with `PLATFORM=linux/arm64`.
 platform := env_var_or_default("PLATFORM", "linux/amd64")
 
 # List available recipes.
@@ -16,9 +18,10 @@ default:
 test:
     docker build --platform {{platform}} --target test .
 
-# Build the .deb into dist/ via the Dockerfile `artifact` stage.
+# Build the .deb into dist/ via the Dockerfile `artifact` stage. Always amd64 --
+# the published repo is amd64 (emulated on a non-amd64 host).
 package:
-    docker build --platform {{platform}} --target artifact \
+    docker build --platform linux/amd64 --target artifact \
       --build-arg WWS_VERSION="$WWS_VERSION" -o dist .
     @ls -1 dist/*.deb
 

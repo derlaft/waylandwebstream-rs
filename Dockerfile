@@ -35,8 +35,17 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable \
     && rustup component add rustfmt clippy \
     && rustc --version
+# nfpm arch-aware so `base` builds natively on amd64 AND arm64 (arm64 lets the
+# test stage run without emulation for a faster local loop; releases still build
+# the amd64 artifact via `--platform linux/amd64`). TARGETARCH is set by BuildKit.
 ARG NFPM_VERSION=2.47.0
-RUN curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+ARG TARGETARCH
+RUN case "${TARGETARCH:-amd64}" in \
+      amd64) NFARCH=x86_64 ;; \
+      arm64) NFARCH=arm64 ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${NFARCH}.tar.gz" \
       | tar -xz -C /usr/local/bin nfpm && nfpm --version
 WORKDIR /src
 
