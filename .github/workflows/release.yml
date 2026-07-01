@@ -78,6 +78,9 @@ jobs:
       - name: Assemble + sign APT archive
         env:
           GPG_SIGNING_SUBKEY: ${{ secrets.GPG_SIGNING_SUBKEY }}
+          # Optional: only needed if the signing subkey is passphrase-protected.
+          # The intended design is a passphrase-less subkey; leave this unset then.
+          GPG_SIGNING_PASSPHRASE: ${{ secrets.GPG_SIGNING_PASSPHRASE }}
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -112,14 +115,24 @@ jobs:
             release "site/dists/$SUITE" > "site/dists/$SUITE/Release"
 
           # 5. Import the signing subkey into an ephemeral keyring and sign.
+          # CI has no TTY, so gpg must not invoke pinentry -- use loopback
+          # pinentry (the subkey has no passphrase). Without this, clear-signing
+          # fails with "Inappropriate ioctl for device".
           export GNUPGHOME="$(mktemp -d)"
           chmod 700 "$GNUPGHOME"
+          printf 'allow-loopback-pinentry\n' > "$GNUPGHOME/gpg-agent.conf"
+          printf 'pinentry-mode loopback\nno-tty\nbatch\n' > "$GNUPGHOME/gpg.conf"
           printf '%s' "$GPG_SIGNING_SUBKEY" | gpg --batch --import
+          gpgconf --kill gpg-agent 2>/dev/null || true
           KEYID=$(gpg --list-keys --with-colons | awk -F: '/^pub/{print $5; exit}')
-          gpg --batch --yes --local-user "$KEYID" \
-            --clearsign -o "site/dists/$SUITE/InRelease" "site/dists/$SUITE/Release"
-          gpg --batch --yes --local-user "$KEYID" \
-            -abs -o "site/dists/$SUITE/Release.gpg" "site/dists/$SUITE/Release"
+
+          # Pass a passphrase only if one was provided (passphrase-less by design).
+          PASS=()
+          [ -n "${GPG_SIGNING_PASSPHRASE:-}" ] && PASS=(--passphrase "$GPG_SIGNING_PASSPHRASE")
+          sign() { gpg --batch --yes --pinentry-mode loopback "${PASS[@]}" --local-user "$KEYID" "$@"; }
+
+          sign --clearsign -o "site/dists/$SUITE/InRelease" "site/dists/$SUITE/Release"
+          sign -abs -o "site/dists/$SUITE/Release.gpg" "site/dists/$SUITE/Release"
           rm -rf "$GNUPGHOME"
 
       - name: Publish to gh-pages
