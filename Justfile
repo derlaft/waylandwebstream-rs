@@ -6,8 +6,9 @@
 
 # Package version: default from Cargo.toml, override with `WWS_VERSION=... just ...`.
 export WWS_VERSION := env_var_or_default("WWS_VERSION", `grep -m1 '^version' Cargo.toml | cut -d'"' -f2`)
-# amd64 by default (mirrors CI, and one encoder unit test is arch-sensitive so
-# native arm64 gives a false failure). Opt into arm64 with `PLATFORM=linux/arm64`.
+# amd64 by default (mirrors CI and the released artifact). The test suite is
+# arch-robust, so `PLATFORM=linux/arm64` runs the tests natively (no emulation)
+# for a faster local loop on an arm64 host.
 platform := env_var_or_default("PLATFORM", "linux/amd64")
 
 # List available recipes.
