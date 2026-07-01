@@ -182,14 +182,20 @@ mod tests {
 
     #[test]
     fn resize_serializes_to_expected_json() {
-        let msg = SignalingMessage::Resize { width: 800, height: 600 };
+        let msg = SignalingMessage::Resize {
+            width: 800,
+            height: 600,
+        };
         let json = serde_json::to_string(&msg).expect("serialize");
         assert_eq!(json, r#"{"type":"resize","width":800,"height":600}"#);
     }
 
     #[test]
     fn resize_round_trips_through_json() {
-        let original = SignalingMessage::Resize { width: 1920, height: 1080 };
+        let original = SignalingMessage::Resize {
+            width: 1920,
+            height: 1080,
+        };
         let json = serde_json::to_string(&original).expect("serialize");
         let parsed: SignalingMessage = serde_json::from_str(&json).expect("deserialize");
         match parsed {
@@ -204,7 +210,10 @@ mod tests {
     #[test]
     fn resize_round_trips_through_client_framing() {
         use crate::proto;
-        let msg = SignalingMessage::Resize { width: 800, height: 600 };
+        let msg = SignalingMessage::Resize {
+            width: 800,
+            height: 600,
+        };
         let json = serde_json::to_vec(&msg).expect("serialize");
         let frame = proto::encode_msg(proto::MSG_CLIENT_MSG, 0, &json);
 
@@ -213,9 +222,8 @@ mod tests {
         assert_eq!(frame[0], proto::MSG_CLIENT_MSG);
 
         // Decode the payload and verify it round-trips.
-        let (msg_type, _flags, payload_len) = proto::decode_header(
-            frame[..proto::HEADER_LEN].try_into().unwrap(),
-        );
+        let (msg_type, _flags, payload_len) =
+            proto::decode_header(frame[..proto::HEADER_LEN].try_into().unwrap());
         assert_eq!(msg_type, proto::MSG_CLIENT_MSG);
         assert_eq!(payload_len as usize, json.len());
         let payload = &frame[proto::HEADER_LEN..proto::HEADER_LEN + payload_len as usize];

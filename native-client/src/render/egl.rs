@@ -10,11 +10,11 @@
 
 use anyhow::{Context, Result};
 use std::ffi::c_void;
+use std::sync::mpsc;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::sync::mpsc;
 
 use wayland_client::backend::ObjectId;
 
@@ -240,18 +240,15 @@ impl EglRenderer {
         render_count: Arc<AtomicU64>,
     ) -> Result<Self> {
         // ── wayland-egl window ──────────────────────────────────────────
-        let egl_window =
-            wayland_egl::WlEglSurface::new(surface_id, width as i32, height as i32)
-                .map_err(|e| anyhow::anyhow!("WlEglSurface::new: {e}"))?;
+        let egl_window = wayland_egl::WlEglSurface::new(surface_id, width as i32, height as i32)
+            .map_err(|e| anyhow::anyhow!("WlEglSurface::new: {e}"))?;
 
         // ── EGL display + init ─────────────────────────────────────────
         let egl_display = unsafe { eglGetDisplay(wl_display_ptr) };
         if egl_display == EGL_NO_DISPLAY {
             anyhow::bail!("eglGetDisplay returned EGL_NO_DISPLAY");
         }
-        let ok = unsafe {
-            eglInitialize(egl_display, std::ptr::null_mut(), std::ptr::null_mut())
-        };
+        let ok = unsafe { eglInitialize(egl_display, std::ptr::null_mut(), std::ptr::null_mut()) };
         if ok == EGL_FALSE {
             anyhow::bail!("eglInitialize failed");
         }
@@ -294,9 +291,8 @@ impl EglRenderer {
 
         // ── EGL context (GLES 2.0) ─────────────────────────────────────
         let ctx_attribs: [i32; 3] = [EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE];
-        let egl_context = unsafe {
-            eglCreateContext(egl_display, config, EGL_NO_CONTEXT, ctx_attribs.as_ptr())
-        };
+        let egl_context =
+            unsafe { eglCreateContext(egl_display, config, EGL_NO_CONTEXT, ctx_attribs.as_ptr()) };
         if egl_context == EGL_NO_CONTEXT {
             anyhow::bail!("eglCreateContext failed");
         }
@@ -316,8 +312,7 @@ impl EglRenderer {
             anyhow::bail!("eglCreateWindowSurface failed");
         }
 
-        let ok =
-            unsafe { eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context) };
+        let ok = unsafe { eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context) };
         if ok == EGL_FALSE {
             anyhow::bail!("eglMakeCurrent failed");
         }
@@ -391,10 +386,7 @@ impl EglRenderer {
     }
 
     /// Drain all pending decoded frames from `frame_rx`, rendering the latest.
-    pub fn drain_frames(
-        &mut self,
-        frame_rx: &mpsc::Receiver<DecodedFrame>,
-    ) -> Result<usize> {
+    pub fn drain_frames(&mut self, frame_rx: &mpsc::Receiver<DecodedFrame>) -> Result<usize> {
         let mut latest: Option<DecodedFrame> = None;
         let mut count = 0usize;
         loop {
@@ -522,8 +514,7 @@ impl Drop for EglRenderer {
 
 fn compile_program() -> Result<u32> {
     let vert = compile_shader(GL_VERTEX_SHADER, VERT_SRC).context("vertex shader")?;
-    let frag =
-        compile_shader(GL_FRAGMENT_SHADER, FRAG_SRC).context("fragment shader")?;
+    let frag = compile_shader(GL_FRAGMENT_SHADER, FRAG_SRC).context("fragment shader")?;
     let prog = unsafe { glCreateProgram() };
     unsafe {
         glAttachShader(prog, vert);

@@ -161,8 +161,12 @@ async fn run_pipeline_async(port: u16) -> Result<()> {
 
     tokio::spawn(transport_relay(transport, send_rx, packet_tx));
 
-    let mut display = spawn_display_thread((INITIAL_OUTPUT_W, INITIAL_OUTPUT_H), frame_rx, RendererKind::Shm)
-        .context("spawn display thread")?;
+    let mut display = spawn_display_thread(
+        (INITIAL_OUTPUT_W, INITIAL_OUTPUT_H),
+        frame_rx,
+        RendererKind::Shm,
+    )
+    .context("spawn display thread")?;
     let (_, decoded_count) = native_client::decode::sw::spawn_decoder_thread(packet_rx, frame_tx);
 
     // Handshake: send Ready, then wait for the display thread to receive the
@@ -180,7 +184,14 @@ async fn run_pipeline_async(port: u16) -> Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let (initial_w, initial_h) = *display.size_rx.borrow();
     eprintln!("resize_e2e: labwc initial configure: {initial_w}×{initial_h}");
-    send(&send_tx, &SignalingMessage::Resize { width: initial_w, height: initial_h }).await?;
+    send(
+        &send_tx,
+        &SignalingMessage::Resize {
+            width: initial_w,
+            height: initial_h,
+        },
+    )
+    .await?;
 
     // ── Phase 1: verify initial rendering ─────────────────────────────────────
     eprintln!("resize_e2e: waiting for first rendered frame…");
@@ -192,7 +203,10 @@ async fn run_pipeline_async(port: u16) -> Result<()> {
 
     grim_screenshot(SCREENSHOT_INITIAL)?;
     let initial_white = ppm_white_fraction(SCREENSHOT_INITIAL)?;
-    eprintln!("resize_e2e: initial screenshot — {:.1}% white", initial_white * 100.0);
+    eprintln!(
+        "resize_e2e: initial screenshot — {:.1}% white",
+        initial_white * 100.0
+    );
     if initial_white < COLOR_THRESHOLD {
         return Err(anyhow!(
             "initial screenshot only {:.1}% white (expected ≥{:.0}%). \
@@ -217,26 +231,33 @@ async fn run_pipeline_async(port: u16) -> Result<()> {
     // Wait for the display thread to receive and process the resize configure.
     // Direct changed() (not on a clone) so the version advances past this
     // point; Phase 3 wait_for_render_count does not call changed() again.
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        display.size_rx.changed(),
-    )
-    .await
-    .context("size_rx never changed after wlr-randr resize")??;
+    tokio::time::timeout(Duration::from_secs(5), display.size_rx.changed())
+        .await
+        .context("size_rx never changed after wlr-randr resize")??;
     // Settle in case labwc sends a follow-up configure.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let (resized_w, resized_h) = *display.size_rx.borrow();
     eprintln!("resize_e2e: display thread configured at {resized_w}×{resized_h}");
 
     // Tell the server to encode at the new size.
-    send(&send_tx, &SignalingMessage::Resize { width: resized_w, height: resized_h }).await?;
+    send(
+        &send_tx,
+        &SignalingMessage::Resize {
+            width: resized_w,
+            height: resized_h,
+        },
+    )
+    .await?;
     eprintln!(
         "resize_e2e: Resize({resized_w},{resized_h}) sent to server; waiting for new frames…"
     );
 
     // ── Phase 3: confirm pipeline works at new size (still white) ─────────────
     wait_for_render_count(
-        &display, pre_resize_count + 2, POST_RESIZE_FRAME_TIMEOUT, &decoded_count,
+        &display,
+        pre_resize_count + 2,
+        POST_RESIZE_FRAME_TIMEOUT,
+        &decoded_count,
     )
     .await
     .map_err(|e| {
@@ -263,7 +284,10 @@ async fn run_pipeline_async(port: u16) -> Result<()> {
     eprintln!("resize_e2e: payload switched to black; waiting for dark frames…");
 
     wait_for_render_count(
-        &display, post_resize_count + 3, POST_RESIZE_FRAME_TIMEOUT, &decoded_count,
+        &display,
+        post_resize_count + 3,
+        POST_RESIZE_FRAME_TIMEOUT,
+        &decoded_count,
     )
     .await
     .map_err(|e| {
@@ -281,7 +305,10 @@ async fn run_pipeline_async(port: u16) -> Result<()> {
 
     grim_screenshot(SCREENSHOT_RESIZED)?;
     let post_dark = ppm_black_fraction(SCREENSHOT_RESIZED)?;
-    eprintln!("resize_e2e: post-switch screenshot — {:.1}% dark", post_dark * 100.0);
+    eprintln!(
+        "resize_e2e: post-switch screenshot — {:.1}% dark",
+        post_dark * 100.0
+    );
     if post_dark < COLOR_THRESHOLD {
         return Err(anyhow!(
             "post-resize screenshot only {:.1}% dark after switching payload to black \
@@ -395,8 +422,10 @@ fn grim_screenshot(path: &str) -> Result<()> {
 fn wlr_randr_set_mode(w: u32, h: u32) -> Result<()> {
     let status = Command::new("wlr-randr")
         .args([
-            "--output", HEADLESS_OUTPUT,
-            "--custom-mode", &format!("{w}x{h}@60Hz"),
+            "--output",
+            HEADLESS_OUTPUT,
+            "--custom-mode",
+            &format!("{w}x{h}@60Hz"),
         ])
         .env("WAYLAND_DISPLAY", "wayland-0")
         .env("XDG_RUNTIME_DIR", LABWC_SOCKET_DIR)
@@ -421,7 +450,9 @@ fn ppm_color_fraction(path: &str, pred: impl Fn(u8, u8, u8) -> bool) -> Result<f
     let mut pos = 0;
     let mut nl = 0;
     while nl < 3 && pos < bytes.len() {
-        if bytes[pos] == b'\n' { nl += 1; }
+        if bytes[pos] == b'\n' {
+            nl += 1;
+        }
         pos += 1;
     }
     if nl < 3 {
@@ -442,7 +473,9 @@ fn ppm_color_fraction(path: &str, pred: impl Fn(u8, u8, u8) -> bool) -> Result<f
         sampled += 1;
         i += 3 * stride;
     }
-    if sampled == 0 { return Ok(0.0); }
+    if sampled == 0 {
+        return Ok(0.0);
+    }
     Ok(matched as f64 / sampled as f64)
 }
 
@@ -502,15 +535,21 @@ fn spawn_server(port: u16) -> Result<Child> {
     let stderr = std::fs::File::create(SERVER_ERR).context("create server err log")?;
     Command::new(server_bin)
         .args([
-            "--display-name", "wayland-wws-resize-e2e",
-            "--port", &port.to_string(),
-            "--listen-addr", "127.0.0.1",
-            "--encoder", "x264",
+            "--display-name",
+            "wayland-wws-resize-e2e",
+            "--port",
+            &port.to_string(),
+            "--listen-addr",
+            "127.0.0.1",
+            "--encoder",
+            "x264",
             "--no-audio",
             "--",
             payload_bin.to_str().unwrap(),
-            "--color", "white",
-            "--control-file", CONTROL_FILE,
+            "--color",
+            "white",
+            "--control-file",
+            CONTROL_FILE,
         ])
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
@@ -523,10 +562,14 @@ fn locate_binary(name: &str, env_var: &str) -> PathBuf {
         return PathBuf::from(p);
     }
     let manifest = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    let ws = std::path::Path::new(&manifest).parent().expect("workspace root");
+    let ws = std::path::Path::new(&manifest)
+        .parent()
+        .expect("workspace root");
     for profile in &["debug", "release"] {
         let c = ws.join("target").join(profile).join(name);
-        if c.exists() { return c; }
+        if c.exists() {
+            return c;
+        }
     }
     panic!("could not find `{name}` in target/debug or target/release");
 }
@@ -547,7 +590,9 @@ fn wait_for_server(host: &str, port: u16, timeout: Duration) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Err(anyhow!("no TCP listener on {host}:{port} within {timeout:.0?}"))
+    Err(anyhow!(
+        "no TCP listener on {host}:{port} within {timeout:.0?}"
+    ))
 }
 
 fn labwc_socket_path() -> PathBuf {
@@ -557,17 +602,24 @@ fn labwc_socket_path() -> PathBuf {
 fn wait_for_wayland_socket(path: &std::path::Path, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if path.exists() { return Ok(()); }
+        if path.exists() {
+            return Ok(());
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
-    Err(anyhow!("Wayland socket {:?} never appeared within {timeout:.0?}", path))
+    Err(anyhow!(
+        "Wayland socket {:?} never appeared within {timeout:.0?}",
+        path
+    ))
 }
 
 fn which(bin: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     for dir in env::split_paths(&path) {
         let c = dir.join(bin);
-        if c.is_file() { return Some(c); }
+        if c.is_file() {
+            return Some(c);
+        }
     }
     None
 }

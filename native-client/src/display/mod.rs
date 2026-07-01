@@ -27,8 +27,8 @@ use tracing::{debug, info, warn};
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer,
-    delegate_registry, delegate_seat, delegate_shm, delegate_xdg_shell, delegate_xdg_window,
+    delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat, delegate_shm, delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -230,14 +230,12 @@ fn run_display_loop(
     // Bind SCTK-managed globals.
     let compositor_state =
         CompositorState::bind(&globals, &qh).context("wl_compositor not available")?;
-    let xdg_shell_state =
-        XdgShell::bind(&globals, &qh).context("xdg_wm_base not available")?;
+    let xdg_shell_state = XdgShell::bind(&globals, &qh).context("xdg_wm_base not available")?;
     let shm_state = Shm::bind(&globals, &qh).context("wl_shm not available")?;
 
     // Surface + window (no buffer yet; initial empty commit triggers configure).
     let surface = compositor_state.create_surface(&qh);
-    let window =
-        xdg_shell_state.create_window(surface, WindowDecorations::RequestServer, &qh);
+    let window = xdg_shell_state.create_window(surface, WindowDecorations::RequestServer, &qh);
     window.set_title("waylandwebstream");
     window.set_app_id("rs.waylandwebstream.client");
     window.set_min_size(Some((16, 16)));
@@ -267,7 +265,9 @@ fn run_display_loop(
     };
 
     // First roundtrip: compositor delivers the initial Configure + seat capabilities.
-    event_queue.roundtrip(&mut state).context("initial roundtrip")?;
+    event_queue
+        .roundtrip(&mut state)
+        .context("initial roundtrip")?;
 
     if !state.configured {
         warn!("no initial configure; using {initial_size:?}");
@@ -326,21 +326,30 @@ fn run_display_loop(
 
         tracing::trace!(
             "tick: slot_state={}",
-            state.renderer.as_ref().map(|r| r.slot_state()).unwrap_or_default()
+            state
+                .renderer
+                .as_ref()
+                .map(|r| r.slot_state())
+                .unwrap_or_default()
         );
 
         // Non-blocking socket read then dispatch.
         if let Some(guard) = event_queue.prepare_read() {
             let _ = guard.read();
         }
-        event_queue.dispatch_pending(&mut state).context("dispatch_pending")?;
+        event_queue
+            .dispatch_pending(&mut state)
+            .context("dispatch_pending")?;
         event_queue.flush().ok();
 
         // Synthetic resize injection (used by integration tests to simulate a
         // compositor configure without needing to resize an actual Wayland output).
         if let Ok((w, h)) = synthetic_resize_rx.try_recv() {
             if (w, h) != (state.width, state.height) {
-                debug!("synthetic resize inject: {}x{} → {w}x{h}", state.width, state.height);
+                debug!(
+                    "synthetic resize inject: {}x{} → {w}x{h}",
+                    state.width, state.height
+                );
                 state.width = w;
                 state.height = h;
                 let _ = state.size_tx.send((w, h));
@@ -480,13 +489,7 @@ impl OutputHandler for DisplayState {
 
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: wl_output::WlOutput,
-    ) {
-    }
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
 
 impl WindowHandler for DisplayState {
@@ -518,7 +521,10 @@ impl WindowHandler for DisplayState {
             // Signal main.rs so it sends the real compositor-assigned size as
             // the initial Resize, not the hard-coded INITIAL_WINDOW_SIZE.
             let _ = self.size_tx.send((w, h));
-            debug!("initial configure: {w}x{h} decoration={:?}", configure.decoration_mode);
+            debug!(
+                "initial configure: {w}x{h} decoration={:?}",
+                configure.decoration_mode
+            );
         } else if (w, h) != (self.width, self.height) {
             debug!("resize configure: {}x{} → {w}x{h}", self.width, self.height);
             self.width = w;
@@ -620,7 +626,9 @@ impl KeyboardHandler for DisplayState {
         // wl_keyboard::Event::Key { key } field carried, so evdev_to_code works as-is.
         match evdev_to_code(event.raw_code) {
             Some(code) => self.send_input(SignalingMessage::Key {
-                event: KeyboardEvent::Down { code: code.to_string() },
+                event: KeyboardEvent::Down {
+                    code: code.to_string(),
+                },
             }),
             None => debug!(
                 "unknown evdev scancode {} (keysym={:?})",
@@ -639,7 +647,9 @@ impl KeyboardHandler for DisplayState {
     ) {
         if let Some(code) = evdev_to_code(event.raw_code) {
             self.send_input(SignalingMessage::Key {
-                event: KeyboardEvent::Up { code: code.to_string() },
+                event: KeyboardEvent::Up {
+                    code: code.to_string(),
+                },
             });
         }
     }
@@ -723,7 +733,11 @@ impl PointerHandler for DisplayState {
                         },
                     });
                 }
-                PointerEventKind::Axis { horizontal, vertical, .. } => {
+                PointerEventKind::Axis {
+                    horizontal,
+                    vertical,
+                    ..
+                } => {
                     let (x, y) = self.pointer_pos;
                     self.send_input(SignalingMessage::Pointer {
                         event: MouseEvent::Wheel {
@@ -781,7 +795,10 @@ impl Dispatch<wl_buffer::WlBuffer, SlotId> for DisplayState {
         _: &QueueHandle<Self>,
     ) {
         if let wl_buffer::Event::Release = event {
-            state.counters.release.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state
+                .counters
+                .release
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             debug!("wl_buffer::Release slot={slot_id}");
             if let Some(r) = state.renderer.as_mut() {
                 r.release_slot(*slot_id);

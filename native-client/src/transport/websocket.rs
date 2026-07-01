@@ -5,9 +5,7 @@
 use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{
-    connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream,
-};
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 use super::{Frame, FrameError, Transport};
 use crate::proto;
@@ -116,8 +114,7 @@ pub fn parse_frame(data: &[u8]) -> Result<Frame, FrameError> {
             } else {
                 0.0
             };
-            let capture_to_encode_ms =
-                f64::from_be_bytes(payload[12..20].try_into().unwrap());
+            let capture_to_encode_ms = f64::from_be_bytes(payload[12..20].try_into().unwrap());
             let h264 = payload[20..].to_vec();
             Ok(Frame::VideoFrame {
                 is_keyframe: (flags & proto::FLAG_KEYFRAME) != 0,
@@ -261,35 +258,29 @@ mod tests {
         bad[5] = 0;
         bad[6] = 0;
         bad[7] = 0;
-        assert!(matches!(
-            parse_frame(&bad),
-            Err(FrameError::BadHeader(_))
-        ));
+        assert!(matches!(parse_frame(&bad), Err(FrameError::BadHeader(_))));
     }
 
     #[test]
     fn rejects_unknown_type() {
         let frame = proto::encode_msg(0xEE, 0, &[1, 2, 3]);
-        assert!(matches!(parse_frame(&frame), Err(FrameError::UnknownType(0xEE))));
+        assert!(matches!(
+            parse_frame(&frame),
+            Err(FrameError::UnknownType(0xEE))
+        ));
     }
 
     #[test]
     fn rejects_short_video_payload() {
         let payload = vec![0u8; 10]; // < 20 bytes required for video
         let frame = proto::encode_msg(proto::MSG_VIDEO_FRAME, 0, &payload);
-        assert!(matches!(
-            parse_frame(&frame),
-            Err(FrameError::BadHeader(_))
-        ));
+        assert!(matches!(parse_frame(&frame), Err(FrameError::BadHeader(_))));
     }
 
     #[test]
     fn rejects_short_audio_payload() {
         let payload = vec![0u8; 4]; // < 8 bytes required for audio
         let frame = proto::encode_msg(proto::MSG_AUDIO_FRAME, 0, &payload);
-        assert!(matches!(
-            parse_frame(&frame),
-            Err(FrameError::BadHeader(_))
-        ));
+        assert!(matches!(parse_frame(&frame), Err(FrameError::BadHeader(_))));
     }
 }

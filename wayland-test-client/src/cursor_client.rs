@@ -9,8 +9,7 @@
 use std::os::unix::io::AsFd;
 use wayland_client::{
     protocol::{
-        wl_buffer, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
-        wl_surface,
+        wl_buffer, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
     },
     Connection, Dispatch, QueueHandle,
 };
@@ -80,10 +79,22 @@ fn main() {
     let pool = shm.create_pool(tmp.as_fd(), pool_size as i32, &qh, ());
 
     let window_buffer = pool.create_buffer(
-        0, WIN_W, WIN_H, win_stride, wl_shm::Format::Argb8888, &qh, (),
+        0,
+        WIN_W,
+        WIN_H,
+        win_stride,
+        wl_shm::Format::Argb8888,
+        &qh,
+        (),
     );
     let cursor_buffer = pool.create_buffer(
-        win_size as i32, CUR_W, CUR_H, cur_stride, wl_shm::Format::Argb8888, &qh, (),
+        win_size as i32,
+        CUR_W,
+        CUR_H,
+        cur_stride,
+        wl_shm::Format::Argb8888,
+        &qh,
+        (),
     );
 
     // Create and commit the cursor surface (no xdg role; role is set by
@@ -95,7 +106,11 @@ fn main() {
 
     // Create and map the main window.
     let surface = state.compositor.as_ref().unwrap().create_surface(&qh, ());
-    let xdg_surface = state.wm_base.as_ref().unwrap().get_xdg_surface(&surface, &qh, ());
+    let xdg_surface = state
+        .wm_base
+        .as_ref()
+        .unwrap()
+        .get_xdg_surface(&surface, &qh, ());
     let _toplevel = xdg_surface.get_toplevel(&qh, ());
     let _pointer = state.seat.as_ref().unwrap().get_pointer(&qh, ());
     surface.commit();
@@ -141,13 +156,33 @@ struct AppState {
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
-    fn event(state: &mut Self, registry: &wl_registry::WlRegistry, event: wl_registry::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
+    fn event(
+        state: &mut Self,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
             match &interface[..] {
-                "wl_compositor" => { state.compositor = Some(registry.bind(name, version, qh, ())); }
-                "wl_shm"        => { state.shm        = Some(registry.bind(name, version, qh, ())); }
-                "xdg_wm_base"  => { state.wm_base    = Some(registry.bind(name, version, qh, ())); }
-                "wl_seat"       => { state.seat       = Some(registry.bind(name, version, qh, ())); }
+                "wl_compositor" => {
+                    state.compositor = Some(registry.bind(name, version, qh, ()));
+                }
+                "wl_shm" => {
+                    state.shm = Some(registry.bind(name, version, qh, ()));
+                }
+                "xdg_wm_base" => {
+                    state.wm_base = Some(registry.bind(name, version, qh, ()));
+                }
+                "wl_seat" => {
+                    state.seat = Some(registry.bind(name, version, qh, ()));
+                }
                 _ => {}
             }
         }
@@ -155,22 +190,69 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
 }
 
 impl Dispatch<wl_compositor::WlCompositor, ()> for AppState {
-    fn event(_: &mut Self, _: &wl_compositor::WlCompositor, _: wl_compositor::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wl_compositor::WlCompositor,
+        _: wl_compositor::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<wl_surface::WlSurface, ()> for AppState {
-    fn event(_: &mut Self, _: &wl_surface::WlSurface, _: wl_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wl_surface::WlSurface,
+        _: wl_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<wl_shm::WlShm, ()> for AppState {
-    fn event(_: &mut Self, _: &wl_shm::WlShm, _: wl_shm::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wl_shm::WlShm,
+        _: wl_shm::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<wl_shm_pool::WlShmPool, ()> for AppState {
-    fn event(_: &mut Self, _: &wl_shm_pool::WlShmPool, _: wl_shm_pool::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wl_shm_pool::WlShmPool,
+        _: wl_shm_pool::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<wl_buffer::WlBuffer, ()> for AppState {
-    fn event(_: &mut Self, _: &wl_buffer::WlBuffer, _: wl_buffer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wl_buffer::WlBuffer,
+        _: wl_buffer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<wl_seat::WlSeat, ()> for AppState {
-    fn event(state: &mut Self, seat: &wl_seat::WlSeat, event: wl_seat::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
+    fn event(
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
         if let wl_seat::Event::Capabilities { capabilities } = event {
             use wayland_client::WEnum;
             if let WEnum::Value(caps) = capabilities {
@@ -182,23 +264,57 @@ impl Dispatch<wl_seat::WlSeat, ()> for AppState {
     }
 }
 impl Dispatch<xdg_wm_base::XdgWmBase, ()> for AppState {
-    fn event(_: &mut Self, base: &xdg_wm_base::XdgWmBase, event: xdg_wm_base::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-        if let xdg_wm_base::Event::Ping { serial } = event { base.pong(serial); }
+    fn event(
+        _: &mut Self,
+        base: &xdg_wm_base::XdgWmBase,
+        event: xdg_wm_base::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_wm_base::Event::Ping { serial } = event {
+            base.pong(serial);
+        }
     }
 }
 impl Dispatch<xdg_surface::XdgSurface, ()> for AppState {
-    fn event(_: &mut Self, xdg: &xdg_surface::XdgSurface, event: xdg_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-        if let xdg_surface::Event::Configure { serial } = event { xdg.ack_configure(serial); }
+    fn event(
+        _: &mut Self,
+        xdg: &xdg_surface::XdgSurface,
+        event: xdg_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_surface::Event::Configure { serial } = event {
+            xdg.ack_configure(serial);
+        }
     }
 }
 impl Dispatch<xdg_toplevel::XdgToplevel, ()> for AppState {
-    fn event(state: &mut Self, _: &xdg_toplevel::XdgToplevel, event: xdg_toplevel::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-        if let xdg_toplevel::Event::Close = event { state.running = false; }
+    fn event(
+        state: &mut Self,
+        _: &xdg_toplevel::XdgToplevel,
+        event: xdg_toplevel::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_toplevel::Event::Close = event {
+            state.running = false;
+        }
     }
 }
 
 impl Dispatch<wl_pointer::WlPointer, ()> for AppState {
-    fn event(state: &mut Self, pointer: &wl_pointer::WlPointer, event: wl_pointer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        state: &mut Self,
+        pointer: &wl_pointer::WlPointer,
+        event: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         match event {
             wl_pointer::Event::Enter { serial, .. } => {
                 println!("pointer enter (serial {serial}), setting magenta cursor");

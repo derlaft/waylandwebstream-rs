@@ -72,7 +72,10 @@ async fn main() -> Result<()> {
         "egl" => RendererKind::Egl,
         _ => RendererKind::Shm,
     };
-    info!("wws-client starting ({:?}, renderer={:?})", transport_spec, renderer_kind);
+    info!(
+        "wws-client starting ({:?}, renderer={:?})",
+        transport_spec, renderer_kind
+    );
 
     // --- channels ---
     // capacity 4: small but not 1; absorbs one-frame scheduler jitter
@@ -132,8 +135,7 @@ async fn main() -> Result<()> {
 
     // --- latency tracker (Phase 8) ---
     let mut tracker = LatencyTracker::new();
-    let mut latency_tick =
-        tokio::time::interval(Duration::from_secs(LATENCY_INTERVAL_SECS));
+    let mut latency_tick = tokio::time::interval(Duration::from_secs(LATENCY_INTERVAL_SECS));
     // Don't fire immediately on startup — let the pipeline warm up.
     latency_tick.tick().await;
 

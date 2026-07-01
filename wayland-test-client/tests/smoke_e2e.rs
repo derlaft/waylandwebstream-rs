@@ -121,20 +121,16 @@ fn run_visual_pipeline(port: u16) -> Result<()> {
             .context("send Ready")?;
 
         let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel(1);
-        let display =
-            spawn_display_thread((1280, 720), frame_rx, RendererKind::Shm)
-                .context("spawn display thread")?;
+        let display = spawn_display_thread((1280, 720), frame_rx, RendererKind::Shm)
+            .context("spawn display thread")?;
         eprintln!("smoke_e2e: display thread spawned");
 
         // Wait for the display thread to receive the actual window size from
         // labwc (labwc may differ from the initial 1280×720 due to server-side
         // decorations). Using that size for Resize keeps the server in sync.
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            display.size_rx.clone().changed(),
-        )
-        .await
-        .context("display thread never received initial configure")??;
+        tokio::time::timeout(Duration::from_secs(5), display.size_rx.clone().changed())
+            .await
+            .context("display thread never received initial configure")??;
         // Settle — labwc often sends a second configure shortly after the first.
         tokio::time::sleep(Duration::from_millis(200)).await;
         let (actual_w, actual_h) = *display.size_rx.borrow();
@@ -153,15 +149,20 @@ fn run_visual_pipeline(port: u16) -> Result<()> {
         let (_decoder, decoded_count) = spawn_decoder(transport, frame_tx).await?;
         eprintln!("smoke_e2e: decoder spawned");
 
-        let elapsed = wait_for_render_count(&display, 1, FIRST_FRAME_TIMEOUT, &decoded_count).await?;
+        let elapsed =
+            wait_for_render_count(&display, 1, FIRST_FRAME_TIMEOUT, &decoded_count).await?;
         eprintln!("smoke_e2e: first rendered frame at t={elapsed:?}");
         // Wait for at least a couple of vsyncs + margin so the screenshot
         // sees the actual frame content, not the prime buffer.
         tokio::time::sleep(Duration::from_millis(500)).await;
         eprintln!(
             "smoke_e2e: after settle: render_count={} release_count={}",
-            display.render_counter.load(std::sync::atomic::Ordering::Relaxed),
-            display.release_counter.load(std::sync::atomic::Ordering::Relaxed),
+            display
+                .render_counter
+                .load(std::sync::atomic::Ordering::Relaxed),
+            display
+                .release_counter
+                .load(std::sync::atomic::Ordering::Relaxed),
         );
 
         grim_screenshot(SCREENSHOT_INITIAL).context("grim initial screenshot")?;
@@ -216,7 +217,10 @@ fn run_visual_pipeline(port: u16) -> Result<()> {
 async fn spawn_decoder(
     mut transport: WsTransport,
     frame_tx: std::sync::mpsc::SyncSender<native_client::decode::sw::DecodedFrame>,
-) -> Result<(tokio::task::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicU64>)> {
+) -> Result<(
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+)> {
     use native_client::decode::sw::spawn_decoder_thread;
     let (packet_tx, packet_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
     let ws_frame_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -227,11 +231,19 @@ async fn spawn_decoder(
             match transport.recv().await {
                 Ok(Frame::VideoFrame { data, .. }) => {
                     let n = ws_frame_count2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n < 3 { eprintln!("smoke_e2e: ws video frame #{n} len={}", data.len()); }
+                    if n < 3 {
+                        eprintln!("smoke_e2e: ws video frame #{n} len={}", data.len());
+                    }
                     let _ = packet_tx.try_send(data);
                 }
-                Ok(_) => { ctrl += 1; eprintln!("smoke_e2e: ws ctrl frame #{ctrl}"); }
-                Err(e) => { eprintln!("smoke_e2e: ws recv error: {e:#}"); break; }
+                Ok(_) => {
+                    ctrl += 1;
+                    eprintln!("smoke_e2e: ws ctrl frame #{ctrl}");
+                }
+                Err(e) => {
+                    eprintln!("smoke_e2e: ws recv error: {e:#}");
+                    break;
+                }
             }
         }
         eprintln!("smoke_e2e: ws recv loop exited");
@@ -249,7 +261,9 @@ async fn wait_for_render_count(
     let start = Instant::now();
     let mut last_log = Instant::now();
     loop {
-        let now = display.render_counter.load(std::sync::atomic::Ordering::Relaxed);
+        let now = display
+            .render_counter
+            .load(std::sync::atomic::Ordering::Relaxed);
         if now >= target {
             return Ok(start.elapsed());
         }
@@ -311,7 +325,7 @@ fn ppm_color_fraction(path: &str, predicate: impl Fn(u8, u8, u8) -> bool) -> Res
         }
         i += 3 * stride;
     }
-    let sampled = (total + stride - 1) / stride;
+    let sampled = total.div_ceil(stride);
     Ok(matched as f64 / sampled as f64)
 }
 
@@ -334,7 +348,8 @@ fn spawn_labwc() -> Result<Child> {
     }
     let labwc_bin = which("labwc").ok_or_else(|| anyhow!("labwc not on PATH"))?;
     let log = std::fs::File::create(LABWC_LOG).context("create labwc log")?;
-    let err = std::fs::File::create("/tmp/wws-smoke-e2e-labwc.err").context("create labwc err log")?;
+    let err =
+        std::fs::File::create("/tmp/wws-smoke-e2e-labwc.err").context("create labwc err log")?;
     Command::new(labwc_bin)
         .arg("-V")
         .env("WLR_BACKENDS", "headless")
@@ -389,7 +404,10 @@ fn locate_binary(name: &str, env_override: &str) -> PathBuf {
             return candidate;
         }
     }
-    panic!("could not find `{name}` under {}", workspace.join("target").display());
+    panic!(
+        "could not find `{name}` under {}",
+        workspace.join("target").display()
+    );
 }
 
 fn pick_free_port() -> u16 {
@@ -405,7 +423,9 @@ fn wait_for_server(host: &str, port: u16, timeout: Duration) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Err(anyhow!("no TCP listener on {host}:{port} within {timeout:?}"))
+    Err(anyhow!(
+        "no TCP listener on {host}:{port} within {timeout:?}"
+    ))
 }
 
 fn wait_for_wayland_socket(path: &std::path::Path, timeout: Duration) -> Result<()> {

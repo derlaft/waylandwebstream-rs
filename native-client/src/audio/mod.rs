@@ -40,8 +40,8 @@ impl AudioPlayer {
     /// skipping the PipeWire thread. Only for unit tests.
     #[cfg(test)]
     pub(crate) fn new_with_sender(tx: mpsc::SyncSender<Vec<f32>>) -> Result<Self> {
-        let decoder = OpusDecoder::new(SAMPLE_RATE, Channels::Stereo)
-            .context("create Opus decoder")?;
+        let decoder =
+            OpusDecoder::new(SAMPLE_RATE, Channels::Stereo).context("create Opus decoder")?;
         Ok(Self { tx, decoder })
     }
 
@@ -84,6 +84,125 @@ impl AudioPlayer {
 }
 
 // ---------------------------------------------------------------------------
+// PipeWire playback thread
+// ---------------------------------------------------------------------------
+
+struct PlaybackState {
+    rx: mpsc::Receiver<Vec<f32>>,
+    // Accumulates decoded samples that span more than one PW quantum.
+    buf: Vec<f32>,
+}
+
+fn run_playback_loop(rx: mpsc::Receiver<Vec<f32>>) -> Result<()> {
+    pw::init();
+
+    let main_loop = pw::main_loop::MainLoopBox::new(None).context("PipeWire main loop")?;
+    let context =
+        pw::context::ContextBox::new(main_loop.loop_(), None).context("PipeWire context")?;
+    let core = context
+        .connect(None)
+        .context("connect to PipeWire daemon")?;
+
+    let state = PlaybackState {
+        rx,
+        buf: Vec::with_capacity(OPUS_FRAME_SAMPLES * CHANNELS as usize * 4),
+    };
+
+    let props = properties! {
+        *pw::keys::MEDIA_TYPE     => "Audio",
+        *pw::keys::MEDIA_CATEGORY => "Playback",
+        *pw::keys::MEDIA_ROLE     => "Music",
+        "node.name"               => "wws-client-audio",
+    };
+
+    let stream = pw::stream::StreamBox::new(&core, "wws-client-audio", props)
+        .context("create PipeWire stream")?;
+
+    let _listener = stream
+        .add_local_listener_with_user_data(state)
+        .process(|stream, state| {
+            // Pull all queued decoded frames into our local buffer first.
+            while let Ok(pcm) = state.rx.try_recv() {
+                state.buf.extend_from_slice(&pcm);
+            }
+
+            let Some(mut buf) = stream.dequeue_buffer() else {
+                return;
+            };
+            let datas = buf.datas_mut();
+            if datas.is_empty() {
+                return;
+            }
+            let data = &mut datas[0];
+            let Some(raw_bytes) = data.data() else {
+                return;
+            };
+
+            let capacity_f32 = raw_bytes.len() / std::mem::size_of::<f32>();
+            let n_copy = capacity_f32.min(state.buf.len());
+
+            // Write available samples to PW buffer.
+            if n_copy > 0 {
+                let n_bytes = n_copy * std::mem::size_of::<f32>();
+                // SAFETY: f32 is Copy, the source and dest don't overlap,
+                // and raw_bytes is large enough (checked via capacity_f32).
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        state.buf.as_ptr() as *const u8,
+                        raw_bytes.as_mut_ptr(),
+                        n_bytes,
+                    );
+                }
+                state.buf.drain(..n_copy);
+            }
+
+            // Pad remainder with silence to avoid buffer underruns.
+            let silence_start = n_copy * std::mem::size_of::<f32>();
+            raw_bytes[silence_start..].fill(0);
+
+            let total_bytes = capacity_f32 * std::mem::size_of::<f32>();
+            let chunk = data.chunk_mut();
+            *chunk.offset_mut() = 0;
+            *chunk.stride_mut() = (CHANNELS as usize * std::mem::size_of::<f32>()) as i32;
+            *chunk.size_mut() = total_bytes as u32;
+        })
+        .register()
+        .context("register PipeWire stream listener")?;
+
+    // Negotiate F32LE 48 kHz stereo output (mirrors the server's capture format).
+    let mut audio_info = AudioInfoRaw::new();
+    audio_info.set_format(AudioFormat::F32LE);
+    audio_info.set_rate(SAMPLE_RATE);
+    audio_info.set_channels(CHANNELS);
+
+    let obj = Object {
+        type_: SpaTypes::ObjectParamFormat.as_raw(),
+        id: ParamType::EnumFormat.as_raw(),
+        properties: audio_info.into(),
+    };
+    let values: Vec<u8> =
+        PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
+            .context("serialize audio format pod")?
+            .0
+            .into_inner();
+
+    let mut params = [Pod::from_bytes(&values).expect("audio format pod is well-formed")];
+
+    stream
+        .connect(
+            Direction::Output,
+            None,
+            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
+            &mut params,
+        )
+        .context("connect PipeWire output stream")?;
+
+    info!("PipeWire audio playback stream connected (F32LE 48 kHz stereo)");
+    main_loop.run();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -100,8 +219,7 @@ mod tests {
 
     /// Encode `pcm` (F32LE stereo) to a valid Opus packet.
     fn encode_pcm(pcm: &[f32]) -> Vec<u8> {
-        let mut enc =
-            OpusEncoder::new(SAMPLE_RATE, Channels::Stereo, Application::Audio).unwrap();
+        let mut enc = OpusEncoder::new(SAMPLE_RATE, Channels::Stereo, Application::Audio).unwrap();
         let mut out = vec![0u8; 4096];
         let n = enc.encode_float(pcm, &mut out).unwrap();
         out.truncate(n);
@@ -126,10 +244,7 @@ mod tests {
         );
         // Opus may add a tiny bit of ringing but silence should decode near-zero.
         for (i, &s) in pcm_out.iter().enumerate() {
-            assert!(
-                s.abs() < 1e-3,
-                "sample[{i}] = {s} is not near silence"
-            );
+            assert!(s.abs() < 1e-3, "sample[{i}] = {s} is not near silence");
         }
     }
 
@@ -181,129 +296,4 @@ mod tests {
             assert!(player.push_opus(&pkt).is_ok());
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// PipeWire playback thread
-// ---------------------------------------------------------------------------
-
-struct PlaybackState {
-    rx: mpsc::Receiver<Vec<f32>>,
-    // Accumulates decoded samples that span more than one PW quantum.
-    buf: Vec<f32>,
-}
-
-fn run_playback_loop(rx: mpsc::Receiver<Vec<f32>>) -> Result<()> {
-    pw::init();
-
-    let main_loop =
-        pw::main_loop::MainLoopBox::new(None).context("PipeWire main loop")?;
-    let context = pw::context::ContextBox::new(main_loop.loop_(), None)
-        .context("PipeWire context")?;
-    let core = context
-        .connect(None)
-        .context("connect to PipeWire daemon")?;
-
-    let state = PlaybackState {
-        rx,
-        buf: Vec::with_capacity(OPUS_FRAME_SAMPLES * CHANNELS as usize * 4),
-    };
-
-    let props = properties! {
-        *pw::keys::MEDIA_TYPE     => "Audio",
-        *pw::keys::MEDIA_CATEGORY => "Playback",
-        *pw::keys::MEDIA_ROLE     => "Music",
-        "node.name"               => "wws-client-audio",
-    };
-
-    let stream =
-        pw::stream::StreamBox::new(&core, "wws-client-audio", props)
-            .context("create PipeWire stream")?;
-
-    let _listener = stream
-        .add_local_listener_with_user_data(state)
-        .process(|stream, state| {
-            // Pull all queued decoded frames into our local buffer first.
-            while let Ok(pcm) = state.rx.try_recv() {
-                state.buf.extend_from_slice(&pcm);
-            }
-
-            let Some(mut buf) = stream.dequeue_buffer() else {
-                return;
-            };
-            let datas = buf.datas_mut();
-            if datas.is_empty() {
-                return;
-            }
-            let data = &mut datas[0];
-            let Some(raw_bytes) = data.data() else {
-                return;
-            };
-
-            let capacity_f32 = raw_bytes.len() / std::mem::size_of::<f32>();
-            let n_copy = capacity_f32.min(state.buf.len());
-
-            // Write available samples to PW buffer.
-            if n_copy > 0 {
-                let n_bytes = n_copy * std::mem::size_of::<f32>();
-                // SAFETY: f32 is Copy, the source and dest don't overlap,
-                // and raw_bytes is large enough (checked via capacity_f32).
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        state.buf.as_ptr() as *const u8,
-                        raw_bytes.as_mut_ptr(),
-                        n_bytes,
-                    );
-                }
-                state.buf.drain(..n_copy);
-            }
-
-            // Pad remainder with silence to avoid buffer underruns.
-            let silence_start = n_copy * std::mem::size_of::<f32>();
-            raw_bytes[silence_start..].fill(0);
-
-            let total_bytes = capacity_f32 * std::mem::size_of::<f32>();
-            let chunk = data.chunk_mut();
-            *chunk.offset_mut() = 0;
-            *chunk.stride_mut() =
-                (CHANNELS as usize * std::mem::size_of::<f32>()) as i32;
-            *chunk.size_mut() = total_bytes as u32;
-        })
-        .register()
-        .context("register PipeWire stream listener")?;
-
-    // Negotiate F32LE 48 kHz stereo output (mirrors the server's capture format).
-    let mut audio_info = AudioInfoRaw::new();
-    audio_info.set_format(AudioFormat::F32LE);
-    audio_info.set_rate(SAMPLE_RATE);
-    audio_info.set_channels(CHANNELS);
-
-    let obj = Object {
-        type_: SpaTypes::ObjectParamFormat.as_raw(),
-        id: ParamType::EnumFormat.as_raw(),
-        properties: audio_info.into(),
-    };
-    let values: Vec<u8> = PodSerializer::serialize(
-        std::io::Cursor::new(Vec::new()),
-        &Value::Object(obj),
-    )
-    .context("serialize audio format pod")?
-    .0
-    .into_inner();
-
-    let mut params =
-        [Pod::from_bytes(&values).expect("audio format pod is well-formed")];
-
-    stream
-        .connect(
-            Direction::Output,
-            None,
-            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
-            &mut params,
-        )
-        .context("connect PipeWire output stream")?;
-
-    info!("PipeWire audio playback stream connected (F32LE 48 kHz stereo)");
-    main_loop.run();
-    Ok(())
 }

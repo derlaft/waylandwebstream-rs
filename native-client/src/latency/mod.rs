@@ -18,6 +18,12 @@ pub struct LatencyTracker {
     last_frame_arrival: Option<Instant>,
 }
 
+impl Default for LatencyTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LatencyTracker {
     pub fn new() -> Self {
         Self {
@@ -43,14 +49,12 @@ impl LatencyTracker {
         }
         self.last_frame_arrival = Some(now);
 
-        if ping_echo != 0.0 {
-            if self.pending_ping_ts == Some(ping_echo) {
-                let rtt_ms = now_ms() - ping_echo;
-                if rtt_ms > 0.0 {
-                    self.last_network_ms = Some(rtt_ms / 2.0);
-                }
-                self.pending_ping_ts = None;
+        if ping_echo != 0.0 && self.pending_ping_ts == Some(ping_echo) {
+            let rtt_ms = now_ms() - ping_echo;
+            if rtt_ms > 0.0 {
+                self.last_network_ms = Some(rtt_ms / 2.0);
             }
+            self.pending_ping_ts = None;
         }
     }
 
@@ -98,9 +102,11 @@ mod tests {
 
     fn latency_fields(msg: SignalingMessage) -> (Option<f64>, u32) {
         match msg {
-            SignalingMessage::Latency { network_ms, burst_count, .. } => {
-                (network_ms, burst_count)
-            }
+            SignalingMessage::Latency {
+                network_ms,
+                burst_count,
+                ..
+            } => (network_ms, burst_count),
             other => panic!("expected Latency, got {other:?}"),
         }
     }
@@ -124,7 +130,10 @@ mod tests {
     fn second_maybe_ping_does_not_fire() {
         let mut t = LatencyTracker::new();
         t.maybe_ping(); // consume the initial one
-        assert!(t.maybe_ping().is_none(), "should not ping twice without 5 s gap");
+        assert!(
+            t.maybe_ping().is_none(),
+            "should not ping twice without 5 s gap"
+        );
     }
 
     // Simulate the server echoing the ping timestamp back inside a video
@@ -153,7 +162,10 @@ mod tests {
         t.record_arrival(1.0);
 
         let (network_ms, _) = latency_fields(t.flush_report());
-        assert!(network_ms.is_none(), "should not compute RTT from stale echo");
+        assert!(
+            network_ms.is_none(),
+            "should not compute RTT from stale echo"
+        );
     }
 
     // echo=0.0 is the sentinel for "no echo in this frame" and must be ignored.
@@ -207,6 +219,9 @@ mod tests {
 
         let (ms1, _) = latency_fields(t.flush_report());
         let (ms2, _) = latency_fields(t.flush_report()); // second flush, no new ping
-        assert_eq!(ms1, ms2, "network_ms should persist until a new RTT is measured");
+        assert_eq!(
+            ms1, ms2,
+            "network_ms should persist until a new RTT is measured"
+        );
     }
 }

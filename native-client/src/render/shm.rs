@@ -99,9 +99,7 @@ impl ShmRenderer {
         render_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<Self>
     where
-        State: Dispatch<wl_shm_pool::WlShmPool, u32>
-            + Dispatch<wl_buffer::WlBuffer, u32>
-            + 'static,
+        State: Dispatch<wl_shm_pool::WlShmPool, u32> + Dispatch<wl_buffer::WlBuffer, u32> + 'static,
     {
         let mut renderer = Self {
             shm,
@@ -119,14 +117,9 @@ impl ShmRenderer {
     /// Allocate a new slot for every `None` entry. Skips `Some` entries
     /// (including zombies) — overwriting a zombie would drop its WlBuffer
     /// while the compositor still holds it, bypassing the zombie invariant.
-    fn recreate_slots<State>(
-        &mut self,
-        qh: &QueueHandle<State>,
-    ) -> Result<()>
+    fn recreate_slots<State>(&mut self, qh: &QueueHandle<State>) -> Result<()>
     where
-        State: Dispatch<wl_shm_pool::WlShmPool, u32>
-            + Dispatch<wl_buffer::WlBuffer, u32>
-            + 'static,
+        State: Dispatch<wl_shm_pool::WlShmPool, u32> + Dispatch<wl_buffer::WlBuffer, u32> + 'static,
     {
         for idx in 0..NUM_SLOTS {
             if self.slots[idx].is_none() {
@@ -176,9 +169,7 @@ impl ShmRenderer {
         new_h: u32,
     ) -> bool
     where
-        State: Dispatch<wl_shm_pool::WlShmPool, u32>
-            + Dispatch<wl_buffer::WlBuffer, u32>
-            + 'static,
+        State: Dispatch<wl_shm_pool::WlShmPool, u32> + Dispatch<wl_buffer::WlBuffer, u32> + 'static,
     {
         self.resize(new_w, new_h);
         // Fill any freed (None) slots at the new size.
@@ -207,7 +198,8 @@ impl ShmRenderer {
         let slot = self.slots[idx].as_mut().unwrap();
         slot.released = false;
         self.surface.attach(Some(&slot.buffer), 0, 0);
-        self.surface.damage_buffer(0, 0, slot.width as i32, slot.height as i32);
+        self.surface
+            .damage_buffer(0, 0, slot.width as i32, slot.height as i32);
         self.surface.commit();
         self.next_idx = (idx + 1) % NUM_SLOTS;
         true
@@ -224,9 +216,7 @@ impl ShmRenderer {
         frame_rx: &mpsc::Receiver<DecodedFrame>,
     ) -> Result<usize>
     where
-        State: Dispatch<wl_shm_pool::WlShmPool, u32>
-            + Dispatch<wl_buffer::WlBuffer, u32>
-            + 'static,
+        State: Dispatch<wl_shm_pool::WlShmPool, u32> + Dispatch<wl_buffer::WlBuffer, u32> + 'static,
     {
         let mut latest: Option<DecodedFrame> = None;
         let mut count = 0usize;
@@ -269,15 +259,9 @@ impl ShmRenderer {
     /// slots are still held by the compositor and we had to drop the
     /// frame (caller may log a warning; this is rare on a healthy
     /// session and self-heals on the next keyframe).
-    pub fn render<State>(
-        &mut self,
-        qh: &QueueHandle<State>,
-        frame: &DecodedFrame,
-    ) -> Result<bool>
+    pub fn render<State>(&mut self, qh: &QueueHandle<State>, frame: &DecodedFrame) -> Result<bool>
     where
-        State: Dispatch<wl_shm_pool::WlShmPool, u32>
-            + Dispatch<wl_buffer::WlBuffer, u32>
-            + 'static,
+        State: Dispatch<wl_shm_pool::WlShmPool, u32> + Dispatch<wl_buffer::WlBuffer, u32> + 'static,
     {
         // Recreate any slot that is missing (None). Zombie slots still
         // occupy their index and will be cleaned up when released; we
@@ -291,7 +275,10 @@ impl ShmRenderer {
         // corrupt memory and violate the protocol.
         let mut released = [false; NUM_SLOTS];
         for (i, slot) in self.slots.iter().enumerate() {
-            released[i] = slot.as_ref().map(|s| s.released && !s.zombie).unwrap_or(false);
+            released[i] = slot
+                .as_ref()
+                .map(|s| s.released && !s.zombie)
+                .unwrap_or(false);
         }
         let Some(idx) = pick_next_released(&released, self.next_idx) else {
             // Both slots held — compositor hasn't released the previous
@@ -314,7 +301,10 @@ impl ShmRenderer {
         if frame.width.abs_diff(slot.width) > 2 || frame.height.abs_diff(slot.height) > 2 {
             tracing::debug!(
                 "skipping frame {}x{} (slot {}x{})",
-                frame.width, frame.height, slot.width, slot.height
+                frame.width,
+                frame.height,
+                slot.width,
+                slot.height
             );
             return Ok(false);
         }
@@ -335,7 +325,8 @@ impl ShmRenderer {
 
         slot.released = false;
         self.surface.attach(Some(&slot.buffer), 0, 0);
-        self.surface.damage_buffer(0, 0, slot.width as i32, slot.height as i32);
+        self.surface
+            .damage_buffer(0, 0, slot.width as i32, slot.height as i32);
         self.surface.commit();
 
         self.next_idx = (idx + 1) % NUM_SLOTS;
@@ -380,9 +371,7 @@ fn create_buffer_slot<State>(
     height: u32,
 ) -> Result<BufferSlot>
 where
-    State: Dispatch<wl_shm_pool::WlShmPool, u32>
-        + Dispatch<wl_buffer::WlBuffer, u32>
-        + 'static,
+    State: Dispatch<wl_shm_pool::WlShmPool, u32> + Dispatch<wl_buffer::WlBuffer, u32> + 'static,
 {
     const BYTES_PER_PIXEL: usize = 4;
     let stride = width as usize * BYTES_PER_PIXEL;
@@ -391,16 +380,16 @@ where
     let name = CString::new("wws-client-shm").unwrap();
     let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
     if raw_fd < 0 {
-        anyhow::bail!(
-            "memfd_create failed: {}",
-            std::io::Error::last_os_error()
-        );
+        anyhow::bail!("memfd_create failed: {}", std::io::Error::last_os_error());
     }
     let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
     let ret = unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) };
     if ret < 0 {
-        anyhow::bail!("ftruncate({size}) failed: {}", std::io::Error::last_os_error());
+        anyhow::bail!(
+            "ftruncate({size}) failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
     let ptr = unsafe {
@@ -488,7 +477,11 @@ fn blit_into(
         let src_off = row * src_stride;
         let dst_off = (y_off + row) * dst_stride + x_off;
         unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr().add(src_off), dst_ptr.add(dst_off), row_bytes);
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr().add(src_off),
+                dst_ptr.add(dst_off),
+                row_bytes,
+            );
         }
     }
 }

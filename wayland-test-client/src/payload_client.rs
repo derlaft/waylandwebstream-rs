@@ -78,7 +78,10 @@ fn parse_args() -> Result<Args> {
     }
     let color = Color::parse(&color_str)
         .ok_or_else(|| anyhow::anyhow!("invalid --color {color_str:?} (use white or black)"))?;
-    Ok(Args { color, control_file })
+    Ok(Args {
+        color,
+        control_file,
+    })
 }
 
 fn main() -> Result<()> {
@@ -105,7 +108,9 @@ fn main() -> Result<()> {
         color: args.color,
     };
 
-    event_queue.roundtrip(&mut state).context("initial roundtrip")?;
+    event_queue
+        .roundtrip(&mut state)
+        .context("initial roundtrip")?;
 
     let compositor = state
         .compositor
@@ -137,7 +142,10 @@ fn main() -> Result<()> {
     if !state.configured {
         anyhow::bail!("timed out waiting for xdg_surface::Configure");
     }
-    eprintln!("payload-client: configured at {}x{}", state.size.0, state.size.1);
+    eprintln!(
+        "payload-client: configured at {}x{}",
+        state.size.0, state.size.1
+    );
 
     let mut current_color = state.color;
     let mut committed_size = state.size;
@@ -247,7 +255,15 @@ fn create_colored_buffer(
     }
 
     let pool = shm.create_pool(f.as_fd(), byte_len as i32, qh, ());
-    Ok(pool.create_buffer(0, w as i32, h as i32, stride as i32, wl_shm::Format::Argb8888, qh, ()))
+    Ok(pool.create_buffer(
+        0,
+        w as i32,
+        h as i32,
+        stride as i32,
+        wl_shm::Format::Argb8888,
+        qh,
+        (),
+    ))
 }
 
 // ----- Wayland dispatch state -----
@@ -271,23 +287,31 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
             match &interface[..] {
                 "wl_compositor" => {
-                    state.compositor = Some(
-                        registry.bind::<wl_compositor::WlCompositor, _, _>(name, version, qh, ()),
-                    );
+                    state.compositor = Some(registry.bind::<wl_compositor::WlCompositor, _, _>(
+                        name,
+                        version,
+                        qh,
+                        (),
+                    ));
                 }
                 "wl_shm" => {
-                    state.shm =
-                        Some(registry.bind::<wl_shm::WlShm, _, _>(name, version, qh, ()));
+                    state.shm = Some(registry.bind::<wl_shm::WlShm, _, _>(name, version, qh, ()));
                 }
                 "xdg_wm_base" => {
-                    state.wm_base = Some(
-                        registry.bind::<xdg_wm_base_protocol::XdgWmBase, _, _>(
-                            name, version, qh, (),
-                        ),
-                    );
+                    state.wm_base = Some(registry.bind::<xdg_wm_base_protocol::XdgWmBase, _, _>(
+                        name,
+                        version,
+                        qh,
+                        (),
+                    ));
                 }
                 _ => {}
             }
@@ -296,23 +320,63 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
 }
 
 impl Dispatch<wl_compositor::WlCompositor, ()> for AppState {
-    fn event(_: &mut Self, _: &wl_compositor::WlCompositor, _: wl_compositor::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wl_compositor::WlCompositor,
+        _: wl_compositor::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<wl_surface::WlSurface, ()> for AppState {
-    fn event(_: &mut Self, _: &wl_surface::WlSurface, _: wl_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wl_surface::WlSurface,
+        _: wl_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<wl_shm::WlShm, ()> for AppState {
-    fn event(_: &mut Self, _: &wl_shm::WlShm, _: wl_shm::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wl_shm::WlShm,
+        _: wl_shm::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<wl_shm_pool::WlShmPool, ()> for AppState {
-    fn event(_: &mut Self, _: &wl_shm_pool::WlShmPool, _: wl_shm_pool::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wl_shm_pool::WlShmPool,
+        _: wl_shm_pool::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<wl_buffer::WlBuffer, ()> for AppState {
-    fn event(_: &mut Self, _: &wl_buffer::WlBuffer, _: wl_buffer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wl_buffer::WlBuffer,
+        _: wl_buffer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<xdg_wm_base_protocol::XdgWmBase, ()> for AppState {
